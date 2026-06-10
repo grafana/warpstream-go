@@ -1,0 +1,26 @@
+version: "2"
+linters:
+  settings:
+    errcheck:
+      # Use exclude-functions instead of exclude, since the GitHub Action's caching is broken.
+      # When changing the file referenced by exclude, the GitHub Action may use an older cache
+      # entry and ignore the changes in said file (thus breaking CI).
+      exclude-functions:
+        - (github.com/go-kit/log.Logger).Log
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+formatters:
+  enable:
+    - gci
+    - gofmt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/grafana/warpstream-go)
+      custom-order: true
