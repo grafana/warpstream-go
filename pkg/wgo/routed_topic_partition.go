@@ -99,10 +99,11 @@ func unpromiseRoutedTopicPartitionRecords(parts []promisedRoutedTopicPartitionRe
 
 // mergePromisedRoutedTopicPartitionRecordsByTopicPartition returns one
 // routedTopicPartitionRecords per (topic, partition), concatenating the records
-// of entries that share a partition (in arrival order). This is the done-less
-// wire view handed to a flush; completion is fired separately on the original
-// promised entries, so this view drops done. Backing arrays of the inputs are
-// never mutated.
+// of entries that share a partition (in arrival order). The merged entry takes
+// the last contributor's nodeState — the freshest routing-time classification
+// of the agent. This is the done-less wire view handed to a flush; completion is fired
+// separately on the original promised entries, so this view drops done. Backing
+// arrays of the inputs are never mutated.
 func mergePromisedRoutedTopicPartitionRecordsByTopicPartition(entries []promisedRoutedTopicPartitionRecords) []routedTopicPartitionRecords {
 	out := make([]routedTopicPartitionRecords, 0, len(entries))
 	for _, e := range entries {
@@ -113,6 +114,10 @@ func mergePromisedRoutedTopicPartitionRecordsByTopicPartition(entries []promised
 				combined = append(combined, out[i].records...)
 				combined = append(combined, e.records...)
 				out[i].records = combined
+				// Take the latest Add's nodeState: it is the freshest
+				// routing-time view of the agent, which is what the hedger
+				// trusts to decide probe (zero-delay) hedging.
+				out[i].nodeState = e.nodeState
 				merged = true
 				break
 			}

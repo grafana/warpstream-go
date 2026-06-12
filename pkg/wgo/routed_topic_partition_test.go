@@ -134,6 +134,33 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 		assert.Nil(t, first[:cap(first)][1], "merge must not write into the input's spare capacity")
 	})
 
+	t.Run("merged entry takes the last contributor's nodeState", func(t *testing.T) {
+		promState := func(state AgentState, r *kgo.Record) promisedRoutedTopicPartitionRecords {
+			return promisedRoutedTopicPartitionRecords{
+				routedTopicPartitionRecords: routedTopicPartitionRecords{
+					topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: []*kgo.Record{r}},
+					nodeID:                7,
+					nodeState:             state,
+				},
+			}
+		}
+		// The last Add's routing-time state is the freshest, so it wins — whether
+		// that means an agent just got demoted or just recovered.
+		demotedLast := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+			promState(AgentStateHealthy, rec("a")),
+			promState(AgentStateDemoted, rec("b")),
+		})
+		require.Len(t, demotedLast, 1)
+		assert.Equal(t, AgentStateDemoted, demotedLast[0].nodeState)
+
+		healthyLast := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+			promState(AgentStateDemoted, rec("a")),
+			promState(AgentStateHealthy, rec("b")),
+		})
+		require.Len(t, healthyLast, 1)
+		assert.Equal(t, AgentStateHealthy, healthyLast[0].nodeState)
+	})
+
 	t.Run("empty input returns empty", func(t *testing.T) {
 		assert.Empty(t, mergePromisedRoutedTopicPartitionRecordsByTopicPartition(nil))
 	})
