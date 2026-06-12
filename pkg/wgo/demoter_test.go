@@ -811,3 +811,23 @@ func TestDemoterConfig_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestDemoter_Refresh(t *testing.T) {
+	cfg := DemoterConfig{ProbeInterval: time.Second}
+	d, _ := newTestDemoter(&mockPartitionAssignmentStrategy{}, NewAverageAgentStatsTracker(), HealthCheckConfig{}, cfg)
+	now := time.Now()
+	d.lastDemotedProbe[1] = now
+	d.lastDemotedProbe[2] = now
+	d.lastDemotedProbe[3] = now
+
+	// Agent 2 has left the pool; agents 1 and 3 remain. 4 is new and not demoted.
+	d.Refresh([]int32{1, 3, 4})
+
+	_, kept1 := d.lastDemotedProbe[1]
+	_, pruned2 := d.lastDemotedProbe[2]
+	_, kept3 := d.lastDemotedProbe[3]
+	assert.True(t, kept1)
+	assert.False(t, pruned2)
+	assert.True(t, kept3)
+	assert.Equal(t, float64(2), d.demotedAgentsCount())
+}

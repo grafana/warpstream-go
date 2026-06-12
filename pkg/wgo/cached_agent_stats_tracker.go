@@ -28,6 +28,11 @@ type CachedAgentStatsTracker struct {
 
 	cacheMu sync.RWMutex
 	cache   map[clusterStatsCacheKey]clusterStatsCacheEntry
+	// cachePurgeGen increments on every PurgeAgents (under cacheMu). ClusterStats
+	// snapshots it before computing and skips the cache write if it changed,
+	// so a snapshot computed before a purge can't repopulate the cache with
+	// agents the purge just removed.
+	cachePurgeGen uint64
 }
 
 type clusterStatsCacheKey struct {
@@ -68,6 +73,7 @@ func (w *CachedAgentStatsTracker) PurgeAgents(nodeIDs []int32) {
 	w.inner.PurgeAgents(nodeIDs)
 	w.cacheMu.Lock()
 	clear(w.cache)
+	w.cachePurgeGen++
 	w.cacheMu.Unlock()
 }
 
@@ -82,14 +88,28 @@ func (w *CachedAgentStatsTracker) ClusterStats(now time.Time, slowMultiplier, fa
 	if entry, hit := w.lookup(key, now); hit {
 		return entry.stats, entry.ok
 	}
+
+	// Fetch the cache purge generation before recomputing the cluster stats.
+	w.cacheMu.RLock()
+	gen := w.cachePurgeGen
+	w.cacheMu.RUnlock()
+
 	stats, ok := w.inner.ClusterStats(now, slowMultiplier, faultyThreshold)
+
+	// Drop the result if a purge raced the compute: the snapshot may
+	// reflect agents the purge removed, so caching it would resurrect them
+	// for up to cacheTTL. The caller still gets this (transient) view; the
+	// next call recomputes fresh.
 	w.cacheMu.Lock()
-	w.cache[key] = clusterStatsCacheEntry{
-		stats:      stats,
-		ok:         ok,
-		computedAt: now,
+	if w.cachePurgeGen == gen {
+		w.cache[key] = clusterStatsCacheEntry{
+			stats:      stats,
+			ok:         ok,
+			computedAt: now,
+		}
 	}
 	w.cacheMu.Unlock()
+
 	return stats, ok
 }
 

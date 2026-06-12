@@ -76,7 +76,7 @@ type WarpstreamClient struct {
 
 	pool           *AgentPool
 	tracker        *CachedAgentStatsTracker
-	strategy       PartitionAssignmentStrategy
+	demoter        *Demoter
 	directProducer *KafkaDirectProducer
 	hedger         *Hedger
 	buffer         *ClusterRecordBuffer
@@ -135,8 +135,8 @@ func NewWarpstreamClient(cfg Config, logger log.Logger, reg prometheus.Registere
 	// agent-pool changes flow through transparently while the Demoter's
 	// per-agent probe-timing state persists across refreshes.
 	lazy := NewLazyPartitionAssignmentStrategy(pool.Strategy)
-	c.strategy = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg)
-	c.hedger = NewHedger(trackingProducer, tracker, c.strategy, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.MaxBatchBytes, m)
+	c.demoter = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg)
+	c.hedger = NewHedger(trackingProducer, tracker, c.demoter, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.MaxBatchBytes, m)
 	// The cluster buffer's AgentFlushFunc is the Hedger, wrapped only to
 	// bound each flush by WriteTimeout. The Hedger is otherwise shaped
 	// like a DirectProducer (same signature as KafkaDirectProducer) so it
@@ -277,6 +277,7 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 				if len(removed) > 0 {
 					c.tracker.PurgeAgents(removed)
 				}
+				c.demoter.Refresh(c.pool.Agents())
 			}
 		}
 	}()
@@ -292,7 +293,7 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
 		g, ok := groups[key]
 		if !ok {
-			cands := c.strategy.Candidates(r.Topic, r.Partition, 1)
+			cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
 			if len(cands) == 0 {
 				return nil, fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition)
 			}
@@ -322,7 +323,7 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 // skips the per-partition map and avoids heap-allocating an intermediate
 // group. Returns an error if the record's partition has no known candidate.
 func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResult)) (routedTopicPartitionRecords, error) {
-	cands := c.strategy.Candidates(record.Topic, record.Partition, 1)
+	cands := c.demoter.Candidates(record.Topic, record.Partition, 1)
 	if len(cands) == 0 {
 		return routedTopicPartitionRecords{}, fmt.Errorf("no agent assigned for topic %q partition %d", record.Topic, record.Partition)
 	}

@@ -105,6 +105,12 @@ func (p *AgentPool) Strategy() PartitionAssignmentStrategy {
 	return p.state.Load().strategy
 }
 
+// Agents returns the NodeIDs known as of the last Refresh, sorted ascending.
+// The slice is owned by the immutable snapshot and must not be mutated.
+func (p *AgentPool) Agents() []int32 {
+	return p.state.Load().agents
+}
+
 // TopicID returns the UUID of topic from the last Metadata refresh, or
 // ok=false if the topic was unknown. UUIDs are required for Produce v13+.
 func (p *AgentPool) TopicID(topic string) ([16]byte, bool) {

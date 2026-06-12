@@ -104,6 +104,7 @@ type Demoter struct {
 	// entry (zero timestamp, so the first probe is immediately due) on the
 	// demotion edge and removes it on recovery; shouldProbe and the
 	// forced-probe fallback in Candidates stamp it with each probe time.
+	// Refresh prunes entries for agents no longer in the pool.
 	lastDemotedProbeMu sync.Mutex
 	lastDemotedProbe   map[int32]time.Time
 }
@@ -301,6 +302,25 @@ func (d *Demoter) isDemotionSuppressed(clusterStats ClusterStats, hasClusterStat
 		return true, demotionSuppressedManyFaultyAgentsSmallCluster
 	}
 	return true, demotionSuppressedManyFaultyAgents
+}
+
+// Refresh reconciles demotion state against the agents currently in the pool,
+// dropping per-agent probe entries for any node ID no longer present. Called
+// on every metadata refresh, it clears state for departed agents and, by
+// reconciling against ground truth rather than a removed-diff, also serves as
+// a backstop so a leaked entry can't keep inflating demoter_demoted_agents.
+func (d *Demoter) Refresh(currentAgents []int32) {
+	current := make(map[int32]struct{}, len(currentAgents))
+	for _, id := range currentAgents {
+		current[id] = struct{}{}
+	}
+	d.lastDemotedProbeMu.Lock()
+	defer d.lastDemotedProbeMu.Unlock()
+	for nodeID := range d.lastDemotedProbe {
+		if _, ok := current[nodeID]; !ok {
+			delete(d.lastDemotedProbe, nodeID)
+		}
+	}
 }
 
 func (d *Demoter) demotedAgentsCount() float64 {

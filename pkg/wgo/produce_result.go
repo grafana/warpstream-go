@@ -176,7 +176,14 @@ func (a *produceResultAccumulator) accumulate(res ProduceResult) {
 					if entry.ErrorCode == kerrNoError {
 						continue
 					}
-					a.failed[topicPartition{topic: t.Topic, partition: entry.Partition}] = entry
+					tp := topicPartition{topic: t.Topic, partition: entry.Partition}
+					// Only track partitions we're still waiting on; a stray
+					// partition the broker returned but we never requested
+					// would never resolve, so it must not enter failed.
+					if _, ok := a.pending[tp]; !ok {
+						continue
+					}
+					a.failed[tp] = entry
 				}
 			}
 		}
