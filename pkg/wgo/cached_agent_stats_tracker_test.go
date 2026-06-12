@@ -169,6 +169,70 @@ func TestCachedAgentStatsTracker_PurgeAgents(t *testing.T) {
 		// Without agent 3, baseline = (10 + 10) / 2 = 10
 		assert.Equal(t, 10*time.Millisecond, c2.BaselineLatency)
 	})
+
+	t.Run("purge racing an in-flight compute is not cached", func(t *testing.T) {
+		now := time.Unix(3600, 0)
+		inner := NewAverageAgentStatsTracker()
+		blocking := &blockingClusterStatsTracker{
+			inner:   inner,
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		w := NewCachedAgentStatsTracker(blocking, time.Hour) // long TTL — only Purge can invalidate
+		nowNs := now.UnixNano()
+
+		seedFullWindow(inner, 1, nowNs, 20, 10, 0)
+		seedFullWindow(inner, 2, nowNs, 20, 10, 0)
+		seedFullWindow(inner, 3, nowNs, 20, 100, 0)
+
+		// Goroutine A computes a snapshot while agent 3 is still present
+		// (pre-purge baseline = (10+10+100)/3 = 40ms), then blocks before the
+		// wrapper writes it to the cache.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = w.ClusterStats(now, 2.0, 0.05)
+		}()
+
+		<-blocking.started
+		// Purge agent 3 mid-compute: clears the cache and bumps cachePurgeGen.
+		w.PurgeAgents([]int32{3})
+		close(blocking.release)
+		<-done
+
+		// The pre-purge snapshot must not have been cached. The next call
+		// recomputes against the purged inner: baseline = (10+10)/2 = 10ms.
+		// Without the cachePurgeGen guard this would return the stale 40ms.
+		c, ok := w.ClusterStats(now, 2.0, 0.05)
+		require.True(t, ok)
+		assert.Equal(t, 10*time.Millisecond, c.BaselineLatency)
+	})
+}
+
+// blockingClusterStatsTracker blocks the first ClusterStats call after it has
+// computed its result, letting a test interleave a PurgeAgents between the
+// compute and the cache write.
+type blockingClusterStatsTracker struct {
+	inner   AgentStatsTracker
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingClusterStatsTracker) TrackAgentRequest(now time.Time, nodeID int32, latency time.Duration, err error) {
+	b.inner.TrackAgentRequest(now, nodeID, latency, err)
+}
+func (b *blockingClusterStatsTracker) AgentStats(now time.Time, nodeID int32) (AgentStats, bool) {
+	return b.inner.AgentStats(now, nodeID)
+}
+func (b *blockingClusterStatsTracker) PurgeAgents(nodeIDs []int32) { b.inner.PurgeAgents(nodeIDs) }
+func (b *blockingClusterStatsTracker) ClusterStats(now time.Time, slowMultiplier, faultyThreshold float64) (ClusterStats, bool) {
+	res, ok := b.inner.ClusterStats(now, slowMultiplier, faultyThreshold)
+	b.once.Do(func() {
+		close(b.started)
+		<-b.release
+	})
+	return res, ok
 }
 
 func BenchmarkCachedAgentStatsTracker_ClusterStats(b *testing.B) {

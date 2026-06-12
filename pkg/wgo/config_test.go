@@ -71,6 +71,10 @@ func TestConfig_Validate(t *testing.T) {
 			mutate:     func(c *Config) { c.MaxBatchBytes = -1 },
 			wantErrMsg: "max batch bytes must be positive",
 		},
+		"max batch bytes over ceiling": {
+			mutate:     func(c *Config) { c.MaxBatchBytes = maxBatchBytesCeiling + 1 },
+			wantErrMsg: "max batch bytes must not exceed 1073741824",
+		},
 		"negative linger": {
 			mutate:     func(c *Config) { c.Linger = -1 },
 			wantErrMsg: "linger must be non-negative",

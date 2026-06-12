@@ -150,7 +150,7 @@ func NewWarpstreamClient(cfg Config, logger log.Logger, reg prometheus.Registere
 // acknowledged or failed. Cancelling ctx detaches the caller; the record
 // is still produced in the background.
 func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, promise func(*kgo.Record, error)) {
-	if recordBatchEstimateBytes(record) > c.cfg.MaxBatchBytes {
+	if recordBatchEstimateBytes(record) > int64(c.cfg.MaxBatchBytes) {
 		promise(record, errRecordTooLarge(record))
 		return
 	}
@@ -177,7 +177,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 		wg        sync.WaitGroup
 	)
 	for i, r := range records {
-		if recordBatchEstimateBytes(r) > c.cfg.MaxBatchBytes {
+		if recordBatchEstimateBytes(r) > int64(c.cfg.MaxBatchBytes) {
 			results[i] = kgo.ProduceResult{Record: r, Err: errRecordTooLarge(r)}
 			continue
 		}

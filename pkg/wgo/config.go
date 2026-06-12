@@ -73,6 +73,9 @@ func (c *Config) Validate() error {
 	if c.MaxBatchBytes <= 0 {
 		return errors.New("max batch bytes must be positive")
 	}
+	if c.MaxBatchBytes > maxBatchBytesCeiling {
+		return fmt.Errorf("max batch bytes must not exceed %d", maxBatchBytesCeiling)
+	}
 	if c.Linger < 0 {
 		return errors.New("linger must be non-negative")
 	}

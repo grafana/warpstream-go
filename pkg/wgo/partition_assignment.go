@@ -164,7 +164,8 @@ func nthNonLeader(agents []int32, leader int32, idx int) int32 {
 
 // hashTopicPartition hashes a (topic, partition) pair without heap allocation.
 func hashTopicPartition(topic string, partition int32) uint64 {
-	// Mix partition into topic hash using a large prime multiplier to spread
-	// bits from the low-value partition number across the full 64-bit range.
+	// Mix partition into topic hash using the golden-ratio prime (⌊2^64/φ⌋) as
+	// the multiplier to spread bits from the low-value partition number across
+	// the full 64-bit range.
 	return xxhash.Sum64String(topic) ^ (uint64(partition) * 0x9e3779b97f4a7c15)
 }

@@ -323,7 +323,7 @@ func TestRecordBatchEstimateBytes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			estimate := recordBatchEstimateBytes(tc.rec)
 			actual := actualUncompressedBatchWireSize(tc.rec)
-			assert.Equal(t, actual, estimate)
+			assert.Equal(t, int64(actual), estimate)
 		})
 	}
 }

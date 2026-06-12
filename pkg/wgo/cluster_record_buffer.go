@@ -36,6 +36,12 @@ import (
 // "records the producer is responsible for", not "records the caller is
 // waiting on", which is why they are decremented on actual flush completion
 // (not on caller ctx-cancel).
+//
+// These counters are for observability only: the buffer enforces no upper
+// bound on buffered bytes or records. Bounding in-flight produce volume is
+// intentionally the caller's responsibility — a caller that needs
+// backpressure must cap its own outstanding produces rather than rely on
+// the buffer to reject work.
 type ClusterRecordBuffer struct {
 	linger        time.Duration
 	maxBatchBytes int32

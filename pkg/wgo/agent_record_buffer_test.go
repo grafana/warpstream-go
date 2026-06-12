@@ -366,7 +366,7 @@ func TestAgentRecordBuffer_BufferedWireBytes(t *testing.T) {
 			a.mu.Unlock()
 
 			actual := actualUncompressedMultiRecordBatchWireSize(tc.records)
-			assert.Equal(t, actual, running)
+			assert.Equal(t, int64(actual), running)
 		})
 	}
 }
@@ -426,7 +426,7 @@ func TestAgentRecordBuffer_BufferedWireBytes_AfterEarlyFlush(t *testing.T) {
 	a.mu.Unlock()
 
 	assert.Equal(t, second[0].Timestamp.UnixMilli(), anchor)
-	assert.Equal(t, actualUncompressedMultiRecordBatchWireSize(second), running)
+	assert.Equal(t, int64(actualUncompressedMultiRecordBatchWireSize(second)), running)
 }
 
 func TestAgentRecordBuffer_Close(t *testing.T) {

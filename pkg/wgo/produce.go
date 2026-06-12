@@ -48,22 +48,29 @@ const crcOffset = 17
 // batchFixedFieldsAfterLength.
 const recordBatchHeaderBytes = 4 + 8 + 4 + batchFixedFieldsAfterLength
 
+// maxBatchBytesCeiling is a sanity cap on Config.MaxBatchBytes. A value above
+// this is almost certainly misconfiguration — the broker would reject such a
+// request anyway — so we fail validation early rather than buffer toward it.
+const maxBatchBytesCeiling int32 = 1 << 30 // 1 GiB
+
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
 // given offsetDelta and tsDelta — the length-prefix varint plus the
 // length-prefixed body. Used to keep the batch counter aligned with the
-// bytes the encoder will eventually emit.
-func recordEstimateBytes(r *kgo.Record, offsetDelta int32, tsDelta int64) int32 {
-	lengthField := int32(1) + // Attributes (int8, unused)
-		int32(kbin.VarlongLen(tsDelta)) +
-		int32(kbin.VarintLen(offsetDelta)) +
-		int32(kbin.VarintLen(int32(len(r.Key)))) + int32(len(r.Key)) +
-		int32(kbin.VarintLen(int32(len(r.Value)))) + int32(len(r.Value)) +
-		int32(kbin.VarintLen(int32(len(r.Headers))))
+// bytes the encoder will eventually emit. The result is int64 so the sum
+// can't overflow for a pathologically large record (a 2 GiB value would wrap
+// an int32 to a negative size and slip past the per-record gate).
+func recordEstimateBytes(r *kgo.Record, offsetDelta int32, tsDelta int64) int64 {
+	lengthField := int64(1) + // Attributes (int8, unused)
+		int64(kbin.VarlongLen(tsDelta)) +
+		int64(kbin.VarintLen(offsetDelta)) +
+		int64(kbin.VarintLen(int32(len(r.Key)))) + int64(len(r.Key)) +
+		int64(kbin.VarintLen(int32(len(r.Value)))) + int64(len(r.Value)) +
+		int64(kbin.VarintLen(int32(len(r.Headers))))
 	for _, h := range r.Headers {
-		lengthField += int32(kbin.VarintLen(int32(len(h.Key)))) + int32(len(h.Key)) +
-			int32(kbin.VarintLen(int32(len(h.Value)))) + int32(len(h.Value))
+		lengthField += int64(kbin.VarintLen(int32(len(h.Key)))) + int64(len(h.Key)) +
+			int64(kbin.VarintLen(int32(len(h.Value)))) + int64(len(h.Value))
 	}
-	return int32(kbin.VarintLen(lengthField)) + lengthField
+	return int64(kbin.VarintLen(int32(lengthField))) + lengthField
 }
 
 // recordBatchEstimateBytes returns the wire-byte size of a fresh single-
@@ -72,7 +79,7 @@ func recordEstimateBytes(r *kgo.Record, offsetDelta int32, tsDelta int64) int32 
 // it synchronously instead of letting the broker reject the eventual
 // request. The estimate is on the uncompressed payload — Snappy can only
 // shrink it, so the gate stays sound under compression.
-func recordBatchEstimateBytes(r *kgo.Record) int32 {
+func recordBatchEstimateBytes(r *kgo.Record) int64 {
 	return recordBatchHeaderBytes + recordEstimateBytes(r, 0, 0)
 }
 

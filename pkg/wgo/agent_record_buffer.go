@@ -63,7 +63,7 @@ type AgentRecordBuffer struct {
 	bufferedFirstTimestamp int64
 	bufferedPartitions     []routedTopicPartitionRecords
 	bufferedRecords        int
-	bufferedWireBytes      int32
+	bufferedWireBytes      int64
 	bufferedFlushTimer     *time.Timer
 	closed                 bool
 
@@ -113,7 +113,7 @@ func (a *AgentRecordBuffer) Add(partitions []routedTopicPartitionRecords) {
 	}
 
 	addBytes, firstTS := a.computeAddCostLocked(partitions)
-	if a.bufferedRecords > 0 && a.bufferedWireBytes+addBytes > a.maxBatchBytes {
+	if a.bufferedRecords > 0 && a.bufferedWireBytes+addBytes > int64(a.maxBatchBytes) {
 		// Re-cost after the forced flush: the batch overhead and offsetDelta
 		// values reset, so the original addBytes no longer applies.
 		a.startFlushLocked()
@@ -164,7 +164,7 @@ func (a *AgentRecordBuffer) mergeInLocked(partitions []routedTopicPartitionRecor
 // the first incoming record's timestamp otherwise). Includes the
 // recordBatchHeaderBytes overhead when the batch is empty so the caller can
 // simply add the result to a zeroed counter. Caller must hold a.mu.
-func (a *AgentRecordBuffer) computeAddCostLocked(partitions []routedTopicPartitionRecords) (int32, int64) {
+func (a *AgentRecordBuffer) computeAddCostLocked(partitions []routedTopicPartitionRecords) (int64, int64) {
 	fresh := a.bufferedRecords == 0
 	firstTS := a.bufferedFirstTimestamp
 	if fresh {
@@ -176,7 +176,7 @@ func (a *AgentRecordBuffer) computeAddCostLocked(partitions []routedTopicPartiti
 		}
 	}
 
-	var bytes int32
+	var bytes int64
 	if fresh {
 		bytes = recordBatchHeaderBytes
 	}

@@ -21,7 +21,9 @@ func mergeProduceResponses(resps []*kmsg.ProduceResponse) *kmsg.ProduceResponse 
 		}
 		// Version: take the first non-nil sub-response — sub-responses
 		// share the same wire version as the original request. Throttle
-		// is the max across sub-responses (most-throttling agent wins).
+		// is the max across sub-responses (most-throttling agent wins);
+		// like the accumulator, it is propagated but not enforced (load is
+		// steered via hedging/demotion, not broker-requested throttling).
 		if !versionSet {
 			merged.Version = res.Version
 			versionSet = true

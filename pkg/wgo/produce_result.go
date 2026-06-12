@@ -191,7 +191,10 @@ func (a *produceResultAccumulator) accumulate(res ProduceResult) {
 	}
 
 	// Capture wire metadata once. Version is identical across calls;
-	// ThrottleMillis is the max so the most-throttling agent wins.
+	// ThrottleMillis is the max so the most-throttling agent wins. The value
+	// is propagated to the caller but intentionally not enforced here: this
+	// client steers load via hedging/demotion, not by sleeping on a
+	// broker-requested throttle.
 	if a.responseVersion == 0 {
 		a.responseVersion = res.resp.Version
 	}
