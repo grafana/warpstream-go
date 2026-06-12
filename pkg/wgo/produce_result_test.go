@@ -614,10 +614,10 @@ func TestSelectProduceResult(t *testing.T) {
 				err:  fmt.Errorf("%w: %w", primaryErr, fallbackErr),
 			},
 		},
-		"primary had per-partition codes only (no transport err), fallback errored: return primary": {
+		"primary had per-partition codes only (no transport err), fallback errored: return fallback (merged view)": {
 			primary:  ProduceResult{resp: primaryCodesResp},
 			fallback: ProduceResult{resp: fallbackCodesResp, err: fallbackErr},
-			want:     ProduceResult{resp: primaryCodesResp},
+			want:     ProduceResult{resp: fallbackCodesResp, err: fallbackErr},
 		},
 		"primary transport-errored, fallback had per-partition codes only (partial wins): return fallback": {
 			primary:  ProduceResult{err: primaryErr},

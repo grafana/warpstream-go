@@ -317,5 +317,13 @@ func selectProduceResult(primary, fallback ProduceResult) ProduceResult {
 			err:  fmt.Errorf("%w: %w", primary.err, fallback.err),
 		}
 	}
+	if fallback.resp != nil {
+		// Primary failed via per-partition codes only (no transport err), so it
+		// resolved nothing under the all-or-nothing leg model. The fallback
+		// merges produce attempts across multiple agents, so its response can
+		// carry partitions a hedge leg landed even alongside its error — that
+		// richer view wins.
+		return fallback
+	}
 	return primary
 }
