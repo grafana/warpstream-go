@@ -19,20 +19,22 @@ import (
 // completed. routeBy(topic, partition) returns the destination; the helper
 // is the test equivalent of WarpstreamClient.routeRecords paired with the
 // caller's promise/wait coordination.
-func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, sharedDone func(error)) []routedTopicPartitionRecords {
+func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, sharedDone func(error)) []promisedRoutedTopicPartitionRecords {
 	if len(records) == 0 {
 		sharedDone(nil)
 		return nil
 	}
-	groups := make(map[topicPartition]*routedTopicPartitionRecords)
+	groups := make(map[topicPartition]*promisedRoutedTopicPartitionRecords)
 	var order []topicPartition
 	for _, r := range records {
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
 		g, ok := groups[key]
 		if !ok {
-			g = &routedTopicPartitionRecords{
-				topicPartitionRecords: topicPartitionRecords{topic: r.Topic, partition: r.Partition},
-				nodeID:                routeBy(r.Topic, r.Partition),
+			g = &promisedRoutedTopicPartitionRecords{
+				routedTopicPartitionRecords: routedTopicPartitionRecords{
+					topicPartitionRecords: topicPartitionRecords{topic: r.Topic, partition: r.Partition},
+					nodeID:                routeBy(r.Topic, r.Partition),
+				},
 			}
 			groups[key] = g
 			order = append(order, key)
@@ -61,7 +63,7 @@ func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, shar
 			sharedDone(final)
 		}
 	}
-	out := make([]routedTopicPartitionRecords, 0, len(order))
+	out := make([]promisedRoutedTopicPartitionRecords, 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		g.done = fan

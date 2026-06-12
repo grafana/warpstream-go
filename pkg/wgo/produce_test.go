@@ -261,13 +261,13 @@ func TestParseProduceResponse(t *testing.T) {
 	}
 }
 
-// TestRecordBatchEstimateBytes verifies that recordBatchEstimateBytes returns
+// TestSingleRecordBatchEstimateBytes verifies that singleRecordBatchEstimateBytes returns
 // the exact uncompressed wire-byte size of a single-record batch. The
 // reference value is computed by actually encoding a RecordBatch with the
 // same record via kmsg.RecordBatch.AppendTo (which is what franz-go itself
 // uses for production traffic): if our estimate matches the real encoder
 // output, drift between the two is impossible.
-func TestRecordBatchEstimateBytes(t *testing.T) {
+func TestSingleRecordBatchEstimateBytes(t *testing.T) {
 	cases := []struct {
 		name string
 		rec  *kgo.Record
@@ -321,8 +321,67 @@ func TestRecordBatchEstimateBytes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			estimate := recordBatchEstimateBytes(tc.rec)
+			estimate := singleRecordBatchEstimateBytes(tc.rec)
 			actual := actualUncompressedBatchWireSize(tc.rec)
+			assert.Equal(t, int64(actual), estimate)
+		})
+	}
+}
+
+// TestMultiRecordBatchEstimateBytes verifies that multiRecordBatchEstimateBytes
+// returns the exact uncompressed wire-byte size of a multi-record batch,
+// comparing against the real encoder (kmsg.RecordBatch.AppendTo) so the
+// estimate can't drift — exercising offset deltas (across the varint boundary)
+// and timestamp deltas relative to the first record.
+func TestMultiRecordBatchEstimateBytes(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	rec := func(value string, tsOffsetMS int64) *kgo.Record {
+		return &kgo.Record{Value: []byte(value), Timestamp: now.Add(time.Duration(tsOffsetMS) * time.Millisecond)}
+	}
+	manyRecords := func(n int) []*kgo.Record {
+		recs := make([]*kgo.Record, n)
+		for i := range recs {
+			recs[i] = rec("x", int64(i))
+		}
+		return recs
+	}
+
+	cases := []struct {
+		name string
+		recs []*kgo.Record
+	}{
+		{
+			name: "single record",
+			recs: []*kgo.Record{rec("v", 0)},
+		},
+		{
+			name: "two records, same timestamp",
+			recs: []*kgo.Record{rec("a", 0), rec("b", 0)},
+		},
+		{
+			name: "records with increasing timestamps",
+			recs: []*kgo.Record{rec("a", 0), rec("b", 100), rec("c", 20000)},
+		},
+		{
+			name: "records with keys, values and headers",
+			recs: []*kgo.Record{
+				{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
+				{Value: []byte("v2"), Headers: []kgo.RecordHeader{{Key: "h", Value: []byte("hv")}}, Timestamp: now.Add(time.Millisecond)},
+			},
+		},
+		{
+			name: "many records crossing offsetDelta varint boundary (127 / 128)",
+			recs: manyRecords(130),
+		},
+		{
+			name: "records crossing tsDelta varlong boundary",
+			recs: []*kgo.Record{rec("a", 0), rec("b", 63), rec("c", 64), rec("d", 8192)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			estimate := multiRecordBatchEstimateBytes(tc.recs)
+			actual := actualUncompressedMultiRecordBatchWireSize(tc.recs)
 			assert.Equal(t, int64(actual), estimate)
 		})
 	}
@@ -332,7 +391,7 @@ func TestRecordBatchEstimateBytes(t *testing.T) {
 // batch and returns the on-wire byte count, including the 4-byte length
 // prefix the surrounding ProduceRequestTopicPartition.Records field adds.
 // No compression — the goal is to compare against
-// recordBatchEstimateBytes' uncompressed estimate.
+// singleRecordBatchEstimateBytes' uncompressed estimate.
 func actualUncompressedBatchWireSize(r *kgo.Record) int32 {
 	return actualUncompressedMultiRecordBatchWireSize([]*kgo.Record{r})
 }

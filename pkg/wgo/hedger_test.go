@@ -60,12 +60,12 @@ func (c *resultCapture) doneFor(topic string, partition int32) func(ProduceResul
 // each routed entry's done with the per-partition outcome from the merged
 // response (wrapping kerr.RequestTimedOut with kgo.ErrRecordTimeout to
 // match perPartitionDone's behaviour in the real WarpstreamClient).
-func runHedger(h *Hedger, ctx context.Context, partitions []routedTopicPartitionRecords) {
+func runHedger(h *Hedger, ctx context.Context, partitions []promisedRoutedTopicPartitionRecords) {
 	if len(partitions) == 0 {
 		return
 	}
 	primaryID := partitions[0].nodeID
-	res := h.ProduceSync(ctx, primaryID, partitions)
+	res := h.ProduceSync(ctx, primaryID, unpromiseRoutedTopicPartitionRecords(partitions))
 	for _, p := range partitions {
 		if p.done == nil {
 			continue
@@ -136,15 +136,17 @@ func TestHedger_ProduceSync(t *testing.T) {
 	}
 
 	// makeReq builds a single-partition request whose done feeds capture.
-	makeReq := func(capture *resultCapture) []routedTopicPartitionRecords {
-		return []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+	makeReq := func(capture *resultCapture) []promisedRoutedTopicPartitionRecords {
+		return []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID: primaryID,
 			},
-			nodeID: primaryID,
-			done:   capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 	}
 	successResp := func(_ int32, _ []topicPartitionRecords) (*kmsg.ProduceResponse, error) {
@@ -371,9 +373,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), multiStrat, health, cfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{
-			{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 0, records: []*kgo.Record{{Topic: topicMulti, Partition: 0}}}, nodeID: primaryID, done: capture.doneFor(topicMulti, 0)},
-			{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 1, records: []*kgo.Record{{Topic: topicMulti, Partition: 1}}}, nodeID: primaryID, done: capture.doneFor(topicMulti, 1)},
+		req := []promisedRoutedTopicPartitionRecords{
+			{routedTopicPartitionRecords: routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 0, records: []*kgo.Record{{Topic: topicMulti, Partition: 0}}}, nodeID: primaryID}, done: capture.doneFor(topicMulti, 0)},
+			{routedTopicPartitionRecords: routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 1, records: []*kgo.Record{{Topic: topicMulti, Partition: 1}}}, nodeID: primaryID}, done: capture.doneFor(topicMulti, 1)},
 		}
 		runHedger(h, context.Background(), req)
 
@@ -445,9 +447,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), partialStrat, health, cfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{
-			{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 0, records: []*kgo.Record{{Topic: topicMulti, Partition: 0}}}, nodeID: primaryID, done: capture.doneFor(topicMulti, 0)},
-			{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 1, records: []*kgo.Record{{Topic: topicMulti, Partition: 1}}}, nodeID: primaryID, done: capture.doneFor(topicMulti, 1)},
+		req := []promisedRoutedTopicPartitionRecords{
+			{routedTopicPartitionRecords: routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 0, records: []*kgo.Record{{Topic: topicMulti, Partition: 0}}}, nodeID: primaryID}, done: capture.doneFor(topicMulti, 0)},
+			{routedTopicPartitionRecords: routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{topic: topicMulti, partition: 1, records: []*kgo.Record{{Topic: topicMulti, Partition: 1}}}, nodeID: primaryID}, done: capture.doneFor(topicMulti, 1)},
 		}
 		runHedger(h, context.Background(), req)
 
@@ -488,15 +490,17 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), probeStrat, health, probeCfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		probeReq := []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+		probeReq := []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID:    primaryID,
+				nodeState: AgentStateDemoted, // primary is a probe
 			},
-			nodeID:    primaryID,
-			nodeState: AgentStateDemoted, // primary is a probe
-			done:      capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 
 		start := time.Now()
@@ -536,15 +540,17 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+		req := []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID:    primaryID,
+				nodeState: AgentStateDemoted,
 			},
-			nodeID:    primaryID,
-			nodeState: AgentStateDemoted,
-			done:      capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 
 		runHedger(h, context.Background(), req)
@@ -579,15 +585,17 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), strategy, health, cfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+		req := []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID:    primaryID,
+				nodeState: AgentStateDemoted,
 			},
-			nodeID:    primaryID,
-			nodeState: AgentStateDemoted,
-			done:      capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 
 		runHedger(h, context.Background(), req)
@@ -716,14 +724,16 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, tr, strategy, health, fastCfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+		req := []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID: agentA,
 			},
-			nodeID: agentA,
-			done:   capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 
 		syncDone := make(chan struct{})
@@ -876,15 +886,17 @@ func TestHedger_ProduceSync(t *testing.T) {
 		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m)
 
 		capture := newResultCapture()
-		req := []routedTopicPartitionRecords{{
-			topicPartitionRecords: topicPartitionRecords{
-				topic:     topic,
-				partition: partition,
-				records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+		req := []promisedRoutedTopicPartitionRecords{{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     topic,
+					partition: partition,
+					records:   []*kgo.Record{{Topic: topic, Partition: partition}},
+				},
+				nodeID:    primaryID,
+				nodeState: AgentStateDemoted,
 			},
-			nodeID:    primaryID,
-			nodeState: AgentStateDemoted,
-			done:      capture.doneFor(topic, partition),
+			done: capture.doneFor(topic, partition),
 		}}
 		runHedger(h, context.Background(), req)
 		require.NoError(t, capture.get(topic, partition).err)

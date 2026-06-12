@@ -1,6 +1,8 @@
 package wgo
 
 import (
+	"sync"
+
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -28,64 +30,17 @@ func (p *topicPartitionRecords) recordValueBytes() int64 {
 	return n
 }
 
-// routedTopicPartitionRecords is the partition-grouped unit of work flowing
-// through the buffer. It is the bare topicPartitionRecords plus the routing
-// decision (nodeID + nodeState) and the per-partition completion callback.
-//
-// done fires exactly once with the partition's terminal ProduceResult: the
-// produce attempt's full ProduceResponse, or an error-only result on
-// transport-level failure or ctx-cancel. Callers that only care about the
-// error split it out via ProduceResult.error(). All records in the group
-// share that outcome — per-record fan-out is the concern of the caller that
-// built the group (e.g. WarpstreamClient.ProduceSync).
-//
-// Cross-agent retry is NOT a concern of this type: the Hedger owns the
-// "try the next agent" loop internally per call. A routed entry entering
-// the buffer always represents one decisive routing decision; if the
-// Hedger needs to retry on a different agent, it builds new internal
-// state without re-entering the buffer.
-//
-// Two routedTopicPartitionRecords values are mergeable iff they share
-// (topic, partition, nodeID). When the AgentRecordBuffer merges fresh
-// Produce calls for the same partition into one wire batch, it appends
-// records and chains the two dones into one — preserving every caller's
-// completion notification without inflating the wire batch count.
+// routedTopicPartitionRecords is a topicPartitionRecords plus the routing
+// decision for it: the destination nodeID and the state of that agent.
 type routedTopicPartitionRecords struct {
 	topicPartitionRecords
 
-	done   func(ProduceResult)
 	nodeID int32
 
-	// nodeState mirrors the State of the Agent that nodeID was picked
-	// from. AgentStateDemoted in particular tells downstream layers
-	// (specifically the Hedger) that nodeID is a demoted agent being
-	// probed — fire the fallback immediately rather than paying the
-	// hedge delay, because a probe is expected to fail.
+	// nodeState is the State of the Agent nodeID was picked from, captured at
+	// routing time (e.g. AgentStateDemoted when nodeID is a demoted agent
+	// being probed).
 	nodeState AgentState
-}
-
-// newMultiRoutedTopicPartitionRecords stamps each input with the same
-// routing decision (nodeID) and shared done callback. Used by callers
-// that batch multiple partitions to the same agent in one wave.
-func newMultiRoutedTopicPartitionRecords(parts []topicPartitionRecords, nodeID int32, done func(ProduceResult)) []routedTopicPartitionRecords {
-	out := make([]routedTopicPartitionRecords, len(parts))
-	for i, p := range parts {
-		out[i] = routedTopicPartitionRecords{
-			topicPartitionRecords: p,
-			nodeID:                nodeID,
-			done:                  done,
-		}
-	}
-	return out
-}
-
-// mergeableWith reports whether other can be merged into p — true iff both
-// describe the same (topic, partition) routed to the same nodeID. The
-// caller is free to apply additional constraints (e.g. byte caps).
-func (p *routedTopicPartitionRecords) mergeableWith(other *routedTopicPartitionRecords) bool {
-	return p.topic == other.topic &&
-		p.partition == other.partition &&
-		p.nodeID == other.nodeID
 }
 
 // unrouteTopicPartitionRecords returns the bare topicPartitionRecords
@@ -98,19 +53,161 @@ func unrouteTopicPartitionRecords(parts []routedTopicPartitionRecords) []topicPa
 	return out
 }
 
-// chainDones returns a done that invokes both a and b. Used by the buffer's
-// merge path so a merged routed entry carries every contributing caller's
-// completion. Either may be nil (no-op).
-func chainDones(a, b func(ProduceResult)) func(ProduceResult) {
-	switch {
-	case a == nil:
-		return b
-	case b == nil:
-		return a
-	default:
-		return func(res ProduceResult) {
-			a(res)
-			b(res)
+// promisedRoutedTopicPartitionRecords is a routedTopicPartitionRecords paired
+// with a done callback that carries the group's terminal ProduceResult.
+type promisedRoutedTopicPartitionRecords struct {
+	routedTopicPartitionRecords
+
+	// done fires exactly once with the partition's terminal ProduceResult: a
+	// full ProduceResponse on success, or an error result on failure or
+	// ctx-cancel — which may still carry a partial response (e.g. the
+	// retry-exhausted kgo.ErrRecordTimeout envelope with per-partition entries).
+	// Callers that only care about the error split it out via
+	// ProduceResult.error(). All records in the group share that outcome —
+	// per-record fan-out is the concern of the caller that built the group
+	// (e.g. WarpstreamClient.ProduceSync).
+	done func(ProduceResult)
+}
+
+// newMultiRoutedTopicPartitionRecords stamps each input with the same
+// routing decision (nodeID) and shared done callback. Used by callers
+// that batch multiple partitions to the same agent in one wave.
+func newMultiRoutedTopicPartitionRecords(parts []topicPartitionRecords, nodeID int32, done func(ProduceResult)) []promisedRoutedTopicPartitionRecords {
+	out := make([]promisedRoutedTopicPartitionRecords, len(parts))
+	for i, p := range parts {
+		out[i] = promisedRoutedTopicPartitionRecords{
+			routedTopicPartitionRecords: routedTopicPartitionRecords{
+				topicPartitionRecords: p,
+				nodeID:                nodeID,
+			},
+			done: done,
 		}
 	}
+	return out
+}
+
+// unpromiseRoutedTopicPartitionRecords returns the done-less
+// routedTopicPartitionRecords view of each entry, for callers that need the
+// routing decision and records but not the completion callback.
+func unpromiseRoutedTopicPartitionRecords(parts []promisedRoutedTopicPartitionRecords) []routedTopicPartitionRecords {
+	out := make([]routedTopicPartitionRecords, len(parts))
+	for i, p := range parts {
+		out[i] = p.routedTopicPartitionRecords
+	}
+	return out
+}
+
+// mergePromisedRoutedTopicPartitionRecordsByTopicPartition returns one
+// routedTopicPartitionRecords per (topic, partition), concatenating the records
+// of entries that share a partition (in arrival order). This is the done-less
+// wire view handed to a flush; completion is fired separately on the original
+// promised entries, so this view drops done. Backing arrays of the inputs are
+// never mutated.
+func mergePromisedRoutedTopicPartitionRecordsByTopicPartition(entries []promisedRoutedTopicPartitionRecords) []routedTopicPartitionRecords {
+	out := make([]routedTopicPartitionRecords, 0, len(entries))
+	for _, e := range entries {
+		merged := false
+		for i := range out {
+			if out[i].topic == e.topic && out[i].partition == e.partition {
+				combined := make([]*kgo.Record, 0, len(out[i].records)+len(e.records))
+				combined = append(combined, out[i].records...)
+				combined = append(combined, e.records...)
+				out[i].records = combined
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			out = append(out, e.routedTopicPartitionRecords)
+		}
+	}
+	return out
+}
+
+// splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes splits in's records
+// so each returned group's standalone RecordBatch fits within maxBatchBytes.
+//
+// The whole group is returned unchanged when it already fits (the common case).
+// When it must be split, the chunks share a fan-in done: in.done fires exactly once,
+// after every chunk has resolved, with a failing result if any chunk failed (else a
+// success).
+//
+// Each record's own batch is <= maxBatchBytes (enforced by the per-record gate), so
+// every chunk carries at least one record and the split always terminates.
+func splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(in promisedRoutedTopicPartitionRecords, maxBatchBytes int32) []promisedRoutedTopicPartitionRecords {
+	if multiRecordBatchEstimateBytes(in.records) <= int64(maxBatchBytes) {
+		return []promisedRoutedTopicPartitionRecords{in}
+	}
+
+	var (
+		chunks      [][]*kgo.Record
+		currRecords []*kgo.Record
+		currBytes   int64
+		firstTS     int64
+	)
+	for _, r := range in.records {
+		if len(currRecords) == 0 {
+			firstTS = r.Timestamp.UnixMilli()
+			currRecords = append(currRecords, r)
+			currBytes = recordBatchHeaderBytes + recordEstimateBytes(r, 0, 0)
+			continue
+		}
+
+		cost := recordEstimateBytes(r, int32(len(currRecords)), r.Timestamp.UnixMilli()-firstTS)
+		if currBytes+cost > int64(maxBatchBytes) {
+			chunks = append(chunks, currRecords)
+			firstTS = r.Timestamp.UnixMilli()
+			currRecords = []*kgo.Record{r}
+			currBytes = recordBatchHeaderBytes + recordEstimateBytes(r, 0, 0)
+			continue
+		}
+
+		currRecords = append(currRecords, r)
+		currBytes += cost
+	}
+	chunks = append(chunks, currRecords)
+
+	// Fan-in done: every chunk shares in's single (topic, partition), so
+	// in.done just needs firing once, after all chunks resolve, with the first
+	// failing result if any chunk failed (else a success). No merging of the
+	// per-chunk responses is needed — in.done resolves only that one partition's
+	// outcome, and reporting any chunk's failure triggers a safe whole-partition
+	// retry under at-least-once.
+	// Capture the done func, not in itself: referencing in.done directly would
+	// make the closure retain all of in (notably in.records) until the last
+	// chunk completes.
+	origDone := in.done
+	var (
+		mu         sync.Mutex
+		remaining  = len(chunks)
+		chosen     ProduceResult
+		haveChosen bool
+		chosenOK   bool
+	)
+	done := func(res ProduceResult) {
+		mu.Lock()
+		remaining--
+		if !haveChosen {
+			chosen = res
+			haveChosen = true
+			chosenOK = res.error() == nil
+		} else if chosenOK && res.error() != nil {
+			chosen = res
+			chosenOK = false
+		}
+		last := remaining == 0
+		result := chosen
+		mu.Unlock()
+		if last {
+			origDone(result)
+		}
+	}
+
+	out := make([]promisedRoutedTopicPartitionRecords, len(chunks))
+	for i, c := range chunks {
+		out[i] = in
+		out[i].records = c
+		out[i].done = done
+	}
+	return out
 }

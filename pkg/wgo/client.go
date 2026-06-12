@@ -150,7 +150,7 @@ func NewWarpstreamClient(cfg Config, logger log.Logger, reg prometheus.Registere
 // acknowledged or failed. Cancelling ctx detaches the caller; the record
 // is still produced in the background.
 func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, promise func(*kgo.Record, error)) {
-	if recordBatchEstimateBytes(record) > int64(c.cfg.MaxBatchBytes) {
+	if singleRecordBatchEstimateBytes(record) > int64(c.cfg.MaxBatchBytes) {
 		promise(record, errRecordTooLarge(record))
 		return
 	}
@@ -159,7 +159,7 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 		promise(record, err)
 		return
 	}
-	c.buffer.Add(ctx, []routedTopicPartitionRecords{routed})
+	c.buffer.Add(ctx, []promisedRoutedTopicPartitionRecords{routed})
 }
 
 // ProduceSync produces records and blocks until each has been
@@ -177,7 +177,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 		wg        sync.WaitGroup
 	)
 	for i, r := range records {
-		if recordBatchEstimateBytes(r) > int64(c.cfg.MaxBatchBytes) {
+		if singleRecordBatchEstimateBytes(r) > int64(c.cfg.MaxBatchBytes) {
 			results[i] = kgo.ProduceResult{Record: r, Err: errRecordTooLarge(r)}
 			continue
 		}
@@ -286,8 +286,8 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 // routeRecords groups records by (topic, partition), stamps each group with
 // its initial destination NodeID and mints the per-group done callback.
 // Returns an error if any record's partition has no known candidate.
-func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]routedTopicPartitionRecords, error) {
-	groups := make(map[topicPartition]*routedTopicPartitionRecords)
+func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]promisedRoutedTopicPartitionRecords, error) {
+	groups := make(map[topicPartition]*promisedRoutedTopicPartitionRecords)
 	order := make([]topicPartition, 0)
 	for _, r := range records {
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
@@ -297,20 +297,22 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 			if len(cands) == 0 {
 				return nil, fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition)
 			}
-			g = &routedTopicPartitionRecords{
-				topicPartitionRecords: topicPartitionRecords{
-					topic:     r.Topic,
-					partition: r.Partition,
+			g = &promisedRoutedTopicPartitionRecords{
+				routedTopicPartitionRecords: routedTopicPartitionRecords{
+					topicPartitionRecords: topicPartitionRecords{
+						topic:     r.Topic,
+						partition: r.Partition,
+					},
+					nodeID:    cands[0].NodeID,
+					nodeState: cands[0].State,
 				},
-				nodeID:    cands[0].NodeID,
-				nodeState: cands[0].State,
 			}
 			groups[key] = g
 			order = append(order, key)
 		}
 		g.records = append(g.records, r)
 	}
-	out := make([]routedTopicPartitionRecords, 0, len(order))
+	out := make([]promisedRoutedTopicPartitionRecords, 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		g.done = doneFor(g.records)
@@ -322,20 +324,22 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 // routeRecord is the single-record specialisation of routeRecords: it
 // skips the per-partition map and avoids heap-allocating an intermediate
 // group. Returns an error if the record's partition has no known candidate.
-func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResult)) (routedTopicPartitionRecords, error) {
+func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResult)) (promisedRoutedTopicPartitionRecords, error) {
 	cands := c.demoter.Candidates(record.Topic, record.Partition, 1)
 	if len(cands) == 0 {
-		return routedTopicPartitionRecords{}, fmt.Errorf("no agent assigned for topic %q partition %d", record.Topic, record.Partition)
+		return promisedRoutedTopicPartitionRecords{}, fmt.Errorf("no agent assigned for topic %q partition %d", record.Topic, record.Partition)
 	}
-	return routedTopicPartitionRecords{
-		topicPartitionRecords: topicPartitionRecords{
-			topic:     record.Topic,
-			partition: record.Partition,
-			records:   []*kgo.Record{record},
+	return promisedRoutedTopicPartitionRecords{
+		routedTopicPartitionRecords: routedTopicPartitionRecords{
+			topicPartitionRecords: topicPartitionRecords{
+				topic:     record.Topic,
+				partition: record.Partition,
+				records:   []*kgo.Record{record},
+			},
+			nodeID:    cands[0].NodeID,
+			nodeState: cands[0].State,
 		},
-		nodeID:    cands[0].NodeID,
-		nodeState: cands[0].State,
-		done:      done,
+		done: done,
 	}, nil
 }
 
@@ -444,5 +448,5 @@ func produceMaxVersions() *kversion.Versions {
 // compared against MaxBatchBytes — to make the value directly comparable
 // to the configured cap.
 func errRecordTooLarge(r *kgo.Record) error {
-	return fmt.Errorf("%w (uncompressed_bytes=%d)", kerr.MessageTooLarge, recordBatchEstimateBytes(r))
+	return fmt.Errorf("%w (uncompressed_bytes=%d)", kerr.MessageTooLarge, singleRecordBatchEstimateBytes(r))
 }

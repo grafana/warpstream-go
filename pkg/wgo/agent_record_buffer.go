@@ -13,16 +13,18 @@ import (
 var errBufferClosed = errors.New("record buffer is closed")
 
 // AgentFlushFunc is invoked by AgentRecordBuffer when a batch is ready to
-// send. All partitions in a single call are guaranteed to belong to nodeID
-// — the agent that owns the AgentRecordBuffer doing the flush — because the
-// buffer bins incoming routed entries by nodeID and never merges across
-// bins.
+// send. The function only produces the batch and returns the resulting
+// ProduceResult. A successful outcome must carry a non-nil resp; an error-only
+// (or zero) ProduceResult is treated as a failure by completion handling.
 //
-// The function is responsible only for producing the batch and returning
-// the resulting ProduceResult. The buffer fires each routed entry's done
-// callback uniformly with that outcome after this returns; callers that
-// resolve per-partition outcomes internally (e.g. the Hedger) must make
-// their done callbacks idempotent so the buffer's redundant fire is a no-op.
+// The partitions it receives satisfy two guarantees:
+//
+//   - All belong to nodeID — the agent that owns the AgentRecordBuffer doing
+//     the flush — because the buffer bins incoming routed entries by nodeID.
+//   - At most one entry per (topic, partition). The buffer coalesces
+//     same-partition records into a single entry before the call, because the
+//     produce/hedge path keys per-partition state by (topic, partition) and
+//     rejects duplicates (see produceResultAccumulator).
 type AgentFlushFunc func(ctx context.Context, nodeID int32, partitions []routedTopicPartitionRecords) ProduceResult
 
 // AgentRecordBuffer accumulates records targeted at one Warpstream agent and
@@ -59,13 +61,13 @@ type AgentRecordBuffer struct {
 	flush         AgentFlushFunc
 	metrics       *metrics
 
-	mu                     sync.Mutex
-	bufferedFirstTimestamp int64
-	bufferedPartitions     []routedTopicPartitionRecords
-	bufferedRecords        int
-	bufferedWireBytes      int64
-	bufferedFlushTimer     *time.Timer
-	closed                 bool
+	mu                        sync.Mutex
+	nextProduceFirstTimestamp int64
+	nextProducePartitions     []promisedRoutedTopicPartitionRecords
+	nextProduceRecords        int
+	nextProduceWireBytes      int64
+	nextProduceFlushTimer     *time.Timer
+	closed                    bool
 
 	flushWG        sync.WaitGroup
 	flushCtx       context.Context
@@ -87,14 +89,9 @@ func NewAgentRecordBuffer(nodeID int32, linger time.Duration, maxBatchBytes int3
 	}
 }
 
-// Add buffers partition groups. Incoming groups are merged into existing
-// buffered groups when they share (topic, partition, tried); this keeps
-// fresh Produce calls for the same partition coalesced into one wire batch
-// on flush, with every contributing caller's done chained together. Each
-// partition's done fires exactly once via the FlushFunc handler when its
-// terminal outcome is known (or synchronously with errBufferClosed if the
-// buffer is closed).
-func (a *AgentRecordBuffer) Add(partitions []routedTopicPartitionRecords) {
+// Add buffers partition groups for produce. Each group's done fires exactly
+// once with its terminal outcome.
+func (a *AgentRecordBuffer) Add(partitions []promisedRoutedTopicPartitionRecords) {
 	incoming := 0
 	for _, p := range partitions {
 		incoming += len(p.records)
@@ -103,95 +100,86 @@ func (a *AgentRecordBuffer) Add(partitions []routedTopicPartitionRecords) {
 		return
 	}
 
+	// Split any group whose own RecordBatch would exceed maxBatchBytes into
+	// chunks that each fit, so no single flushed per-partition batch can be
+	// rejected MessageTooLarge. Chunks are then added one at a time below, and
+	// because each is <= maxBatchBytes the overflow check keeps nextProduceWireBytes
+	// (and therefore every per-partition batch) within the cap.
+	chunks := make([]promisedRoutedTopicPartitionRecords, 0, len(partitions))
+	for _, p := range partitions {
+		chunks = append(chunks, splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(p, a.maxBatchBytes)...)
+	}
+
 	a.mu.Lock()
 	if a.closed {
+		// Closed buffer: there is no flush to carry the outcome, so resolve
+		// every group's done synchronously with errBufferClosed.
 		a.mu.Unlock()
-		for _, p := range partitions {
+		for _, p := range chunks {
 			p.done(ProduceResult{err: errBufferClosed})
 		}
 		return
 	}
 
-	addBytes, firstTS := a.computeAddCostLocked(partitions)
-	if a.bufferedRecords > 0 && a.bufferedWireBytes+addBytes > int64(a.maxBatchBytes) {
-		// Re-cost after the forced flush: the batch overhead and offsetDelta
-		// values reset, so the original addBytes no longer applies.
-		a.startFlushLocked()
-		addBytes, firstTS = a.computeAddCostLocked(partitions)
+	for i := range chunks {
+		a.addToNextProduceLocked(chunks[i])
 	}
-
-	if a.bufferedRecords == 0 {
-		// Fresh batch: anchor timestamp.
-		a.bufferedFirstTimestamp = firstTS
-	}
-	a.mergeInLocked(partitions)
-	a.bufferedRecords += incoming
-	a.bufferedWireBytes += addBytes
-	if a.bufferedFlushTimer == nil {
-		a.bufferedFlushTimer = time.AfterFunc(a.linger, a.timerFlush)
+	if a.nextProduceRecords > 0 && a.nextProduceFlushTimer == nil {
+		a.nextProduceFlushTimer = time.AfterFunc(a.linger, a.timerFlush)
 	}
 	a.mu.Unlock()
 }
 
-// mergeInLocked appends incoming partition groups to bufferedPartitions,
-// merging into an existing entry when (topic, partition, tried) matches.
-// On merge, records are appended and the two dones are chained so every
-// caller's completion fires when the merged group resolves. Caller must
-// hold a.mu.
-func (a *AgentRecordBuffer) mergeInLocked(partitions []routedTopicPartitionRecords) {
-	for _, in := range partitions {
-		merged := false
-		for i := range a.bufferedPartitions {
-			ex := &a.bufferedPartitions[i]
-			if ex.mergeableWith(&in) {
-				ex.records = append(ex.records, in.records...)
-				ex.done = chainDones(ex.done, in.done)
-				merged = true
-				break
-			}
-		}
-		if !merged {
-			cp := in
-			cp.records = append([]*kgo.Record(nil), in.records...)
-			a.bufferedPartitions = append(a.bufferedPartitions, cp)
-		}
+// addToNextProduceLocked appends one group (already <= maxBatchBytes) to the
+// pending produce, flushing first when it wouldn't fit. Groups are never merged
+// here: same-partition entries are coalesced into one wire batch at flush time
+// (startFlushLocked), which keeps each group's done untouched. Caller must hold
+// a.mu.
+func (a *AgentRecordBuffer) addToNextProduceLocked(p promisedRoutedTopicPartitionRecords) {
+	addBytes, firstTS := a.computeAddCostLocked(p.records)
+	if a.nextProduceRecords > 0 && a.nextProduceWireBytes+addBytes > int64(a.maxBatchBytes) {
+		// Re-cost after the forced flush: the batch overhead and offsetDelta
+		// values reset, so the original addBytes no longer applies.
+		a.startFlushLocked()
+		addBytes, firstTS = a.computeAddCostLocked(p.records)
 	}
+
+	if a.nextProduceRecords == 0 {
+		// Fresh produce: anchor timestamp.
+		a.nextProduceFirstTimestamp = firstTS
+	}
+	a.nextProducePartitions = append(a.nextProducePartitions, p)
+	a.nextProduceRecords += len(p.records)
+	a.nextProduceWireBytes += addBytes
 }
 
-// computeAddCostLocked returns the additional wire bytes the incoming partitions
-// would contribute if appended to the current batch, plus the firstTimestamp
-// that anchors the computation (the batch's existing anchor when non-empty,
-// the first incoming record's timestamp otherwise). Includes the
-// recordBatchHeaderBytes overhead when the batch is empty so the caller can
-// simply add the result to a zeroed counter. Caller must hold a.mu.
-func (a *AgentRecordBuffer) computeAddCostLocked(partitions []routedTopicPartitionRecords) (int64, int64) {
-	fresh := a.bufferedRecords == 0
-	firstTS := a.bufferedFirstTimestamp
-	if fresh {
-		for _, p := range partitions {
-			if len(p.records) > 0 {
-				firstTS = p.records[0].Timestamp.UnixMilli()
-				break
-			}
-		}
+// computeAddCostLocked returns the additional wire bytes that appending records
+// to the pending produce would contribute, plus the firstTimestamp that anchors
+// the computation (the pending produce's existing anchor when non-empty, the
+// first incoming record's timestamp otherwise). Includes the
+// recordBatchHeaderBytes overhead when the pending produce is empty so the
+// caller can add the result to a zeroed counter. Caller must hold a.mu.
+func (a *AgentRecordBuffer) computeAddCostLocked(records []*kgo.Record) (int64, int64) {
+	fresh := a.nextProduceRecords == 0
+	firstTS := a.nextProduceFirstTimestamp
+	if fresh && len(records) > 0 {
+		firstTS = records[0].Timestamp.UnixMilli()
 	}
 
 	var bytes int64
 	if fresh {
 		bytes = recordBatchHeaderBytes
 	}
-	offset := int32(a.bufferedRecords)
-	for _, p := range partitions {
-		for _, rec := range p.records {
-			tsDelta := rec.Timestamp.UnixMilli() - firstTS
-			bytes += recordEstimateBytes(rec, offset, tsDelta)
-			offset++
-		}
+	offset := int32(a.nextProduceRecords)
+	for _, rec := range records {
+		tsDelta := rec.Timestamp.UnixMilli() - firstTS
+		bytes += recordEstimateBytes(rec, offset, tsDelta)
+		offset++
 	}
 	return bytes, firstTS
 }
 
-// Close flushes the pending batch and waits for every in-flight FlushFunc
+// Close flushes the pending produce and waits for every in-flight FlushFunc
 // to report. Subsequent Adds fail with errBufferClosed. Idempotent.
 func (a *AgentRecordBuffer) Close() {
 	a.mu.Lock()
@@ -214,33 +202,39 @@ func (a *AgentRecordBuffer) timerFlush() {
 	a.startFlushLocked()
 }
 
-// startFlushLocked dispatches the pending batch to flush in a goroutine and
-// resets buffer state so the next batch can accumulate immediately. No-op
-// if nothing is buffered. Caller must hold a.mu.
+// startFlushLocked dispatches the pending produce to flush in a goroutine and
+// resets buffer state so the next produce can accumulate immediately. No-op
+// if nothing is pending. Caller must hold a.mu.
 func (a *AgentRecordBuffer) startFlushLocked() {
-	if a.bufferedRecords == 0 {
+	if a.nextProduceRecords == 0 {
 		return
 	}
-	if a.bufferedFlushTimer != nil {
+	if a.nextProduceFlushTimer != nil {
 		// Stop's return value is intentionally ignored: a concurrently-firing
 		// timer's callback (timerFlush) blocks on a.mu and, once it acquires
 		// it, finds the buffer empty and is a no-op via startFlushLocked.
-		a.bufferedFlushTimer.Stop()
-		a.bufferedFlushTimer = nil
+		a.nextProduceFlushTimer.Stop()
+		a.nextProduceFlushTimer = nil
 	}
-	partitions := a.bufferedPartitions
-	a.bufferedPartitions = nil
-	a.bufferedRecords = 0
-	a.bufferedWireBytes = 0
-	a.bufferedFirstTimestamp = 0
+	entries := a.nextProducePartitions
+	a.nextProducePartitions = nil
+	a.nextProduceRecords = 0
+	a.nextProduceWireBytes = 0
+	a.nextProduceFirstTimestamp = 0
+
+	// Merge same-partition records into one wire entry: the produce/hedge path
+	// keys per-partition state by (topic, partition) and rejects duplicates
+	// (see produceResultAccumulator). Completion still fans out to every
+	// original entry's done, so the merged wire view drops done.
+	wire := mergePromisedRoutedTopicPartitionRecordsByTopicPartition(entries)
 
 	a.flushWG.Add(1)
 	go func() {
 		defer a.flushWG.Done()
 		a.metrics.lingerFlushesTotal.Inc()
-		res := a.flush(a.flushCtx, a.nodeID, partitions)
-		for _, p := range partitions {
-			p.done(res)
+		res := a.flush(a.flushCtx, a.nodeID, wire)
+		for _, e := range entries {
+			e.done(res)
 		}
 	}()
 }

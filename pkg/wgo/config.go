@@ -25,7 +25,17 @@ type Config struct {
 	SASLOptions []kgo.Opt
 
 	// Producer settings.
-	Linger        time.Duration
+
+	// Linger is how long the buffer waits to coalesce more records into a
+	// produce before flushing it; zero flushes as soon as possible.
+	Linger time.Duration
+
+	// MaxBatchBytes caps the uncompressed wire size of a single per-partition
+	// RecordBatch. It must be set at or below the WarpStream agents'
+	// message.max.bytes: the client guarantees no per-partition batch exceeds
+	// this value (splitting oversized partition groups across batches), so as
+	// long as the cap is <= the agent limit the broker never rejects a flush
+	// with MessageTooLarge.
 	MaxBatchBytes int32
 
 	// DirectProducer holds the per-attempt timing enforced at the kgo

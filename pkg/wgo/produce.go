@@ -73,14 +73,32 @@ func recordEstimateBytes(r *kgo.Record, offsetDelta int32, tsDelta int64) int64 
 	return int64(kbin.VarintLen(int32(lengthField))) + lengthField
 }
 
-// recordBatchEstimateBytes returns the wire-byte size of a fresh single-
+// singleRecordBatchEstimateBytes returns the wire-byte size of a fresh single-
 // record batch carrying r. Used as the per-record rejection gate: a record
 // whose batch alone exceeds MaxBatchBytes can never be produced, so we fail
 // it synchronously instead of letting the broker reject the eventual
 // request. The estimate is on the uncompressed payload — Snappy can only
 // shrink it, so the gate stays sound under compression.
-func recordBatchEstimateBytes(r *kgo.Record) int64 {
+func singleRecordBatchEstimateBytes(r *kgo.Record) int64 {
 	return recordBatchHeaderBytes + recordEstimateBytes(r, 0, 0)
+}
+
+// multiRecordBatchEstimateBytes returns the wire-byte size of records encoded
+// as one fresh RecordBatch: the header plus each record at its 0-based offset
+// and a timestamp delta relative to the first record. This is the per-partition
+// unit the broker enforces message.max.bytes against, so the buffer uses it to
+// keep each flushed batch within MaxBatchBytes. singleRecordBatchEstimateBytes
+// is the n=1 case.
+func multiRecordBatchEstimateBytes(records []*kgo.Record) int64 {
+	if len(records) == 0 {
+		return 0
+	}
+	firstTS := records[0].Timestamp.UnixMilli()
+	bytes := int64(recordBatchHeaderBytes)
+	for i, r := range records {
+		bytes += recordEstimateBytes(r, int32(i), r.Timestamp.UnixMilli()-firstTS)
+	}
+	return bytes
 }
 
 // buildMultiTopicProduceRequest builds a ProduceRequest covering records that

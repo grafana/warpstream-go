@@ -78,7 +78,7 @@ func NewClusterRecordBuffer(linger time.Duration, maxBatchBytes int32, flush Age
 // error on terminal failure, or ctx.Err() if ctx is canceled before the
 // producer resolves the partition). Cancelling ctx detaches the caller
 // but does not stop the in-flight produce.
-func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []routedTopicPartitionRecords) {
+func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []promisedRoutedTopicPartitionRecords) {
 	if len(partitions) == 0 {
 		return
 	}
@@ -91,7 +91,7 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []routedTopicP
 	// bypasses this wrap via addToBuffers — the wrap survives across
 	// re-buffer cycles because done is aliased into the retry entry, so
 	// neither user-visible firing nor accounting double-fires.
-	wrapped := make([]routedTopicPartitionRecords, len(partitions))
+	wrapped := make([]promisedRoutedTopicPartitionRecords, len(partitions))
 	for i, p := range partitions {
 		valueBytes := p.recordValueBytes()
 		recCount := int64(len(p.records))
@@ -140,7 +140,7 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []routedTopicP
 // addToBuffers bins partition groups by destination and dispatches them to
 // the matching per-agent buffer. Used both by Add (external entry) and by
 // the flush handler when re-buffering cascade retries.
-func (c *ClusterRecordBuffer) addToBuffers(ctx context.Context, partitions []routedTopicPartitionRecords) {
+func (c *ClusterRecordBuffer) addToBuffers(ctx context.Context, partitions []promisedRoutedTopicPartitionRecords) {
 	if len(partitions) == 0 {
 		return
 	}
@@ -155,7 +155,7 @@ func (c *ClusterRecordBuffer) addToBuffers(ctx context.Context, partitions []rou
 		return
 	}
 
-	byAgent := make(map[int32][]routedTopicPartitionRecords)
+	byAgent := make(map[int32][]promisedRoutedTopicPartitionRecords)
 	for _, p := range partitions {
 		byAgent[p.nodeID] = append(byAgent[p.nodeID], p)
 	}
