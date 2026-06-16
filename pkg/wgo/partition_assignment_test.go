@@ -332,3 +332,15 @@ func (s *mockPartitionAssignmentStrategy) lastMaxCandidates(topic string, partit
 	defer s.mu.Unlock()
 	return s.lastMax[partitionKey{topic, partition}]
 }
+
+func TestHashTopicPartition(t *testing.T) {
+	assert.Equal(t, hashTopicPartition("t", 3), hashTopicPartition("t", 3))
+	// Both topic and partition are part of the hashed key.
+	assert.NotEqual(t, hashTopicPartition("t", 0), hashTopicPartition("t", 1))
+	assert.NotEqual(t, hashTopicPartition("a", 0), hashTopicPartition("b", 0))
+}
+
+func TestHashTopicPartition_NoHeapAllocation(t *testing.T) {
+	allocs := testing.AllocsPerRun(1000, func() { _ = hashTopicPartition("some-topic-name", 7) })
+	assert.Zero(t, allocs)
+}

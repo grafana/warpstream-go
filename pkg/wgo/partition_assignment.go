@@ -1,6 +1,8 @@
 package wgo
 
 import (
+	"encoding/binary"
+
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -162,10 +164,16 @@ func nthNonLeader(agents []int32, leader int32, idx int) int32 {
 	return 0 // unreachable when idx is in range
 }
 
-// hashTopicPartition hashes a (topic, partition) pair without heap allocation.
+// hashTopicPartition hashes the (topic, partition) pair without heap
+// allocation. The streaming Digest and the stack-allocated partition bytes both
+// stay on the stack, so this avoids building a combined key string while still
+// giving a full-avalanche hash of the whole key.
 func hashTopicPartition(topic string, partition int32) uint64 {
-	// Mix partition into topic hash using the golden-ratio prime (⌊2^64/φ⌋) as
-	// the multiplier to spread bits from the low-value partition number across
-	// the full 64-bit range.
-	return xxhash.Sum64String(topic) ^ (uint64(partition) * 0x9e3779b97f4a7c15)
+	var d xxhash.Digest
+	d.Reset()
+	d.WriteString(topic)
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(partition))
+	d.Write(b[:])
+	return d.Sum64()
 }
