@@ -9,10 +9,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// scenarioBufferDuration is extra time beyond warmup+observed for scenario
-// drain and cleanup before declaring a timeout.
-const scenarioBufferDuration = 60 * time.Second
-
 // runScenario runs warmup + observed phases against a fresh environment and
 // returns the collected result.
 //
@@ -27,7 +23,7 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	}
 	defer env.Close()
 
-	budget := warmupDuration + observedDuration + scenarioBufferDuration
+	budget := warmupDuration + observedDuration + 60*time.Second
 	runCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
