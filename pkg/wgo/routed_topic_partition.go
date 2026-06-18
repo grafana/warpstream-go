@@ -17,12 +17,12 @@ type topicPartitionRecords struct {
 	records   []*kgo.Record
 }
 
-// recordValueBytes returns the producer-side accounting size of the group,
+// recordPayloadBytes returns the producer-side accounting size of the group,
 // mirroring franz-go's BufferedProduceBytes.
 //
 // It intentionally omits Kafka wire overhead (record batch header, varints,
 // etc.) so the counter matches what franz-go reports for the same records.
-func (p *topicPartitionRecords) recordValueBytes() int64 {
+func (p *topicPartitionRecords) recordPayloadBytes() int64 {
 	var n int64
 	for _, r := range p.records {
 		n += int64(len(r.Key) + len(r.Value))

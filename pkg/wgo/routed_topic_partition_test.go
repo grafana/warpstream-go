@@ -13,7 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func TestTopicPartitionRecords_RecordValueBytes(t *testing.T) {
+func TestTopicPartitionRecords_RecordPayloadBytes(t *testing.T) {
 	tests := map[string]struct {
 		records       []*kgo.Record
 		expectedBytes int64
@@ -52,7 +52,7 @@ func TestTopicPartitionRecords_RecordValueBytes(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			p := topicPartitionRecords{records: tc.records}
-			assert.Equal(t, tc.expectedBytes, p.recordValueBytes())
+			assert.Equal(t, tc.expectedBytes, p.recordPayloadBytes())
 		})
 	}
 }

@@ -91,9 +91,9 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []promisedRout
 	//     actual flush completion regardless of whether ctx already fired.
 	wrapped := make([]promisedRoutedTopicPartitionRecords, len(partitions))
 	for i, p := range partitions {
-		valueBytes := p.recordValueBytes()
+		payloadBytes := p.recordPayloadBytes()
 		recCount := int64(len(p.records))
-		c.bufferedBytes.Add(valueBytes)
+		c.bufferedBytes.Add(payloadBytes)
 		c.bufferedRecords.Add(recCount)
 
 		var (
@@ -124,7 +124,7 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []promisedRout
 		p.done = func(res ProduceResult) {
 			if ourDoneFired.CompareAndSwap(false, true) {
 				stopCtxWatch()
-				c.bufferedBytes.Add(-valueBytes)
+				c.bufferedBytes.Add(-payloadBytes)
 				c.bufferedRecords.Add(-recCount)
 			}
 			fireOrigDone(res)
