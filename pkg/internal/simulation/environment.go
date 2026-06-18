@@ -279,17 +279,11 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 // newKgoClient mirrors the kgo.Client configuration that
 // pkg/storage/ingest/writer_client.go applies in production. Any drift would
 // make the comparison misleading, so the two option sets are kept in lockstep.
-// produceAPIVersion mirrors the Produce version wgo pins internally (see
-// produceAPIVersion in pkg/wgo/client.go). Keep in lockstep: the fake cluster
-// caps Produce here so request and response payloads carry the topic name on
-// the wire, matching what the client emits.
-const produceAPIVersion int16 = 11
-
 func newKgoClient(addr string) (*kgo.Client, error) {
-	// Cap Produce at the version this package generates so request and response
-	// payloads carry the topic name on the wire — matches wgo's own pinning.
+	// Cap Produce at the version wgo pins so request and response payloads carry
+	// the topic name on the wire, matching what the client emits.
 	v := kversion.Stable()
-	v.SetMaxKeyVersion(kmsg.Produce.Int16(), produceAPIVersion)
+	v.SetMaxKeyVersion(kmsg.Produce.Int16(), wgo.ProduceAPIVersion)
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(addr),
