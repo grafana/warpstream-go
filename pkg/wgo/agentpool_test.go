@@ -10,7 +10,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
-	"github.com/grafana/warpstream-go/pkg/wgo/internal/testkafka"
+	"github.com/grafana/warpstream-go/pkg/internal/testkafka"
 )
 
 func TestAgentPool_Refresh(t *testing.T) {
