@@ -227,14 +227,11 @@ func (c *latencyDelayedKgoClient) Produce(ctx context.Context, r *kgo.Record, pr
 	c.Client.Produce(ctx, r, func(rec *kgo.Record, err error) {
 		go func() {
 			c.behaviours.nextLatencySleepFor(ctx, c.client, rec.Partition)
-			// If the simulated latency was cut short because the caller's ctx
-			// (e.g. app-request timeout) fired, surface that as the record's
-			// outcome — kgo itself would have observed the broker not respond
-			// in time.
-			if err == nil && ctx.Err() != nil {
-				err = ctx.Err()
+			finalErr := err
+			if finalErr == nil && ctx.Err() != nil {
+				finalErr = ctx.Err()
 			}
-			promise(rec, err)
+			promise(rec, finalErr)
 		}()
 	})
 }
