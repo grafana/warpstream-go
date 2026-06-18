@@ -613,6 +613,42 @@ func TestDemoter_Candidates(t *testing.T) {
 		assert.Equal(t, AgentStateDemoted, cands[0].State)
 	})
 
+	t.Run("healthy primary with clustered demoted agents still fills maxCandidates", func(t *testing.T) {
+		const (
+			healthyPrimary = int32(1)
+			demotedA       = int32(2)
+			demotedB       = int32(3)
+			demotedC       = int32(4)
+			healthyX       = int32(5)
+			healthyY       = int32(6)
+			healthyZ       = int32(7)
+		)
+		inner := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{
+				{topic, part}: healthyAgents(healthyPrimary, demotedA, demotedB, demotedC, healthyX, healthyY, healthyZ),
+			},
+		}
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		for _, id := range []int32{demotedA, demotedB, demotedC} {
+			seedFullWindow(tr, id, nowNs, 10, 10, 10)
+		}
+		for _, id := range []int32{healthyPrimary, healthyX, healthyY, healthyZ, 8, 9, 10, 11, 12} {
+			seedFullWindow(tr, id, nowNs, 20, 10, 0)
+		}
+		d, _ := newTestDemoter(inner, tr, health, cfg)
+		now := time.Now()
+		d.now = func() time.Time { return now }
+
+		cands := d.Candidates(topic, part, 3)
+		require.Len(t, cands, 3)
+		assert.Equal(t, []Agent{
+			{NodeID: healthyPrimary, State: AgentStateHealthy},
+			{NodeID: healthyX, State: AgentStateHealthy},
+			{NodeID: healthyY, State: AgentStateHealthy},
+		}, cands)
+	})
+
 	t.Run("logs demote and restore transitions", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger := log.NewLogfmtLogger(&buf)

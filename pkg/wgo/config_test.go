@@ -114,6 +114,24 @@ func TestConfig_Validate(t *testing.T) {
 		"health check max slow fraction of exactly 1 is valid": {
 			mutate: func(c *Config) { c.HealthCheck.MaxSlowFraction = 1.0 },
 		},
+		"zero faulty threshold is rejected": {
+			mutate:     func(c *Config) { c.HealthCheck.FaultyThreshold = 0 },
+			wantErrMsg: "health check: health check faulty threshold must be greater than 0 and at most 1",
+		},
+		"negative faulty threshold is rejected": {
+			mutate:     func(c *Config) { c.HealthCheck.FaultyThreshold = -0.1 },
+			wantErrMsg: "health check: health check faulty threshold must be greater than 0 and at most 1",
+		},
+		"faulty threshold of exactly 1 is valid": {
+			mutate: func(c *Config) { c.HealthCheck.FaultyThreshold = 1.0 },
+		},
+		"write timeout below produce request timeout plus overhead is rejected": {
+			mutate:     func(c *Config) { c.WriteTimeout = 2 * time.Second },
+			wantErrMsg: "write timeout (2s) must be at least the produce request timeout plus overhead (3s)",
+		},
+		"write timeout equal to produce request timeout plus overhead is valid": {
+			mutate: func(c *Config) { c.WriteTimeout = 3 * time.Second },
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

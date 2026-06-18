@@ -84,10 +84,10 @@ func (c *DemoterConfig) Validate() error {
 // which is the whole point — we want enough probe traffic to know if the
 // agent has recovered, not enough to amplify a problem.
 //
-// Demotion criteria mirror the Hedger's "primary looks bad" signals
-// (latency vs cluster baseline, error rate vs configured floor). Cold-start
-// behaviour is fail-open: if cluster stats aren't available yet, no agent
-// is demoted, so every candidate flows through unchanged.
+// Demotion is classified purely on error rate (ErrorRate above
+// FaultyThreshold, gated by a minimum request count). Cold-start behaviour
+// is fail-open: if cluster stats aren't available yet, no agent is demoted,
+// so every candidate flows through unchanged.
 type Demoter struct {
 	inner      PartitionAssignmentStrategy
 	tracker    AgentStatsReader
@@ -135,7 +135,9 @@ func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, hea
 
 // Candidates returns the candidate list with demoted agents either elided
 // (probe not due) or surfaced as AgentStateDemoted in the primary slot
-// (using up that agent's per-interval probe slot).
+// (using up that agent's per-interval probe slot). If every candidate is
+// demoted and none is due for a probe, the natural primary is surfaced as a
+// forced probe so we never refuse to route.
 func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) []Agent {
 	if maxCandidates <= 0 {
 		return nil
@@ -154,8 +156,9 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	// with a probe filling the primary slot, maxCandidates-1 is enough.
 	//
 	// Ask for a small headroom and double it each retry, capping at 6
-	// doublings (2^6 = 64). The probe state isn't touched in this loop —
-	// shouldProbe runs only in the build pass below.
+	// doublings (2^6 = 64). Only shouldProbe (the probe-timestamp stamping)
+	// is deferred to the build pass below; this loop still calls isDemoted,
+	// which can flip lastDemotedProbe membership and log a transition.
 	const maxRetries = 6
 	var agents []Agent
 	for retry, extra := 0, 2; retry < maxRetries; retry, extra = retry+1, extra*2 {
@@ -172,9 +175,12 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 			}
 		}
 
-		// Stop if we got enough agents, or all possible ones.
-		// +1 accounts for the potential demoted probe in the primary slot.
-		if nonDemoted+1 >= maxCandidates || len(agents) < asked {
+		// Stop once we have a full maxCandidates of non-demoted alternates,
+		// or we've exhausted the pool. We want the full count even when a
+		// demoted probe ends up in the primary slot: a healthy primary
+		// followed by a clustered run of demoted agents must still leave
+		// enough healthy alternates behind them to fill the list.
+		if nonDemoted >= maxCandidates || len(agents) < asked {
 			break
 		}
 	}
@@ -220,7 +226,9 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 }
 
 // isDemoted reports whether agent nodeID currently meets the demotion
-// criteria.
+// criteria. It also applies the demotion/recovery edge transition: it
+// updates lastDemotedProbe (inserting on demote, deleting on recovery) and
+// logs the transition once.
 func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterStats, hasClusterStats bool) bool {
 	// Suppression guard, which also covers cold-start (no cluster view): we'd
 	// rather route fresh traffic to an unknown agent than declare the cluster

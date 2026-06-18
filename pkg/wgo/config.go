@@ -10,7 +10,6 @@ import (
 )
 
 // Config holds all parameters for WarpstreamClient.
-// It has no CLI flags; the ingest package constructs it from KafkaConfig.
 type Config struct {
 	// Connection settings.
 	Address      []string
@@ -43,17 +42,15 @@ type Config struct {
 	DirectProducer KafkaDirectProducerConfig
 
 	// HealthCheck holds the shared "is this agent unhealthy?" thresholds
-	// consumed by both the Hedger (hedging decisions) and the Demoter
-	// (demotion decisions). Having a single source of truth here keeps
-	// the two components aligned on what "slow" and "faulty" mean.
+	// consumed by both the Hedger and the Demoter.
 	HealthCheck HealthCheckConfig
 
-	// Hedger holds the Hedger-specific timing knobs (hedge delay, max
-	// fallback agents). Health thresholds live on HealthCheck.
+	// Hedger holds the Hedger-specific timing knobs. Health thresholds live on
+	// HealthCheck.
 	Hedger HedgerConfig
 
-	// Demoter holds the Demoter-specific knobs (probe interval). Health
-	// thresholds live on HealthCheck.
+	// Demoter holds the Demoter-specific knobs. Health thresholds live on
+	// HealthCheck.
 	Demoter DemoterConfig
 
 	// ClusterStatsTTL is how long a cluster-wide stats snapshot is reused
@@ -112,6 +109,11 @@ func (c *Config) Validate() error {
 	}
 	if err := c.DirectProducer.Validate(); err != nil {
 		return fmt.Errorf("direct producer: %w", err)
+	}
+	// If WriteTimeout is below a single produce attempt's deadline, the flush ctx
+	// cancels before the first attempt completes and hedging never runs.
+	if attempt := c.DirectProducer.ProduceRequestTimeout + c.DirectProducer.ProduceRequestTimeoutOverhead; c.WriteTimeout < attempt {
+		return fmt.Errorf("write timeout (%s) must be at least the produce request timeout plus overhead (%s)", c.WriteTimeout, attempt)
 	}
 	return nil
 }

@@ -12,18 +12,14 @@ import (
 // wasteful while the cluster view barely changes within a short window.
 //
 // The cache holds one entry per (slowMultiplier, faultyThreshold) input
-// pair. Multiple consumers — e.g. Hedger and Demoter — call ClusterStats
-// with different parameters; without per-key caching they would
-// invalidate each other on every call. Each cached entry has its own
-// TTL window, so a stale entry for one key does not force a recompute
-// for another.
+// pair. Each cached entry has its own TTL window, so a stale entry for one
+// key does not force a recompute for another.
 type CachedAgentStatsTracker struct {
 	inner    AgentStatsTracker
 	cacheTTL time.Duration
 
 	// refreshMu serializes the recompute path so only one goroutine
-	// populates the cache for any key at a time. Readers go through
-	// cacheMu (a short critical section) and never take refreshMu.
+	// recomputes the cache at a time (a single mutex across all keys).
 	refreshMu sync.Mutex
 
 	cacheMu sync.RWMutex

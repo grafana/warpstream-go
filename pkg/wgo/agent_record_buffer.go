@@ -43,10 +43,11 @@ type AgentFlushFunc func(ctx context.Context, nodeID int32, partitions []routedT
 //
 // Two design choices stand out:
 //
-//   - The linger period is always honoured. The typical deployment has
+//   - Linger bounds batching on the steady path: the typical deployment has
 //     many concurrent client processes producing to the same Warpstream
-//     cluster and enforcing linger allow us to amortise the Produce requests
-//     cost.
+//     cluster, and lingering lets us amortise the Produce request cost. A
+//     batch still flushes early when adding the next record would exceed the
+//     byte cap, so linger is an upper bound on batching delay, not a floor.
 //   - Each flush runs in its own goroutine so the buffer can immediately
 //     start accumulating the next batch. This means multiple Produce
 //     requests to the same agent can be in flight concurrently. There is

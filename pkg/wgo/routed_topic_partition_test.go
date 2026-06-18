@@ -13,6 +13,50 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
+func TestTopicPartitionRecords_RecordValueBytes(t *testing.T) {
+	tests := map[string]struct {
+		records       []*kgo.Record
+		expectedBytes int64
+	}{
+		"empty group": {
+			records:       nil,
+			expectedBytes: 0,
+		},
+		"value only": {
+			records:       []*kgo.Record{{Value: []byte("hello")}},
+			expectedBytes: 5,
+		},
+		"key and value": {
+			records:       []*kgo.Record{{Key: []byte("ab"), Value: []byte("hello")}},
+			expectedBytes: 7,
+		},
+		"headers counted": {
+			records: []*kgo.Record{{
+				Key:   []byte("ab"),
+				Value: []byte("hello"),
+				Headers: []kgo.RecordHeader{
+					{Key: "h1", Value: []byte("xyz")},
+					{Key: "h22", Value: []byte("z")},
+				},
+			}},
+			expectedBytes: 2 + 5 + (2 + 3) + (3 + 1),
+		},
+		"multiple records summed": {
+			records: []*kgo.Record{
+				{Key: []byte("a"), Value: []byte("bb")},
+				{Value: []byte("ccc")},
+			},
+			expectedBytes: (1 + 2) + 3,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			p := topicPartitionRecords{records: tc.records}
+			assert.Equal(t, tc.expectedBytes, p.recordValueBytes())
+		})
+	}
+}
+
 func TestNewMultiRoutedTopicPartitionRecords(t *testing.T) {
 	t.Run("stamps every entry with the same nodeID and done", func(t *testing.T) {
 		parts := []topicPartitionRecords{

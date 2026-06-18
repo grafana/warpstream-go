@@ -7,9 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// metrics holds Prometheus metrics for WarpstreamClient.
-// It only contains metrics not already emitted by franz-go's kprom hooks
-// (which cover per-broker E2E latency, produce record/byte counts, etc.).
+// metrics holds the Prometheus metrics for this client's produce/hedge path.
 type metrics struct {
 	hedgeAttemptsTotal           prometheus.Counter
 	hedgeWinsTotal               prometheus.Counter
@@ -63,7 +61,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	return &metrics{
 		hedgeAttemptsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "hedge_attempts_total",
-			Help: "Total number of produce requests for which a fanout to per-partition secondaries was dispatched. Includes both latency-triggered hedges (primary still in flight) and primary-failure retries.",
+			Help: "Total number of produce requests for which a fanout to per-partition secondaries was attempted. Includes both latency-triggered hedges (primary still in flight) and primary-failure retries.",
 		}),
 		hedgeWinsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "hedge_wins_total",

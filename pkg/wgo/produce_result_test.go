@@ -184,18 +184,14 @@ func TestNewProduceResultAccumulator(t *testing.T) {
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
-		d, err := a.done()
-		assert.False(t, d)
-		assert.NoError(t, err)
+		assert.False(t, a.done())
 		assert.NotNil(t, a.result().err)
 		assert.Len(t, a.remaining(), 2)
 	})
 
 	t.Run("empty input: nothing pending, done immediately", func(t *testing.T) {
 		a := mustNewProduceResultAccumulator(t, nil)
-		d, err := a.done()
-		assert.True(t, d)
-		assert.NoError(t, err)
+		assert.True(t, a.done())
 		r := a.result()
 		assert.NoError(t, r.err)
 		assert.Empty(t, r.resp.Topics)
@@ -214,9 +210,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 			kmsg.ProduceResponseTopicPartition{Partition: 1, ErrorCode: kerrNoError, BaseOffset: 200},
 		))})
 
-		d, err := a.done()
-		assert.True(t, d)
-		assert.NoError(t, err)
+		assert.True(t, a.done())
 		assert.Nil(t, a.result().err)
 		assert.Empty(t, a.remaining())
 
@@ -236,11 +230,8 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 
 		a.accumulate(ProduceResult{err: kerr.LeaderNotAvailable})
 
-		d, err := a.done()
-		assert.False(t, d)
-		require.Error(t, err)
-		assert.ErrorIs(t, err, kerr.LeaderNotAvailable)
-		assert.NotNil(t, a.result().err)
+		assert.False(t, a.done())
+		assert.ErrorIs(t, a.result().err, kerr.LeaderNotAvailable)
 		assert.Len(t, a.remaining(), 1)
 	})
 
@@ -249,10 +240,8 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 
 		a.accumulate(ProduceResult{err: context.Canceled})
 
-		d, err := a.done()
-		assert.True(t, d)
-		assert.ErrorIs(t, err, context.Canceled)
-		assert.NotNil(t, a.result().err)
+		assert.True(t, a.done())
+		assert.ErrorIs(t, a.result().err, context.Canceled)
 
 		resp := a.result().resp
 		entries := partitionEntries(resp, "t")
@@ -273,10 +262,8 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 			makeProduceResponseTopicPartition(1, kerr.NotLeaderForPartition.Code),
 		))})
 
-		d, err := a.done()
-		assert.False(t, d)
-		assert.ErrorIs(t, err, kerr.NotLeaderForPartition)
-		assert.NotNil(t, a.result().err)
+		assert.False(t, a.done())
+		assert.ErrorIs(t, a.result().err, kerr.NotLeaderForPartition)
 		assert.Len(t, a.remaining(), 2)
 	})
 
@@ -291,10 +278,8 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 			makeProduceResponseTopicPartition(1, kerr.MessageTooLarge.Code),
 		))})
 
-		d, err := a.done()
-		assert.True(t, d)
-		assert.ErrorIs(t, err, kerr.MessageTooLarge)
-		assert.NotNil(t, a.result().err)
+		assert.True(t, a.done())
+		assert.ErrorIs(t, a.result().err, kerr.MessageTooLarge)
 
 		resp := a.result().resp
 		entries := partitionEntries(resp, "t")
@@ -313,8 +298,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 			kmsg.ProduceResponseTopicPartition{Partition: 0, ErrorCode: kerrNoError, BaseOffset: 100},
 		))})
 
-		d, _ := a.done()
-		assert.False(t, d)
+		assert.False(t, a.done())
 		// One partition resolved but the other is still pending: result
 		// surfaces bare ErrRecordTimeout (no failure was observed).
 		assert.ErrorIs(t, a.result().err, kgo.ErrRecordTimeout)
@@ -340,15 +324,13 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		))
 
 		a.accumulate(ProduceResult{resp: first})
-		d, _ := a.done()
-		assert.False(t, d)
+		assert.False(t, a.done())
 		// Intermediate state: one partition resolved but one still
 		// pending and no error observed → bare ErrRecordTimeout.
 		assert.ErrorIs(t, a.result().err, kgo.ErrRecordTimeout)
 
 		a.accumulate(ProduceResult{resp: second})
-		d, _ = a.done()
-		assert.True(t, d)
+		assert.True(t, a.done())
 		assert.Nil(t, a.result().err)
 
 		resp := a.result().resp
@@ -372,8 +354,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		a.accumulate(ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
 			kmsg.ProduceResponseTopicPartition{Partition: 0, ErrorCode: kerrNoError, BaseOffset: 1},
 		))})
-		d, _ := a.done()
-		require.True(t, d)
+		require.True(t, a.done())
 
 		a.accumulate(ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
 			kmsg.ProduceResponseTopicPartition{Partition: 0, ErrorCode: kerrNoError, BaseOffset: 999},

@@ -85,9 +85,7 @@ func singleRecordBatchEstimateBytes(r *kgo.Record) int64 {
 
 // multiRecordBatchEstimateBytes returns the wire-byte size of records encoded
 // as one fresh RecordBatch: the header plus each record at its 0-based offset
-// and a timestamp delta relative to the first record. This is the per-partition
-// unit the broker enforces message.max.bytes against, so the buffer uses it to
-// keep each flushed batch within MaxBatchBytes. singleRecordBatchEstimateBytes
+// and a timestamp delta relative to the first record. singleRecordBatchEstimateBytes
 // is the n=1 case.
 func multiRecordBatchEstimateBytes(records []*kgo.Record) int64 {
 	if len(records) == 0 {
@@ -146,7 +144,7 @@ func groupByPartition(records []*kgo.Record) map[int32][]*kgo.Record {
 	return m
 }
 
-// parseProduceResponse returns the first per-partition error, or nil on full success.
+// parseProduceResponse returns the first per-partition error, or nil on no error.
 func parseProduceResponse(resp *kmsg.ProduceResponse) error {
 	for i := range resp.Topics {
 		for j := range resp.Topics[i].Partitions {

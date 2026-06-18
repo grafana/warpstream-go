@@ -1,7 +1,7 @@
 # AGENTS.md — Go code
 
 Conventions for code under `pkg/`. See the repo-root [`AGENTS.md`](../AGENTS.md)
-for layout and commands, and [`README.md`](../README.md) for the architecture.
+for commands, and [`README.md`](../README.md) for the architecture.
 
 When you change the client's logic or behaviour, update
 [`README.md`](../README.md) in the same change: its "How it works" section
@@ -24,6 +24,11 @@ behaviour that would surprise a reader.
 - No decorative separator/divider comments (`// --- label ---`,
   `// === section ===`, trailing dashes, etc.). Group with blank lines or split
   the file instead.
+- Inside a function/method doc, do not document what the *caller* uses it for —
+  especially for general-purpose helpers. Document the function's own
+  contract/behaviour.
+- When embedding a struct inside another struct, do not enumerate the embedded
+  struct's fields in the outer struct's comment.
 
 ## Tests
 

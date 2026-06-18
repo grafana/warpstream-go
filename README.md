@@ -59,7 +59,7 @@ When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which
 - **Primary fails, cascade retries.** A leg counts as failed if *any* partition in its response errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling fails). The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
 - **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins, and the loser is cancelled.
 
-The hedge decision is **data-driven**, not unconditional. The Hedger consults rolling per-agent latency and error stats (the same window the `Demoter` uses, so both components agree on "is agent X bad?"). When the primary looks unhealthy the hedge delay is the cluster's baseline latency, so the fallback fires quickly. When the primary looks healthy the delay is multiplied so we don't stampede the cluster during normal operation — but we still hedge, because tail-latency amplification (every application request fans out to all partitions; one slow primary stalls the whole request) is the dominant cost we're trying to avoid.
+The hedge decision is **data-driven**, not unconditional. The Hedger consults rolling per-agent latency and error stats (the same window the `Demoter` uses, so both components agree on "is agent X bad?"). When the primary looks unhealthy the hedge delay is the cluster's baseline latency, so the fallback fires quickly. When the primary looks healthy the delay is multiplied so we don't stampede the cluster during normal operation — but we still hedge, because tail-latency amplification (every application request fans out to all partitions; one slow primary stalls the whole request) is the dominant cost we're trying to avoid. Either way the computed delay is floored at the configured `MinHedgeDelay` (probes are the exception — they fire the fallback immediately with no delay).
 
 Two cluster-wide guard rails suppress hedging entirely:
 - **Slow-fraction guard.** Too many agents are slower than baseline → hedging would amplify the problem; back off.
@@ -85,7 +85,7 @@ The `Hedger` handles the "slow but working" case; the Demoter handles the "reall
 
 ### Stats: a single rolling-window view shared by both controllers
 
-Every produce attempt (primary or hedge wave) feeds latency and error data into a rolling per-agent stats tracker. Both the `Hedger` and the `Demoter` read from the same tracker through the same `HealthCheckConfig`, so they always agree on which agents are slow and which are faulty. The tracker is bucketed (a few seconds per bucket, a small number of buckets total) so a transient blip doesn't trigger immediate intervention and a recovery is reflected quickly.
+Every produce attempt (primary or hedge wave) feeds latency and error data into a rolling per-agent stats tracker. Both the `Hedger` and the `Demoter` read from the same tracker through the same `HealthCheckConfig`, so they always agree on which agents are slow and which are faulty. The tracker is bucketed over a rolling 60s window (6 buckets, 10s each) so a transient blip doesn't trigger immediate intervention and a recovery is reflected quickly.
 
 ### Wire layer: franz-go, used as a transport
 

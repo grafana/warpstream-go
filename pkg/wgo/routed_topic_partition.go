@@ -17,15 +17,18 @@ type topicPartitionRecords struct {
 	records   []*kgo.Record
 }
 
-// recordValueBytes returns the total bytes of every record's Value in the
-// group. This is the producer-side accounting unit used for
-// BufferedProduceBytes — it intentionally omits Kafka wire overhead (record
-// batch header, varints, etc.) so the counter matches what franz-go reports
-// for the same records.
+// recordValueBytes returns the producer-side accounting size of the group,
+// mirroring franz-go's BufferedProduceBytes.
+//
+// It intentionally omits Kafka wire overhead (record batch header, varints,
+// etc.) so the counter matches what franz-go reports for the same records.
 func (p *topicPartitionRecords) recordValueBytes() int64 {
 	var n int64
 	for _, r := range p.records {
-		n += int64(len(r.Value))
+		n += int64(len(r.Key) + len(r.Value))
+		for _, h := range r.Headers {
+			n += int64(len(h.Key) + len(h.Value))
+		}
 	}
 	return n
 }

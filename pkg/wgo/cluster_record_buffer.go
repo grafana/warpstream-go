@@ -48,12 +48,14 @@ type ClusterRecordBuffer struct {
 	flush         AgentFlushFunc
 	metrics       *metrics
 
-	// bufferedBytes is the total size in bytes of every record currently
-	// waiting between Add and the corresponding done callback firing.
+	// bufferedBytes is the total size in bytes of every record waiting
+	// between Add and flush completion. A caller ctx-cancel detaches the
+	// caller but does not decrement this; only the flush completing does.
 	bufferedBytes atomic.Int64
 
-	// bufferedRecords is the count of records currently waiting between Add
-	// and the corresponding done callback firing.
+	// bufferedRecords is the count of records waiting between Add and flush
+	// completion. A caller ctx-cancel does not decrement this; only the
+	// flush completing does.
 	bufferedRecords atomic.Int64
 
 	mu           sync.RWMutex
@@ -87,10 +89,6 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []promisedRout
 	//     ctx.Err() (whichever first) to the original done;
 	//   - an accounting hook that decrements the buffered counters on
 	//     actual flush completion regardless of whether ctx already fired.
-	// Internal re-buffering (flush handler retrying failed records)
-	// bypasses this wrap via addToBuffers — the wrap survives across
-	// re-buffer cycles because done is aliased into the retry entry, so
-	// neither user-visible firing nor accounting double-fires.
 	wrapped := make([]promisedRoutedTopicPartitionRecords, len(partitions))
 	for i, p := range partitions {
 		valueBytes := p.recordValueBytes()
@@ -138,8 +136,7 @@ func (c *ClusterRecordBuffer) Add(ctx context.Context, partitions []promisedRout
 }
 
 // addToBuffers bins partition groups by destination and dispatches them to
-// the matching per-agent buffer. Used both by Add (external entry) and by
-// the flush handler when re-buffering cascade retries.
+// the matching per-agent buffer.
 func (c *ClusterRecordBuffer) addToBuffers(ctx context.Context, partitions []promisedRoutedTopicPartitionRecords) {
 	if len(partitions) == 0 {
 		return

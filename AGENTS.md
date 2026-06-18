@@ -13,8 +13,8 @@ the README in the same change.
 This file holds repo-wide conventions. More specific instructions live in nested
 `AGENTS.md` files — read the one closest to the files you're editing:
 
-- [`pkg/AGENTS.md`](pkg/AGENTS.md) — Go code: layout, comment style, tests.
-- [`.github/AGENTS.md`](.github/AGENTS.md) — CI, golangci-lint, Renovate, CODEOWNERS.
+- [`pkg/AGENTS.md`](pkg/AGENTS.md) — Go code: comment style, tests.
+- [`.github/AGENTS.md`](.github/AGENTS.md) — GitHub Actions / CI, Renovate.
 
 ## Common commands
 

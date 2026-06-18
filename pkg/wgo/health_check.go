@@ -15,11 +15,7 @@ import "errors"
 //
 // Keeping these in one struct avoids the bug-prone situation of the
 // Hedger and Demoter disagreeing on "is agent X unhealthy?" because the
-// operator forgot to keep two sets of flags in sync. The components
-// consume the subset of fields each cares about — for example the
-// Demoter ignores SlowMultiplier and MaxSlowFraction because latency-
-// based demotion has its own failure modes and is intentionally not
-// implemented (see DemoterConfig).
+// operator forgot to keep two sets of flags in sync.
 type HealthCheckConfig struct {
 	// SlowMultiplier marks an agent as slow when its window-average
 	// latency exceeds the cluster baseline by this factor. Must be >= 1.
@@ -31,7 +27,7 @@ type HealthCheckConfig struct {
 	MaxSlowFraction float64
 
 	// FaultyThreshold marks an agent as faulty when its window error
-	// rate exceeds this absolute fraction (in [0,1]).
+	// rate exceeds this absolute fraction (in (0,1]).
 	FaultyThreshold float64
 
 	// MaxFaultyFraction suppresses faulty-based action when this
@@ -48,8 +44,8 @@ func (c *HealthCheckConfig) Validate() error {
 	if c.MaxSlowFraction < 0 || c.MaxSlowFraction > 1 {
 		return errors.New("health check max slow fraction must be between 0 and 1")
 	}
-	if c.FaultyThreshold < 0 || c.FaultyThreshold > 1 {
-		return errors.New("health check faulty threshold must be between 0 and 1")
+	if c.FaultyThreshold <= 0 || c.FaultyThreshold > 1 {
+		return errors.New("health check faulty threshold must be greater than 0 and at most 1")
 	}
 	if c.MaxFaultyFraction < 0 || c.MaxFaultyFraction > 1 {
 		return errors.New("health check max faulty fraction must be between 0 and 1")

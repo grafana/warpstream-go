@@ -10,12 +10,14 @@ import (
 
 // Per-agent observations accumulate into a sliding window of fixed-duration
 // buckets. The window covers the last numStatsBuckets * bucketDuration of
-// activity; requests outside the window are discarded by bucket rotation.
+// activity; requests outside the window are not evicted but simply ignored
+// at read time, and their ring slot is lazily overwritten when a later
+// request reuses it.
 //
 // Bucketing — rather than an EMA — gives the latency / error-rate queries
-// time-aware statistics: a burst of slow or errored requests concentrated
-// in one bucket cannot trigger hedging because the bucket-spread gate
-// requires sustained activity across multiple buckets. The window also
+// time-aware statistics: a single concentrated burst of slow or errored
+// requests cannot trigger hedging because the bucket-spread gate requires
+// activity spread across multiple buckets. The window also
 // handles long quiet periods correctly: after silence longer than the
 // window, all buckets age out, so the next burst of activity restarts
 // observation from scratch.
@@ -39,10 +41,10 @@ const (
 
 	// minFilledBuckets is the number of distinct time buckets that must
 	// hold at least one request before an agent's stats are considered
-	// representative. With 6 buckets of 10s, requiring 2 means requests
-	// must cover at least 20 seconds of wall-clock activity. It is kept low
-	// so that an agent is still observable under backpressure (where each
-	// client sees only a handful of requests per agent per window).
+	// representative, ensuring an agent's activity is spread across time
+	// rather than concentrated in a single burst. It is kept low so that
+	// an agent is still observable under backpressure (where each client
+	// sees only a handful of requests per agent per window).
 	//
 	// The same gate is used for AgentStats (per-agent decisions) and for
 	// admitting an agent to the cluster baseline computation: an agent
@@ -117,8 +119,7 @@ type ClusterStats struct {
 	// BaselineLatency is the typical latency observed across the cluster's
 	// agents. Zero when no agent has any successful request in the window;
 	// the rest of the cluster view (BaselineErrorRate, FaultyFraction)
-	// remains meaningful in that case, since they are computed from total
-	// request counts rather than from successful-only ones.
+	// remains meaningful in that case.
 	BaselineLatency time.Duration
 
 	// SlowThreshold is the latency above which an agent is considered slow.
@@ -128,8 +129,8 @@ type ClusterStats struct {
 	SlowFraction float64
 
 	// SlowContributorsCount is the number of agents that contributed to
-	// SlowFraction (i.e. agents with at least one successful request).
-	// Lets the caller scale fraction-based decisions to cluster size.
+	// SlowFraction. Lets the caller scale fraction-based decisions to
+	// cluster size.
 	SlowContributorsCount int64
 
 	// BaselineErrorRate is the typical error rate observed across the cluster's agents.
@@ -138,8 +139,7 @@ type ClusterStats struct {
 	// FaultyThreshold is the error rate above which an agent is considered faulty.
 	FaultyThreshold float64
 
-	// AvgRequestsPerAgent is the average request count across observed agents
-	// (agents with at least one request in the window).
+	// AvgRequestsPerAgent is the average request count across observed agents.
 	AvgRequestsPerAgent int64
 
 	// FaultyFraction is the fraction of agents whose error rate exceeds FaultyThreshold.

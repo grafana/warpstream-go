@@ -18,10 +18,8 @@ type HedgerConfig struct {
 	// The delay is otherwise the cluster baseline latency.
 	MinHedgeDelay time.Duration
 
-	// MaxHedgeAgents caps how many per-partition candidates each leg
-	// walks before giving up on that partition. Across both legs (primary
-	// + secondary) a partition can be attempted on up to this many distinct
-	// agents in total; the two legs share the tried-history.
+	// MaxHedgeAgents caps the distinct agents tried per partition per
+	// ProduceSync, counting the primary.
 	MaxHedgeAgents int
 }
 
@@ -53,17 +51,18 @@ type HedgerConfig struct {
 //
 // Hedge-decision details:
 //   - shouldHedge consults the rolling per-agent stats (same window the
-//     Demoter uses via HealthCheckConfig) for primaryID specifically.
-//     When the primary is healthy and the cluster as a whole is healthy,
-//     hedge=false and we just wait for the primary synchronously.
-//   - anyProbeFor(primaryID) forces hedge=true delay=0: when the
-//     strategy surfaces primaryID as a AgentStateDemoted (a probe), we
-//     expect it to fail, so we don't pay the full delay before kicking
-//     off the fallback.
+//     Demoter uses via HealthCheckConfig) for primaryID specifically. A
+//     healthy primary still hedges, just with a longer delay (baseline ×
+//     SlowMultiplier). shouldHedge returns hedge=false only when a
+//     suppression gate trips: no agent stats, no cluster stats, or the
+//     cluster slow/faulty fraction is too high to hedge safely.
+//   - shouldHedge's inlined leading check forces hedge=true delay=0: when
+//     routing surfaced primaryID as AgentStateDemoted (a probe), we expect
+//     it to fail, so we don't pay the full delay before the fallback.
 //
-// hedge_wins_total counts the timer-fired race: the fallback waves
-// completed before primary returned. (Pure cascade retries — primary
-// returned first with a failure — don't count.)
+// hedge_wins_total counts every produce whose winning response came from
+// the secondary fanout — both the timer-fired race and cascade retries
+// (primary failed first, a secondary then succeeded).
 //
 // Inner must be wrapped by a TrackingProducer so every attempt —
 // primary and fallback — contributes to the rolling agent stats window.
@@ -235,7 +234,9 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		}
 		// Fallback failed (e.g. exhausted candidates) — the primary may
 		// still produce a usable outcome, so let it finish. If the primary
-		// then succeeds it won on its single attempt (depth 1).
+		// then succeeds it won on its single attempt (depth 1). When the
+		// fallback failed too the depth-1 label is best-effort: the
+		// fallback's wave count isn't surfaced on this branch.
 		return hedgerProduceResult{result: selectProduceResult(<-primaryCh, fb.result), attempts: 1}
 	}
 }
@@ -318,10 +319,11 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 	for _, p := range pending {
 		tp := topicPartition{topic: p.topic, partition: p.partition}
 
-		// Hard cap on distinct agents tried per partition. Needed because
-		// Candidates() may surface a different set across waves (pool
-		// refresh, probe rotation, ordering changes) so the per-call
-		// MaxHedgeAgents limit alone doesn't bound the total.
+		// Hard cap on distinct agents tried per partition. The candidate
+		// list is memoized per (topic, partition) for the call, so it's
+		// stable across waves; this is a defensive bound guaranteeing loop
+		// termination even if a strategy returns more entries (or
+		// duplicates) than MaxHedgeAgents.
 		if len(tried[tp]) >= h.cfg.MaxHedgeAgents {
 			return false, false
 		}
@@ -372,7 +374,7 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 		select {
 		case res := <-results:
 			acc.accumulate(res)
-			if isDone, _ := acc.done(); isDone {
+			if acc.done() {
 				// Either every partition resolved or a non-retriable
 				// err aborted the batch — either way, no further wave
 				// would change the outcome.

@@ -14,7 +14,7 @@ import (
 // Bundling the fields into one pointer prevents readers from observing a torn
 // snapshot across the strategy, topic UUIDs, and agent list.
 type poolState struct {
-	agents   []int32 // sorted ascending, used by Refresh to detect removed agents
+	agents   []int32 // sorted ascending so the strategy's hash-walk over non-leaders is consistent
 	topicIDs map[string][16]byte
 	strategy *DefaultPartitionAssignmentStrategy
 }
@@ -43,8 +43,9 @@ type poolState struct {
 //
 // Refresh has one data-preservation rule: when Metadata reports a topic
 // with a non-zero ErrorCode (LEADER_NOT_AVAILABLE during reassignment,
-// etc.) the response zeroes the topic UUID, so we carry the previous UUID
-// forward to keep producing during transient hiccups.
+// etc.) the response zeroes the topic UUID. Carrying the previous UUID
+// forward keeps the topic known during transient errors; the topic's leaders
+// are still dropped, so routing blocks until they reappear.
 type AgentPool struct {
 	client *kgo.Client
 
@@ -64,13 +65,13 @@ func NewAgentPool(client *kgo.Client) *AgentPool {
 	return p
 }
 
-// Refresh atomically replaces the snapshot. Uses the kgo.Client's cached
-// Metadata when fresh, falls back to a real MetadataRequest when stale.
-// Returns the NodeIDs that have left the cluster since the last Refresh —
-// callers must purge per-agent state (stats, etc.) for those IDs. Not safe
-// for concurrent calls.
+// Refresh atomically replaces the snapshot. Returns the NodeIDs that have left
+// the cluster since the last Refresh — callers must purge per-agent state
+// (stats, etc.) for those IDs. Not safe for concurrent calls.
 func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, err error) {
 	// Topics=nil requests metadata for every topic in the cluster.
+	// RequestCachedMetadata reuses the kgo.Client's cached Metadata when fresh
+	// and issues a real MetadataRequest when stale.
 	req := kmsg.NewPtrMetadataRequest()
 	meta, err := p.client.RequestCachedMetadata(ctx, req, 0)
 	if err != nil {
@@ -111,7 +112,7 @@ func (p *AgentPool) Agents() []int32 {
 	return p.state.Load().agents
 }
 
-// TopicID returns the UUID of topic from the last Metadata refresh, or
+// TopicID returns the UUID of topic from the last successful Metadata refresh, or
 // ok=false if the topic was unknown. UUIDs are required for Produce v13+.
 func (p *AgentPool) TopicID(topic string) ([16]byte, bool) {
 	id, ok := p.state.Load().topicIDs[topic]

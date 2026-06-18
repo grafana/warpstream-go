@@ -221,12 +221,11 @@ func (a *produceResultAccumulator) accumulate(res ProduceResult) {
 	}
 }
 
-// done reports whether the caller should stop retrying, and the last
-// error observed (nil when every partition resolved cleanly).
-func (a *produceResultAccumulator) done() (bool, error) {
+// done reports whether the caller should stop retrying.
+func (a *produceResultAccumulator) done() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return len(a.pending) == 0 || a.aborted, a.lastErr.err
+	return len(a.pending) == 0 || a.aborted
 }
 
 // result builds the final ProduceResult that the caller should surface.

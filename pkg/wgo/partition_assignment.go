@@ -65,17 +65,16 @@ func (a Agent) cloneWithState(state AgentState) Agent {
 // many small segments, and bloating the control-plane state the RSM has
 // to keep consistent.
 //
-// Determinism contains the blast radius. Hedge traffic for a given
-// partition lands on the *same* alternate agent across every Kafka client
-// instance, so the per-partition footprint stays at "one primary segment
-// stream + one secondary segment stream + ..." rather than fanning out
-// across the whole pool. All clients with the same Metadata view compute the
-// same candidate order, and as agents come and go orderings only shift for
-// the partitions actually affected.
+// Determinism contains the blast radius. Implementations are expected to place
+// hedge traffic for a given partition on the *same* alternate agent across
+// every Kafka client instance, so the per-partition footprint stays at "one
+// primary segment stream + one secondary segment stream + ..." rather than
+// fanning out across the whole pool.
 type PartitionAssignmentStrategy interface {
-	// Candidates returns the ordered candidate agents for (topic, partition):
-	// primary at [0], then deterministic alternates in hash order. Returns
-	// up to maxCandidates entries; nil if no candidates are available.
+	// Candidates returns up to maxCandidates candidate agents for
+	// (topic, partition), or nil if none are available. Callers must read
+	// each Agent's State rather than assuming a fixed slot meaning: a wrapper
+	// may elide the primary, stamp [0] as demoted, or return fewer entries.
 	Candidates(topic string, partition int32, maxCandidates int) []Agent
 }
 
@@ -101,6 +100,10 @@ func (l *LazyPartitionAssignmentStrategy) Candidates(topic string, partition int
 // pool. The leader map is precomputed in the constructor so the produce hot
 // path reads it lock-free; Candidates is computed lazily over the same agent
 // slice. AgentPool.Refresh creates a new instance on every refresh.
+//
+// Placement is fully deterministic: all clients with the same Metadata view
+// compute the same candidate order, and as agents come and go orderings only
+// shift for the partitions actually affected.
 type DefaultPartitionAssignmentStrategy struct {
 	agents  []int32 // sorted ascending, snapshot at construction
 	leaders map[topicPartition]int32
@@ -114,9 +117,9 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 }
 
 // Candidates returns the ordered candidate agents for (topic, partition):
-// the partition leader first, then deterministic hash-walked alternates.
-// All entries are reported as AgentStateHealthy in this strategy; the demoter
-// strategy wrapper (to be added later) overrides State to mark probes.
+// the partition leader first, then deterministic hash-walked alternates. Every
+// entry is reported as AgentStateHealthy; this strategy has no health signal of
+// its own.
 func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition int32, maxCandidates int) []Agent {
 	if maxCandidates <= 0 {
 		return nil
@@ -133,8 +136,9 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 	}
 
 	// Walk the non-leader agents in deterministic hash order: start at
-	// hash(topic, partition) mod nonLeaderCount and step forward. The
-	// "skip leader" cost is amortised by checking each agent once per step.
+	// hash(topic, partition) mod nonLeaderCount and step forward. nthNonLeader
+	// re-scans from index 0 each step, so emitting k candidates is O(k*n);
+	// acceptable here because n (agent count) is small.
 	nonLeaderCount := len(s.agents) - 1
 	if nonLeaderCount <= 0 {
 		return out
