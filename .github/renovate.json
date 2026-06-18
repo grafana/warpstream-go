@@ -1,0 +1,20 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": [
+        "config:recommended",
+        "helpers:pinGitHubActionDigests",
+        "schedule:weekly"
+    ],
+    "postUpdateOptions": [
+        "gomodTidy"
+    ],
+    "branchPrefix": "grafanarenovatebot/",
+    "platformCommit": "enabled",
+    "dependencyDashboard": false,
+    "rebaseWhen": "behind-base-branch",
+    "separateMajorMinor": false,
+    "vulnerabilityAlerts": {
+        "enabled": true
+    },
+    "osvVulnerabilityAlerts": true
+}
