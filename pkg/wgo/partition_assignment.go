@@ -175,9 +175,10 @@ func nthNonLeader(agents []int32, leader int32, idx int) int32 {
 func hashTopicPartition(topic string, partition int32) uint64 {
 	var d xxhash.Digest
 	d.Reset()
-	d.WriteString(topic)
+	// xxhash.Digest's Write/WriteString never return an error.
+	_, _ = d.WriteString(topic)
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], uint32(partition))
-	d.Write(b[:])
+	_, _ = d.Write(b[:])
 	return d.Sum64()
 }
