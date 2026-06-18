@@ -90,3 +90,19 @@ Every produce attempt (primary or hedge wave) feeds latency and error data into 
 ### Wire layer: franz-go, used as a transport
 
 The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequest` to `kgo.Client.Broker().Request()`. We do not use `kgo.Client.Produce()` because that's where franz-go's leader-pinning lives. By dropping into the raw `Broker.Request` path we keep all of franz-go's connection pooling, TLS/SASL, and wire encoding while taking complete control of which broker each request actually goes to.
+
+## FAQ
+
+### Is this a replacement for franz-go?
+
+No. [franz-go](https://github.com/twmb/franz-go) is an excellent, full-featured Kafka client, and we recommend it for the vast majority of use cases. This client is not a general-purpose client and it is not trying to compete with franz-go — in fact it is built *on top of* franz-go, which it relies on for connection management, Metadata, TLS/SASL, and wire encoding.
+
+### When should I use this client instead?
+
+Only when **all** of the following hold:
+
+- You're producing to a [Warpstream](https://www.warpstream.com/) cluster (or another backend with fully stateless, any-agent-serves-any-partition brokers).
+- You want better tail-latency and resilience on Produce requests via hedging and routing around sick agents.
+- Your workload tolerates at-least-once delivery and does not need ordering, idempotent, or transactional producers.
+
+If any of these don't apply, use franz-go. See [Non-negotiable principles](#non-negotiable-principles) for the full list of assumptions.
