@@ -54,6 +54,10 @@ const (
 	clientDialTimeout            = 2 * time.Second
 	clientWriteTimeout           = 10 * time.Second
 	clientRequestTimeoutOverhead = 2 * time.Second
+	// wgo.Config requires WriteTimeout >= ProduceRequestTimeout + overhead, so
+	// derive the per-attempt produce timeout from the write budget rather than
+	// reusing WriteTimeout (which would leave no room for the overhead).
+	clientProduceRequestTimeout = clientWriteTimeout - clientRequestTimeoutOverhead
 )
 
 // produceClient is the minimum clients surface the simulation exercises.
@@ -264,7 +268,7 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 		ClusterStatsTTL:         time.Second,
 		MetadataRefreshInterval: clientMetadataRefresh,
 		DirectProducer: wgo.KafkaDirectProducerConfig{
-			ProduceRequestTimeout:         clientWriteTimeout,
+			ProduceRequestTimeout:         clientProduceRequestTimeout,
 			ProduceRequestTimeoutOverhead: clientRequestTimeoutOverhead,
 		},
 	}
@@ -303,7 +307,7 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 		// a record can take to be delivered.
 		kgo.RecordRetries(math.MaxInt64),
 		kgo.RecordDeliveryTimeout(clientWriteTimeout),
-		kgo.ProduceRequestTimeout(clientWriteTimeout),
+		kgo.ProduceRequestTimeout(clientProduceRequestTimeout),
 		kgo.RequestTimeoutOverhead(clientRequestTimeoutOverhead),
 
 		kgo.MaxBufferedRecords(math.MaxInt),
