@@ -96,6 +96,68 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		assert.Equal(t, []byte("v"), fetches.Records()[0].Value)
 	})
 
+	t.Run("record with unset timestamp ships produce time on the wire", func(t *testing.T) {
+		c, _, clusterAddr := newTestWarpstreamClient(t, topic, 1)
+
+		// Produce with a zero Timestamp: the client must stamp the produce
+		// time like franz-go.
+		before := time.Now()
+		results := c.ProduceSync(context.Background(), []*kgo.Record{
+			{Topic: topic, Partition: 0, Value: []byte("v")},
+		})
+		require.Len(t, results, 1)
+		require.NoError(t, results[0].Err)
+
+		consumer, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+				topic: {0: kgo.NewOffset().AtStart()},
+			}),
+		)
+		require.NoError(t, err)
+		t.Cleanup(consumer.Close)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(cancel)
+		fetches := consumer.PollFetches(ctx)
+		require.NoError(t, fetches.Err())
+		require.Len(t, fetches.Records(), 1)
+
+		got := fetches.Records()[0].Timestamp
+		assert.False(t, got.IsZero())
+		assert.WithinDuration(t, before, got, 5*time.Second)
+	})
+
+	t.Run("record with set timestamp keeps it on the wire", func(t *testing.T) {
+		c, _, clusterAddr := newTestWarpstreamClient(t, topic, 1)
+
+		// A caller-set Timestamp must reach the wire unchanged, save for the
+		// truncation to the millisecond resolution Kafka stores.
+		ts := time.Date(2024, 1, 2, 3, 4, 5, 123_456_789, time.UTC)
+		results := c.ProduceSync(context.Background(), []*kgo.Record{
+			{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: ts},
+		})
+		require.Len(t, results, 1)
+		require.NoError(t, results[0].Err)
+
+		consumer, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+				topic: {0: kgo.NewOffset().AtStart()},
+			}),
+		)
+		require.NoError(t, err)
+		t.Cleanup(consumer.Close)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(cancel)
+		fetches := consumer.PollFetches(ctx)
+		require.NoError(t, fetches.Err())
+		require.Len(t, fetches.Records(), 1)
+
+		assert.WithinDuration(t, ts.Truncate(time.Millisecond), fetches.Records()[0].Timestamp, 0)
+	})
+
 	t.Run("records across two partitions both succeed", func(t *testing.T) {
 		c, _, _ := newTestWarpstreamClient(t, topic, 2)
 

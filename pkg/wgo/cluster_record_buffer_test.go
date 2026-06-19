@@ -294,6 +294,31 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.Equal(t, int64(0), c.BufferedRecords())
 	})
 
+	t.Run("pre-canceled ctx leaves record timestamps untouched", func(t *testing.T) {
+		flush := newRecordingFlush()
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		t.Cleanup(c.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// The produce is a no-op, so the detached caller's record must not be
+		// mutated: its Timestamp stays zero and a later retry gets a fresh now.
+		rec := makeRecord("t", 0, "v")
+		done := make(chan error, 1)
+		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{rec}, func(err error) { done <- err }))
+
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Fatal("done did not fire for pre-canceled ctx")
+		}
+		assert.True(t, rec.Timestamp.IsZero())
+		assert.Equal(t, 0, flush.callCount())
+	})
+
 	t.Run("context canceled mid-flight: done fires with ctx error but records still flush", func(t *testing.T) {
 		flush := newRecordingFlush()
 		release := make(chan struct{})
@@ -435,6 +460,41 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.NoError(t, *observedErr.Load())
 		assert.Equal(t, int64(0), c.BufferedBytes())
 		assert.Equal(t, int64(0), c.BufferedRecords())
+	})
+
+	t.Run("stamps produce time on records before buffering", func(t *testing.T) {
+		flush := newRecordingFlush()
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		t.Cleanup(c.Close)
+
+		// unset1 and unset2 have no Timestamp; preset already carries one, which the
+		// client must leave untouched.
+		unset1 := makeRecord("t", 0, "unset")
+		unset2 := makeRecord("t", 1, "unset2")
+		preset := makeRecord("t", 0, "preset")
+		presetTS := time.Date(2021, 5, 4, 3, 2, 1, 123_456_789, time.UTC)
+		preset.Timestamp = presetTS
+
+		start := time.Now()
+		done := make(chan error, 1)
+		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{unset1, unset2, preset}, func(err error) { done <- err }))
+
+		// Add stamps synchronously before buffering, so the records carry their
+		// produce timestamp as soon as Add returns.
+		assert.False(t, unset1.Timestamp.IsZero())
+		assert.WithinDuration(t, start, unset1.Timestamp, time.Second)
+		assert.Equal(t, unset1.Timestamp.Truncate(time.Millisecond), unset1.Timestamp)
+		assert.Equal(t, presetTS, preset.Timestamp)
+		// Records buffered together share one produce time (a single now per Add).
+		assert.Equal(t, unset1.Timestamp, unset2.Timestamp)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			t.Fatal("done did not fire")
+		}
 	})
 }
 
