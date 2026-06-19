@@ -294,6 +294,31 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.Equal(t, int64(0), c.BufferedRecords())
 	})
 
+	t.Run("pre-canceled ctx leaves record timestamps untouched", func(t *testing.T) {
+		flush := newRecordingFlush()
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		t.Cleanup(c.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// The produce is a no-op, so the detached caller's record must not be
+		// mutated: its Timestamp stays zero and a later retry gets a fresh now.
+		rec := makeRecord("t", 0, "v")
+		done := make(chan error, 1)
+		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{rec}, func(err error) { done <- err }))
+
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Fatal("done did not fire for pre-canceled ctx")
+		}
+		assert.True(t, rec.Timestamp.IsZero())
+		assert.Equal(t, 0, flush.callCount())
+	})
+
 	t.Run("context canceled mid-flight: done fires with ctx error but records still flush", func(t *testing.T) {
 		flush := newRecordingFlush()
 		release := make(chan struct{})
