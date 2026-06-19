@@ -436,6 +436,37 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.Equal(t, int64(0), c.BufferedBytes())
 		assert.Equal(t, int64(0), c.BufferedRecords())
 	})
+
+	t.Run("stamps produce time on records before buffering", func(t *testing.T) {
+		flush := newRecordingFlush()
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		t.Cleanup(c.Close)
+
+		// unset has no Timestamp. preset carries a sub-millisecond Timestamp the client must
+		// keep, truncated to the millisecond resolution Kafka stores.
+		unset := makeRecord("t", 0, "unset")
+		preset := makeRecord("t", 0, "preset")
+		preset.Timestamp = time.Date(2021, 5, 4, 3, 2, 1, 123_456_789, time.UTC)
+
+		start := time.Now()
+		done := make(chan error, 1)
+		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{unset, preset}, func(err error) { done <- err }))
+
+		// Add stamps synchronously before buffering, so the records carry their
+		// produce timestamp as soon as Add returns.
+		assert.False(t, unset.Timestamp.IsZero())
+		assert.WithinDuration(t, start, unset.Timestamp, time.Second)
+		assert.Equal(t, unset.Timestamp.Truncate(time.Millisecond), unset.Timestamp)
+		assert.Equal(t, time.Date(2021, 5, 4, 3, 2, 1, 123_000_000, time.UTC), preset.Timestamp)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			t.Fatal("done did not fire")
+		}
+	})
 }
 
 func TestClusterRecordBuffer_Close(t *testing.T) {

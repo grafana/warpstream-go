@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/twmb/franz-go/pkg/kbin"
@@ -52,6 +53,17 @@ const recordBatchHeaderBytes = 4 + 8 + 4 + batchFixedFieldsAfterLength
 // this is almost certainly misconfiguration — the broker would reject such a
 // request anyway — so we fail validation early rather than buffer toward it.
 const maxBatchBytesCeiling int32 = 1 << 30 // 1 GiB
+
+// ensureRecordTimestamp ensure the record has a timestamp set, eventually
+// setting it to the input time.Time.
+func ensureRecordTimestamp(record *kgo.Record, now time.Time) {
+	if record.Timestamp.IsZero() {
+		record.Timestamp = now
+	}
+
+	// Truncate to milliseconds resolution to honor Kafka protocol.
+	record.Timestamp = record.Timestamp.Truncate(time.Millisecond)
+}
 
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
 // given offsetDelta and tsDelta — the length-prefix varint plus the
