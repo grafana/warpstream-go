@@ -468,22 +468,26 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
 		t.Cleanup(c.Close)
 
-		// unset has no Timestamp. preset carries a sub-millisecond Timestamp the client must
-		// keep, truncated to the millisecond resolution Kafka stores.
-		unset := makeRecord("t", 0, "unset")
+		// unset1 and unset2 have no Timestamp; preset already carries one, which the
+		// client must leave untouched.
+		unset1 := makeRecord("t", 0, "unset")
+		unset2 := makeRecord("t", 1, "unset2")
 		preset := makeRecord("t", 0, "preset")
-		preset.Timestamp = time.Date(2021, 5, 4, 3, 2, 1, 123_456_789, time.UTC)
+		presetTS := time.Date(2021, 5, 4, 3, 2, 1, 123_456_789, time.UTC)
+		preset.Timestamp = presetTS
 
 		start := time.Now()
 		done := make(chan error, 1)
-		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{unset, preset}, func(err error) { done <- err }))
+		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{unset1, unset2, preset}, func(err error) { done <- err }))
 
 		// Add stamps synchronously before buffering, so the records carry their
 		// produce timestamp as soon as Add returns.
-		assert.False(t, unset.Timestamp.IsZero())
-		assert.WithinDuration(t, start, unset.Timestamp, time.Second)
-		assert.Equal(t, unset.Timestamp.Truncate(time.Millisecond), unset.Timestamp)
-		assert.Equal(t, time.Date(2021, 5, 4, 3, 2, 1, 123_000_000, time.UTC), preset.Timestamp)
+		assert.False(t, unset1.Timestamp.IsZero())
+		assert.WithinDuration(t, start, unset1.Timestamp, time.Second)
+		assert.Equal(t, unset1.Timestamp.Truncate(time.Millisecond), unset1.Timestamp)
+		assert.Equal(t, presetTS, preset.Timestamp)
+		// Records buffered together share one produce time (a single now per Add).
+		assert.Equal(t, unset1.Timestamp, unset2.Timestamp)
 
 		select {
 		case err := <-done:

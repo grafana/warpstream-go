@@ -54,15 +54,13 @@ const recordBatchHeaderBytes = 4 + 8 + 4 + batchFixedFieldsAfterLength
 // request anyway — so we fail validation early rather than buffer toward it.
 const maxBatchBytesCeiling int32 = 1 << 30 // 1 GiB
 
-// ensureRecordTimestamp ensure the record has a timestamp set, eventually
-// setting it to the input time.Time.
+// ensureRecordTimestamp defaults an unset record timestamp to now (truncated to
+// the millisecond resolution Kafka stores), mirroring franz-go's bufferRecord.
+// An already-set timestamp is left untouched.
 func ensureRecordTimestamp(record *kgo.Record, now time.Time) {
 	if record.Timestamp.IsZero() {
-		record.Timestamp = now
+		record.Timestamp = now.Truncate(time.Millisecond)
 	}
-
-	// Truncate to milliseconds resolution to honor Kafka protocol.
-	record.Timestamp = record.Timestamp.Truncate(time.Millisecond)
 }
 
 // recordEstimateBytes returns the on-wire byte size of r encoded at the

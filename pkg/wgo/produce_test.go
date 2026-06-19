@@ -3,6 +3,7 @@ package wgo
 import (
 	"bytes"
 	"hash/crc32"
+	"sync"
 	"testing"
 	"time"
 
@@ -539,4 +540,20 @@ func makeProduceResponseTopicPartition(partition int32, errorCode int16) kmsg.Pr
 		Partition: partition,
 		ErrorCode: errorCode,
 	}
+}
+
+func TestEnsureRecordTimestamp_ConcurrentRestampDoesNotRaceWithEncodeRead(t *testing.T) {
+	// The hedger re-buffers already-stamped records through a second
+	// ClusterRecordBuffer (re-invoking ensureRecordTimestamp) while the primary
+	// leg is still encoding them, which reads Timestamp. Re-stamping an
+	// already-stamped record must not write, or the two collide under -race.
+	rec := &kgo.Record{Timestamp: time.UnixMilli(1_700_000_000_123)}
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(2)
+		go func() { defer wg.Done(); ensureRecordTimestamp(rec, time.Now()) }()
+		go func() { defer wg.Done(); _ = rec.Timestamp.UnixMilli() }()
+	}
+	wg.Wait()
 }
