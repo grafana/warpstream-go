@@ -8,6 +8,14 @@ When you change the client's logic or behaviour, update
 documents the routing, buffering, hedging, and demotion design, and must not
 drift from the code.
 
+## Configuration
+
+`Config` (in `config.go`) and its functional options live together. Each `Config`
+field has a matching `With…` option in the same file. When you add, remove, or
+rename a `Config` field, make the same change to its `With…` option, and keep the
+option's doc comment aligned with the field's documentation. A defaulted field
+also needs its `Default…` constant and a line in `DefaultConfig`.
+
 ## Comments
 
 Default to writing **no** comment. Add one only when the *why* is non-obvious: a

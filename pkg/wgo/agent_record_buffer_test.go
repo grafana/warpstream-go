@@ -282,14 +282,14 @@ func TestAgentRecordBuffer_Add(t *testing.T) {
 }
 
 // TestAgentRecordBuffer_Add_SplitsOversizedPartitionGroup checks that a single
-// (topic, partition) group whose records together exceed maxBatchBytes (each
+// (topic, partition) group whose records together exceed batchMaxBytes (each
 // record individually under the cap) is split across multiple flushes, each a
 // RecordBatch within the cap — never one oversized batch the broker would
 // reject MessageTooLarge — and that the group's done still fires exactly once.
 func TestAgentRecordBuffer_Add_SplitsOversizedPartitionGroup(t *testing.T) {
-	const maxBatchBytes = 512
+	const batchMaxBytes = 512
 	flush := newRecordingFlush()
-	a := NewAgentRecordBuffer(1, time.Hour, maxBatchBytes, flush.Func(), newMetrics(prometheus.NewPedanticRegistry()))
+	a := NewAgentRecordBuffer(1, time.Hour, batchMaxBytes, flush.Func(), newMetrics(prometheus.NewPedanticRegistry()))
 
 	// Five 200-byte records for one partition in a single Add: each record's
 	// own batch is under the cap, but two already fill it, so the group can't
@@ -312,8 +312,8 @@ func TestAgentRecordBuffer_Add_SplitsOversizedPartitionGroup(t *testing.T) {
 
 	flushed := 0
 	for _, c := range calls {
-		assert.LessOrEqualf(t, actualUncompressedMultiRecordBatchWireSize(c.records), int32(maxBatchBytes),
-			"flushed batch must stay within maxBatchBytes")
+		assert.LessOrEqualf(t, actualUncompressedMultiRecordBatchWireSize(c.records), int32(batchMaxBytes),
+			"flushed batch must stay within batchMaxBytes")
 		flushed += len(c.records)
 	}
 	assert.Equal(t, len(records), flushed, "every record must be flushed exactly once")
