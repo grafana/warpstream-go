@@ -1,5 +1,8 @@
 # wgo – A Warpstream-aware Kafka client
 
+> [!WARNING]
+> **Experimental.** This client is not battle tested yet. Use it at your own risk, and please don't run it in production unless you've extensively tested it first. Testing and feedback are very welcome!
+
 A Kafka client tailored to [Warpstream](https://www.warpstream.com/)'s stateless-agent architecture.
 
 ## What it is
