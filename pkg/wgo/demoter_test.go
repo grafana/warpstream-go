@@ -264,6 +264,61 @@ func TestDemoter_Candidates(t *testing.T) {
 		`), "demoter_demotion_suppressed"))
 	})
 
+	t.Run("demoted_agents gauge reads 0 once demotion is suppressed", func(t *testing.T) {
+		// An agent demoted while the cluster is healthy leaves an entry in
+		// lastDemotedProbe. If the cluster then crosses the suppression floor,
+		// isDemoted treats every agent as non-demoted, so the stale entry no
+		// longer reflects an in-progress demotion. The gauge must report 0 to
+		// stay consistent with demoter_demotion_suppressed, not the leftover
+		// map entry.
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		for _, id := range []int32{healthyID, extraID, 4, 5} {
+			seedFullWindow(tr, id, nowNs, 20, 10, 0)
+		}
+		seedFullWindow(tr, slowID, nowNs, 10, 10, 10) // faulty
+		inner := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, part}: healthyAgents(slowID, healthyID)},
+		}
+		d, reg := newTestDemoter(inner, tr, health, cfg)
+		d.now = func() time.Time { return time.Now() }
+
+		// 1 of 5 faulty (0.2) is below the floor (max(0.3, 1/5)=0.3), so slowID
+		// is demoted and the gauge counts it.
+		cands := d.Candidates(topic, part, 2)
+		require.NotEmpty(t, cands)
+		assert.Equal(t, slowID, cands[0].NodeID)
+		assert.Equal(t, AgentStateDemoted, cands[0].State)
+		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+			# HELP demoter_demoted_agents Number of Warpstream agents currently demoted by the Demoter.
+			# TYPE demoter_demoted_agents gauge
+			demoter_demoted_agents 1
+
+			# HELP demoter_demotion_suppressed Whether the Demoter is currently suppressing all demotions (1) and why, broken down by reason; 0 for inactive reasons.
+			# TYPE demoter_demotion_suppressed gauge
+			demoter_demotion_suppressed{reason="many_faulty_agents"} 0
+			demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
+			demoter_demotion_suppressed{reason="no_cluster_stats"} 0
+		`)))
+
+		// A second agent turns faulty → 2 of 5 (0.4) exceeds the floor, so
+		// demotion is suppressed. slowID is still in lastDemotedProbe, but the
+		// gauge must read 0 because no demotion is in effect.
+		seedFullWindow(tr, 5, nowNs, 10, 10, 10)
+		require.Len(t, d.lastDemotedProbe, 1)
+		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+			# HELP demoter_demoted_agents Number of Warpstream agents currently demoted by the Demoter.
+			# TYPE demoter_demoted_agents gauge
+			demoter_demoted_agents 0
+
+			# HELP demoter_demotion_suppressed Whether the Demoter is currently suppressing all demotions (1) and why, broken down by reason; 0 for inactive reasons.
+			# TYPE demoter_demotion_suppressed gauge
+			demoter_demotion_suppressed{reason="many_faulty_agents"} 1
+			demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
+			demoter_demotion_suppressed{reason="no_cluster_stats"} 0
+		`)))
+	})
+
 	t.Run("cold start (no cluster stats): nothing is demoted", func(t *testing.T) {
 		// Empty tracker → no cluster baseline → fail-open: every
 		// candidate flows through unchanged.
@@ -865,5 +920,5 @@ func TestDemoter_Refresh(t *testing.T) {
 	assert.True(t, kept1)
 	assert.False(t, pruned2)
 	assert.True(t, kept3)
-	assert.Equal(t, float64(2), d.demotedAgentsCount())
+	assert.Len(t, d.lastDemotedProbe, 2)
 }
