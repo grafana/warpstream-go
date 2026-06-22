@@ -10,7 +10,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
 	github.com/twmb/franz-go v1.21.2
-	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260121195810-e0832fcbdccb
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260615024848-f17c00130060
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 )
 
