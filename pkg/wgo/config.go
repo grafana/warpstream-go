@@ -76,8 +76,8 @@ const (
 	DefaultHealthCheckMaxSlowFraction          = 0.3
 	DefaultHealthCheckFaultyThreshold          = 0.2
 	DefaultHealthCheckMaxFaultyFraction        = 0.3
-	DefaultHedgeMinDelay                       = 500 * time.Millisecond
-	DefaultHedgeMaxAgents                      = 3
+	DefaultHedgerMinHedgeDelay                 = 500 * time.Millisecond
+	DefaultHedgerMaxHedgeAgents                = 3
 	DefaultDemoterProbeInterval                = time.Second
 	DefaultClusterStatsTTL                     = time.Second
 	DefaultMetadataRefreshInterval             = 10 * time.Second
@@ -105,8 +105,8 @@ func DefaultConfig() Config {
 			MaxFaultyFraction: DefaultHealthCheckMaxFaultyFraction,
 		},
 		Hedger: HedgerConfig{
-			MinHedgeDelay:  DefaultHedgeMinDelay,
-			MaxHedgeAgents: DefaultHedgeMaxAgents,
+			MinHedgeDelay:  DefaultHedgerMinHedgeDelay,
+			MaxHedgeAgents: DefaultHedgerMaxHedgeAgents,
 		},
 		Demoter: DemoterConfig{
 			ProbeInterval: DefaultDemoterProbeInterval,
@@ -266,14 +266,14 @@ func WithHealthCheckMaxFaultyFraction(v float64) Opt {
 	return opt{func(c *Config) { c.HealthCheck.MaxFaultyFraction = v }}
 }
 
-// WithHedgeMinDelay sets the floor on the dynamically-computed hedge delay.
-func WithHedgeMinDelay(d time.Duration) Opt {
+// WithHedgerMinHedgeDelay sets the floor on the dynamically-computed hedge delay.
+func WithHedgerMinHedgeDelay(d time.Duration) Opt {
 	return opt{func(c *Config) { c.Hedger.MinHedgeDelay = d }}
 }
 
-// WithHedgeMaxAgents sets the maximum distinct agents tried per partition per
+// WithHedgerMaxHedgeAgents sets the maximum distinct agents tried per partition per
 // produce, counting the primary.
-func WithHedgeMaxAgents(n int) Opt {
+func WithHedgerMaxHedgeAgents(n int) Opt {
 	return opt{func(c *Config) { c.Hedger.MaxHedgeAgents = n }}
 }
 

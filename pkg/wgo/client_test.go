@@ -43,8 +43,8 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32) (*
 		WithHealthCheckMaxSlowFraction(0.3),
 		WithHealthCheckFaultyThreshold(0.05),
 		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgeMinDelay(10*time.Millisecond),
-		WithHedgeMaxAgents(3),
+		WithHedgerMinHedgeDelay(10*time.Millisecond),
+		WithHedgerMaxHedgeAgents(3),
 		WithDemoterProbeInterval(time.Second),
 		WithClusterStatsTTL(time.Second),
 		WithMetadataRefreshInterval(10*time.Second),
@@ -458,8 +458,8 @@ func BenchmarkClient_Produce(b *testing.B) {
 		WithHealthCheckMaxSlowFraction(0.3),
 		WithHealthCheckFaultyThreshold(0.05),
 		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgeMinDelay(time.Hour), // Disable hedging: never fires within the benchmark.
-		WithHedgeMaxAgents(3),
+		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
+		WithHedgerMaxHedgeAgents(3),
 		WithDemoterProbeInterval(time.Second),
 		WithClusterStatsTTL(time.Second),
 		WithMetadataRefreshInterval(time.Hour),
