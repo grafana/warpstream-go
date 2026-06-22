@@ -164,31 +164,28 @@ func TestDefaultConfig_PassesValidation(t *testing.T) {
 func TestOptions_ApplyToConfig(t *testing.T) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
-	cfg := DefaultConfig()
-	for _, o := range []Opt{
+	cfg := NewConfig(
 		WithAddress("a:9092", "b:9092"),
 		WithTopic("ingest"),
 		WithClientID("cid"),
 		WithDialTimeout(time.Second),
-		WithWriteTimeout(9 * time.Second),
+		WithWriteTimeout(9*time.Second),
 		WithTLSConfig(tlsCfg),
 		WithSASL(kgo.ClientID("sasl")),
-		WithLinger(2 * time.Millisecond),
+		WithLinger(2*time.Millisecond),
 		WithBatchMaxBytes(123),
-		WithProduceRequestTimeout(3 * time.Second),
-		WithProduceRequestTimeoutOverhead(4 * time.Second),
+		WithProduceRequestTimeout(3*time.Second),
+		WithProduceRequestTimeoutOverhead(4*time.Second),
 		WithHealthCheckSlowMultiplier(5),
 		WithHealthCheckMaxSlowFraction(0.5),
 		WithHealthCheckFaultyThreshold(0.6),
 		WithHealthCheckMaxFaultyFraction(0.7),
-		WithHedgerMinHedgeDelay(8 * time.Millisecond),
+		WithHedgerMinHedgeDelay(8*time.Millisecond),
 		WithHedgerMaxHedgeAgents(9),
-		WithDemoterProbeInterval(11 * time.Second),
-		WithClusterStatsTTL(12 * time.Second),
-		WithMetadataRefreshInterval(13 * time.Second),
-	} {
-		o.apply(&cfg)
-	}
+		WithDemoterProbeInterval(11*time.Second),
+		WithClusterStatsTTL(12*time.Second),
+		WithMetadataRefreshInterval(13*time.Second),
+	)
 
 	assert.Equal(t, []string{"a:9092", "b:9092"}, cfg.Address)
 	assert.Equal(t, "ingest", cfg.Topic)
@@ -214,10 +211,13 @@ func TestOptions_ApplyToConfig(t *testing.T) {
 }
 
 func TestOptions_UnsetFieldKeepsDefault(t *testing.T) {
-	cfg := DefaultConfig()
-	WithDialTimeout(time.Minute).apply(&cfg)
+	cfg := NewConfig(WithDialTimeout(time.Minute))
 
 	assert.Equal(t, time.Minute, cfg.DialTimeout)
 	// An untouched field keeps the DefaultConfig value.
 	assert.Equal(t, DefaultWriteTimeout, cfg.WriteTimeout)
+}
+
+func TestNewConfig_NoOptionsMatchesDefaultConfig(t *testing.T) {
+	assert.Equal(t, DefaultConfig(), NewConfig())
 }
