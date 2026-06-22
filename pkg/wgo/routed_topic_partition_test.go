@@ -210,8 +210,8 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 	})
 }
 
-func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
-	const maxBatchBytes = 512
+func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
+	const batchMaxBytes = 512
 	mk := func(recs []*kgo.Record, done func(ProduceResult)) promisedRoutedTopicPartitionRecords {
 		return promisedRoutedTopicPartitionRecords{
 			routedTopicPartitionRecords: routedTopicPartitionRecords{
@@ -222,7 +222,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 			done: done,
 		}
 	}
-	// oversized builds records that together exceed maxBatchBytes while each
+	// oversized builds records that together exceed batchMaxBytes while each
 	// stays well within it (200-byte values).
 	oversized := func() []*kgo.Record {
 		recs := make([]*kgo.Record, 5)
@@ -234,20 +234,20 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 
 	t.Run("group within cap is returned unchanged", func(t *testing.T) {
 		recs := []*kgo.Record{{Value: []byte("v")}}
-		out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(recs, func(ProduceResult) {}), maxBatchBytes)
+		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Len(t, out, 1)
 		assert.Equal(t, recs, out[0].records)
 	})
 
 	t.Run("oversized group splits into <=cap chunks, records preserved in order, routing kept", func(t *testing.T) {
 		recs := oversized()
-		out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(recs, func(ProduceResult) {}), maxBatchBytes)
+		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 
 		var got []*kgo.Record
 		for _, c := range out {
 			require.NotEmpty(t, c.records)
-			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(maxBatchBytes))
+			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(batchMaxBytes))
 			assert.Equal(t, "t", c.topic)
 			assert.Equal(t, int32(3), c.partition)
 			assert.Equal(t, int32(9), c.nodeID)
@@ -266,21 +266,21 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 		// records can't catch this — the few-byte varint error per record never
 		// accumulates enough to tip a chunk boundary.
 		//
-		// Use maxBatchBytes records: every record costs at least one wire byte,
-		// so this many records cannot fit in a single <=maxBatchBytes chunk —
+		// Use batchMaxBytes records: every record costs at least one wire byte,
+		// so this many records cannot fit in a single <=batchMaxBytes chunk —
 		// guaranteeing multiple, densely-packed chunks regardless of the cap.
 		base := time.UnixMilli(1_000_000)
-		recs := make([]*kgo.Record, maxBatchBytes)
+		recs := make([]*kgo.Record, batchMaxBytes)
 		for i := range recs {
 			recs[i] = &kgo.Record{Timestamp: base.Add(time.Duration(i) * time.Hour)}
 		}
-		out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(recs, func(ProduceResult) {}), maxBatchBytes)
+		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 
 		var got []*kgo.Record
 		for _, c := range out {
 			require.NotEmpty(t, c.records)
-			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(maxBatchBytes),
+			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(batchMaxBytes),
 				"each chunk's real wire size must stay within the cap")
 			got = append(got, c.records...)
 		}
@@ -296,10 +296,10 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 			calls int
 			got   ProduceResult
 		)
-		out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(oversized(), func(res ProduceResult) {
+		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(res ProduceResult) {
 			calls++
 			got = res
-		}), maxBatchBytes)
+		}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 		for i, c := range out {
 			c.done(success)
@@ -318,7 +318,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 		// single result delivered to the original done.
 		run := func(t *testing.T, results func(n int) []ProduceResult) ProduceResult {
 			var got ProduceResult
-			out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(oversized(), func(res ProduceResult) { got = res }), maxBatchBytes)
+			out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(res ProduceResult) { got = res }), batchMaxBytes)
 			require.GreaterOrEqual(t, len(out), 3, "oversized() must split into >=3 chunks to exercise these orderings")
 			rs := results(len(out))
 			for i, c := range out {
@@ -358,9 +358,9 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(t *testing.T) {
 
 	t.Run("concurrent chunk dones fire the original exactly once", func(t *testing.T) {
 		var calls int32
-		out := splitPromisedRoutedTopicPartitionRecordsByMaxBatchBytes(mk(oversized(), func(ProduceResult) {
+		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(ProduceResult) {
 			atomic.AddInt32(&calls, 1)
-		}), maxBatchBytes)
+		}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 
 		var wg sync.WaitGroup

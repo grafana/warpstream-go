@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -14,7 +16,7 @@ func TestConfig_Validate(t *testing.T) {
 		Topic:         "ingest",
 		DialTimeout:   2 * time.Second,
 		WriteTimeout:  10 * time.Second,
-		MaxBatchBytes: 16_000_000,
+		BatchMaxBytes: 16_000_000,
 		HealthCheck: HealthCheckConfig{
 			SlowMultiplier:    2.0,
 			MaxSlowFraction:   0.3,
@@ -63,17 +65,17 @@ func TestConfig_Validate(t *testing.T) {
 			mutate:     func(c *Config) { c.WriteTimeout = -1 },
 			wantErrMsg: "write timeout must be positive",
 		},
-		"zero max batch bytes": {
-			mutate:     func(c *Config) { c.MaxBatchBytes = 0 },
-			wantErrMsg: "max batch bytes must be positive",
+		"zero batch max bytes": {
+			mutate:     func(c *Config) { c.BatchMaxBytes = 0 },
+			wantErrMsg: "batch max bytes must be positive",
 		},
-		"negative max batch bytes": {
-			mutate:     func(c *Config) { c.MaxBatchBytes = -1 },
-			wantErrMsg: "max batch bytes must be positive",
+		"negative batch max bytes": {
+			mutate:     func(c *Config) { c.BatchMaxBytes = -1 },
+			wantErrMsg: "batch max bytes must be positive",
 		},
-		"max batch bytes over ceiling": {
-			mutate:     func(c *Config) { c.MaxBatchBytes = maxBatchBytesCeiling + 1 },
-			wantErrMsg: "max batch bytes must not exceed 1073741824",
+		"batch max bytes over ceiling": {
+			mutate:     func(c *Config) { c.BatchMaxBytes = batchMaxBytesCeiling + 1 },
+			wantErrMsg: "batch max bytes must not exceed 1073741824",
 		},
 		"negative linger": {
 			mutate:     func(c *Config) { c.Linger = -1 },
@@ -145,4 +147,77 @@ func TestConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultConfig_PassesValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Address = []string{"localhost:9092"}
+	cfg.Topic = "ingest"
+
+	require.NoError(t, cfg.Validate())
+
+	// The defaults sit exactly on Validate's WriteTimeout >= per-attempt deadline
+	// boundary, so any future change to these three must keep the relation intact.
+	require.Equal(t, DefaultWriteTimeout, DefaultProduceRequestTimeout+DefaultProduceRequestTimeoutOverhead)
+}
+
+func TestOptions_ApplyToConfig(t *testing.T) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	cfg := DefaultConfig()
+	for _, o := range []Opt{
+		WithAddress("a:9092", "b:9092"),
+		WithTopic("ingest"),
+		WithClientID("cid"),
+		WithDialTimeout(time.Second),
+		WithWriteTimeout(9 * time.Second),
+		WithTLSConfig(tlsCfg),
+		WithSASL(kgo.ClientID("sasl")),
+		WithLinger(2 * time.Millisecond),
+		WithBatchMaxBytes(123),
+		WithProduceRequestTimeout(3 * time.Second),
+		WithProduceRequestTimeoutOverhead(4 * time.Second),
+		WithHealthCheckSlowMultiplier(5),
+		WithHealthCheckMaxSlowFraction(0.5),
+		WithHealthCheckFaultyThreshold(0.6),
+		WithHealthCheckMaxFaultyFraction(0.7),
+		WithHedgerMinHedgeDelay(8 * time.Millisecond),
+		WithHedgerMaxHedgeAgents(9),
+		WithDemoterProbeInterval(11 * time.Second),
+		WithClusterStatsTTL(12 * time.Second),
+		WithMetadataRefreshInterval(13 * time.Second),
+	} {
+		o.apply(&cfg)
+	}
+
+	assert.Equal(t, []string{"a:9092", "b:9092"}, cfg.Address)
+	assert.Equal(t, "ingest", cfg.Topic)
+	assert.Equal(t, "cid", cfg.ClientID)
+	assert.Equal(t, time.Second, cfg.DialTimeout)
+	assert.Equal(t, 9*time.Second, cfg.WriteTimeout)
+	assert.True(t, cfg.TLSEnabled)
+	assert.Same(t, tlsCfg, cfg.TLSConfig)
+	assert.Len(t, cfg.SASLOptions, 1)
+	assert.Equal(t, 2*time.Millisecond, cfg.Linger)
+	assert.Equal(t, int32(123), cfg.BatchMaxBytes)
+	assert.Equal(t, 3*time.Second, cfg.DirectProducer.ProduceRequestTimeout)
+	assert.Equal(t, 4*time.Second, cfg.DirectProducer.ProduceRequestTimeoutOverhead)
+	assert.Equal(t, 5.0, cfg.HealthCheck.SlowMultiplier)
+	assert.Equal(t, 0.5, cfg.HealthCheck.MaxSlowFraction)
+	assert.Equal(t, 0.6, cfg.HealthCheck.FaultyThreshold)
+	assert.Equal(t, 0.7, cfg.HealthCheck.MaxFaultyFraction)
+	assert.Equal(t, 8*time.Millisecond, cfg.Hedger.MinHedgeDelay)
+	assert.Equal(t, 9, cfg.Hedger.MaxHedgeAgents)
+	assert.Equal(t, 11*time.Second, cfg.Demoter.ProbeInterval)
+	assert.Equal(t, 12*time.Second, cfg.ClusterStatsTTL)
+	assert.Equal(t, 13*time.Second, cfg.MetadataRefreshInterval)
+}
+
+func TestOptions_UnsetFieldKeepsDefault(t *testing.T) {
+	cfg := DefaultConfig()
+	WithDialTimeout(time.Minute).apply(&cfg)
+
+	assert.Equal(t, time.Minute, cfg.DialTimeout)
+	// An untouched field keeps the DefaultConfig value.
+	assert.Equal(t, DefaultWriteTimeout, cfg.WriteTimeout)
 }

@@ -29,36 +29,28 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32) (*
 
 	cluster, clusterAddr := testkafka.CreateCluster(t, numPartitions, topic)
 
-	cfg := Config{
-		Address:       []string{clusterAddr},
-		Topic:         topic,
-		ClientID:      "warpstream-test",
-		DialTimeout:   2 * time.Second,
-		WriteTimeout:  5 * time.Second,
-		Linger:        10 * time.Millisecond,
-		MaxBatchBytes: 1 << 20,
-		HealthCheck: HealthCheckConfig{
-			SlowMultiplier:    2.0,
-			MaxSlowFraction:   0.3,
-			FaultyThreshold:   0.05,
-			MaxFaultyFraction: 0.3,
-		},
-		Hedger: HedgerConfig{
-			MinHedgeDelay:  10 * time.Millisecond,
-			MaxHedgeAgents: 3,
-		},
-		Demoter: DemoterConfig{
-			ProbeInterval: time.Second,
-		},
-		ClusterStatsTTL:         time.Second,
-		MetadataRefreshInterval: 10 * time.Second,
-		DirectProducer: KafkaDirectProducerConfig{
-			ProduceRequestTimeout:         2 * time.Second,
-			ProduceRequestTimeoutOverhead: time.Second,
-		},
-	}
-
-	c, err := NewWarpstreamClient(cfg, log.NewNopLogger(), prometheus.NewPedanticRegistry())
+	c, err := NewWarpstreamClient(
+		log.NewNopLogger(),
+		prometheus.NewPedanticRegistry(),
+		WithAddress(clusterAddr),
+		WithTopic(topic),
+		WithClientID("warpstream-test"),
+		WithDialTimeout(2*time.Second),
+		WithWriteTimeout(5*time.Second),
+		WithLinger(10*time.Millisecond),
+		WithBatchMaxBytes(1<<20),
+		WithHealthCheckSlowMultiplier(2.0),
+		WithHealthCheckMaxSlowFraction(0.3),
+		WithHealthCheckFaultyThreshold(0.05),
+		WithHealthCheckMaxFaultyFraction(0.3),
+		WithHedgerMinHedgeDelay(10*time.Millisecond),
+		WithHedgerMaxHedgeAgents(3),
+		WithDemoterProbeInterval(time.Second),
+		WithClusterStatsTTL(time.Second),
+		WithMetadataRefreshInterval(10*time.Second),
+		WithProduceRequestTimeout(2*time.Second),
+		WithProduceRequestTimeoutOverhead(time.Second),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		c.Close()
@@ -216,7 +208,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 	t.Run("oversized record fails per-record while ok records succeed", func(t *testing.T) {
 		c, _, _ := newTestWarpstreamClient(t, topic, 1)
 
-		// MaxBatchBytes is set to 1<<20 (see newTestWarpstreamClient); a 2 MB
+		// BatchMaxBytes is set to 1<<20 (see newTestWarpstreamClient); a 2 MB
 		// value exceeds the cap by itself.
 		oversize := make([]byte, 2<<20)
 		small := []byte("v")
@@ -286,7 +278,7 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 	t.Run("rejects oversized record synchronously with kerr.MessageTooLarge", func(t *testing.T) {
 		c, _, _ := newTestWarpstreamClient(t, topic, 1)
 
-		// MaxBatchBytes is 1<<20 in the test client; a 2 MB value exceeds it.
+		// BatchMaxBytes is 1<<20 in the test client; a 2 MB value exceeds it.
 		input := &kgo.Record{Topic: topic, Partition: 0, Value: make([]byte, 2<<20), Timestamp: time.Now()}
 		done := make(chan error, 1)
 		c.Produce(context.Background(), input, func(r *kgo.Record, err error) {
@@ -452,35 +444,28 @@ func BenchmarkClient_Produce(b *testing.B) {
 	cluster, addr := testkafka.CreateCluster(b, numPartitions, topic, testkafka.WithNumBrokers(numBrokers))
 	b.Cleanup(cluster.Close)
 
-	cfg := Config{
-		Address:       []string{addr},
-		Topic:         topic,
-		ClientID:      "warpstream-bench",
-		DialTimeout:   2 * time.Second,
-		WriteTimeout:  30 * time.Second,
-		Linger:        50 * time.Millisecond,
-		MaxBatchBytes: 16 << 20,
-		HealthCheck: HealthCheckConfig{
-			SlowMultiplier:    2.0,
-			MaxSlowFraction:   0.3,
-			FaultyThreshold:   0.05,
-			MaxFaultyFraction: 0.3,
-		},
-		Hedger: HedgerConfig{
-			MinHedgeDelay:  time.Hour, // Disable hedging: never fires within the benchmark.
-			MaxHedgeAgents: 3,
-		},
-		Demoter: DemoterConfig{
-			ProbeInterval: time.Second,
-		},
-		ClusterStatsTTL:         time.Second,
-		MetadataRefreshInterval: time.Hour,
-		DirectProducer: KafkaDirectProducerConfig{
-			ProduceRequestTimeout:         10 * time.Second,
-			ProduceRequestTimeoutOverhead: time.Second,
-		},
-	}
-	wsc, err := NewWarpstreamClient(cfg, log.NewNopLogger(), prometheus.NewPedanticRegistry())
+	wsc, err := NewWarpstreamClient(
+		log.NewNopLogger(),
+		prometheus.NewPedanticRegistry(),
+		WithAddress(addr),
+		WithTopic(topic),
+		WithClientID("warpstream-bench"),
+		WithDialTimeout(2*time.Second),
+		WithWriteTimeout(30*time.Second),
+		WithLinger(50*time.Millisecond),
+		WithBatchMaxBytes(16<<20),
+		WithHealthCheckSlowMultiplier(2.0),
+		WithHealthCheckMaxSlowFraction(0.3),
+		WithHealthCheckFaultyThreshold(0.05),
+		WithHealthCheckMaxFaultyFraction(0.3),
+		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
+		WithHedgerMaxHedgeAgents(3),
+		WithDemoterProbeInterval(time.Second),
+		WithClusterStatsTTL(time.Second),
+		WithMetadataRefreshInterval(time.Hour),
+		WithProduceRequestTimeout(10*time.Second),
+		WithProduceRequestTimeoutOverhead(time.Second),
+	)
 	require.NoError(b, err)
 	b.Cleanup(wsc.Close)
 
