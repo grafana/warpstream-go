@@ -26,6 +26,10 @@ type metrics struct {
 
 	produceRequestsPrimaryTotal prometheus.Counter
 	produceRequestsHedgeTotal   prometheus.Counter
+
+	produceRecordsTotal         prometheus.Counter
+	produceRecordsFailedTotal   prometheus.Counter
+	produceRecordsRejectedTotal *prometheus.CounterVec
 }
 
 // hedge suppression reasons recorded on hedgeAttemptsSuppressedTotal. These
@@ -35,6 +39,13 @@ const (
 	hedgeSuppressedNoClusterStats = "no_cluster_stats"
 	hedgeSuppressedSlowFraction   = "slow_fraction_exceeded"
 	hedgeSuppressedFaultyFraction = "faulty_fraction_exceeded"
+)
+
+// produce rejection reasons recorded on produceRecordsRejectedTotal. These are
+// terminal failures the client returns before any wire dispatch.
+const (
+	produceRejectedRecordTooLarge  = "record_too_large"
+	produceRejectedNoAgentAssigned = "no_agent_assigned"
 )
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -90,6 +101,18 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		produceDirectRequestsFailedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "produce_direct_requests_failed_total",
 			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.",
+		}, []string{"reason"}),
+		produceRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "produce_records_total",
+			Help: "Total number of records submitted to the client via Produce and ProduceSync.",
+		}),
+		produceRecordsFailedTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "produce_records_failed_total",
+			Help: "Total number of records that failed to be produced after dispatch (wire failures, timeouts, canceled context). Records rejected before dispatch are counted by produce_records_rejected_total instead.",
+		}),
+		produceRecordsRejectedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "produce_records_rejected_total",
+			Help: "Total number of records rejected by the client before any wire dispatch, by reason (record_too_large, no_agent_assigned).",
 		}, []string{"reason"}),
 		produceRequestsAttemptsSuccess:     produceRequestAttempts.WithLabelValues("success"),
 		produceRequestsAttemptsFailure:     produceRequestAttempts.WithLabelValues("failure"),
