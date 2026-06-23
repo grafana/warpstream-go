@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -86,6 +87,9 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		require.NoError(t, fetches.Err())
 		require.Len(t, fetches.Records(), 1)
 		assert.Equal(t, []byte("v"), fetches.Records()[0].Value)
+
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("record with unset timestamp ships produce time on the wire", func(t *testing.T) {
@@ -160,6 +164,9 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		require.Len(t, results, 2)
 		assert.NoError(t, results[0].Err)
 		assert.NoError(t, results[1].Err)
+
+		assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("results preserve input record order", func(t *testing.T) {
@@ -181,6 +188,9 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		c, _, _ := newTestWarpstreamClient(t, topic, 1)
 		results := c.ProduceSync(context.Background(), nil)
 		assert.Nil(t, results)
+
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("record for unknown topic-partition fails fast at the resolver", func(t *testing.T) {
@@ -192,6 +202,10 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		require.Len(t, results, 1)
 		require.Error(t, results[0].Err)
 		assert.ErrorContains(t, results[0].Err, "no agent assigned")
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		// A rejection is not a failure: produceRecordsFailedTotal stays 0.
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("canceled ctx ends the wait", func(t *testing.T) {
@@ -203,6 +217,12 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		})
 		require.Len(t, results, 1)
 		require.ErrorIs(t, results[0].Err, context.Canceled)
+
+		// A canceled context is a post-dispatch failure, not a rejection.
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 	})
 
 	t.Run("oversized record fails per-record while ok records succeed", func(t *testing.T) {
@@ -227,6 +247,34 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 
 		assert.NoError(t, results[1].Err)
 		assert.Same(t, records[1], results[1].Record)
+
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		// The oversized record is a rejection, not a failure; the ok record succeeds.
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+	})
+
+	t.Run("multi-record batch with an unroutable partition counts every ok record rejected", func(t *testing.T) {
+		c, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+		// One record targets an unknown topic: routeRecords fails the whole
+		// batch uniformly, so every ok record is counted under no_agent_assigned.
+		records := []*kgo.Record{
+			{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+			{Topic: "does-not-exist", Partition: 0, Value: []byte("b"), Timestamp: time.Now()},
+			{Topic: topic, Partition: 0, Value: []byte("c"), Timestamp: time.Now()},
+		}
+		results := c.ProduceSync(context.Background(), records)
+		require.Len(t, results, 3)
+		for i := range results {
+			assert.ErrorContains(t, results[i].Err, "no agent assigned")
+		}
+
+		assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		// All records are rejections, not failures.
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 }
 
@@ -255,6 +303,8 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("promise did not fire")
 		}
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("invokes promise with error when topic is unknown to the agent pool", func(t *testing.T) {
@@ -273,6 +323,10 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("promise did not fire")
 		}
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		// A rejection is not a failure: produceRecordsFailedTotal stays 0.
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 	})
 
 	t.Run("rejects oversized record synchronously with kerr.MessageTooLarge", func(t *testing.T) {
@@ -293,6 +347,33 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 			t.Fatal("promise did not fire — rejection must be synchronous, not buffered")
 		}
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		// A rejection is not a failure: produceRecordsFailedTotal stays 0.
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+	})
+
+	t.Run("canceled ctx counts a post-dispatch failure, not a rejection", func(t *testing.T) {
+		c, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		input := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+		done := make(chan error, 1)
+		c.Produce(ctx, input, func(_ *kgo.Record, err error) {
+			done <- err
+		})
+
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Fatal("promise did not fire")
+		}
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 	})
 }
 

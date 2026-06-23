@@ -155,12 +155,24 @@ func NewWarpstreamClient(logger log.Logger, reg prometheus.Registerer, opts ...O
 // acknowledged or failed. Cancelling ctx detaches the caller; the record
 // is still produced in the background.
 func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, promise func(*kgo.Record, error)) {
+	c.metrics.produceRecordsTotal.Inc()
+
 	if singleRecordBatchEstimateBytes(record) > int64(c.cfg.BatchMaxBytes) {
+		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge).Inc()
 		promise(record, errRecordTooLarge(record))
 		return
 	}
-	routed, err := c.routeRecord(record, perRecordDone(record, promise))
+
+	routed, err := c.routeRecord(record, perRecordDone(record, func(r *kgo.Record, err error) {
+		// The buffered path counts a post-dispatch failure on any non-nil error;
+		// the pre-dispatch rejections are counted by produceRecordsRejectedTotal.
+		if err != nil {
+			c.metrics.produceRecordsFailedTotal.Inc()
+		}
+		promise(r, err)
+	}))
 	if err != nil {
+		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Inc()
 		promise(record, err)
 		return
 	}
@@ -174,6 +186,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	if len(records) == 0 {
 		return nil
 	}
+	c.metrics.produceRecordsTotal.Add(float64(len(records)))
 
 	results := make(kgo.ProduceResults, len(records))
 	var (
@@ -183,6 +196,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	)
 	for i, r := range records {
 		if singleRecordBatchEstimateBytes(r) > int64(c.cfg.BatchMaxBytes) {
+			c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge).Inc()
 			results[i] = kgo.ProduceResult{Record: r, Err: errRecordTooLarge(r)}
 			continue
 		}
@@ -201,6 +215,11 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 
 	routed, err := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
 		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, func(err error) {
+			if err != nil {
+				// Post-dispatch failure, resolved uniformly for the whole
+				// partition group; pre-dispatch rejections never reach here.
+				c.metrics.produceRecordsFailedTotal.Add(float64(len(groupRecords)))
+			}
 			for _, r := range groupRecords {
 				results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
 				wg.Done()
@@ -210,6 +229,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	if err != nil {
 		// One record had no known candidate. Fail the whole batch
 		// uniformly: every ok record gets the same error.
+		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(okIndices)))
 		for _, i := range okIndices {
 			results[i] = kgo.ProduceResult{Record: records[i], Err: err}
 		}
