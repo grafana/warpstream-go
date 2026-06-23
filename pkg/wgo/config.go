@@ -114,6 +114,16 @@ func DefaultConfig() Config {
 	}
 }
 
+// NewConfig returns DefaultConfig with opts applied. It does not validate the
+// result.
+func NewConfig(opts ...Opt) Config {
+	cfg := DefaultConfig()
+	for _, o := range opts {
+		o.apply(&cfg)
+	}
+	return cfg
+}
+
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
 	if len(c.Address) == 0 {

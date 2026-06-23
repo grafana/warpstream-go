@@ -94,10 +94,7 @@ type WarpstreamClient struct {
 // is synchronous: if Metadata cannot be reached on startup we fail fast rather
 // than serving traffic against an empty pool.
 func NewWarpstreamClient(logger log.Logger, reg prometheus.Registerer, opts ...Opt) (*WarpstreamClient, error) {
-	cfg := DefaultConfig()
-	for _, o := range opts {
-		o.apply(&cfg)
-	}
+	cfg := NewConfig(opts...)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid warpstream client config: %w", err)
 	}
