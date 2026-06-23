@@ -1,9 +1,11 @@
 package wgo
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -19,6 +21,7 @@ type Config struct {
 	TLSConfig    *tls.Config
 	ClientID     string
 	Topic        string
+	Dialer       func(ctx context.Context, network, host string) (net.Conn, error)
 
 	// SASLOptions are pre-built kgo options for SASL authentication.
 	SASLOptions []kgo.Opt
@@ -303,4 +306,9 @@ func WithClusterStatsTTL(d time.Duration) Opt {
 // background.
 func WithMetadataRefreshInterval(d time.Duration) Opt {
 	return opt{func(c *Config) { c.MetadataRefreshInterval = d }}
+}
+
+// WithDialer sets a custom dialer used to establish broker connections.
+func WithDialer(fn func(ctx context.Context, network, host string) (net.Conn, error)) Opt {
+	return opt{func(c *Config) { c.Dialer = fn }}
 }
