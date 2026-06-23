@@ -428,6 +428,9 @@ func newKgoClient(cfg Config) (*kgo.Client, error) {
 		// can't decode.
 		kgo.MaxVersions(produceMaxVersions()),
 	}
+	if cfg.Dialer != nil {
+		opts = append(opts, kgo.Dialer(cfg.Dialer))
+	}
 	if cfg.TLSEnabled {
 		opts = append(opts, kgo.DialTLSConfig(cfg.TLSConfig))
 	}
