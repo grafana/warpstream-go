@@ -96,16 +96,16 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 		// Counter ticked once on the successful Produce; no failures.
 		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-			# HELP produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
-			# TYPE produce_direct_requests_total counter
-			produce_direct_requests_total 1
-		`), "produce_direct_requests_total", "produce_direct_requests_failed_total"))
+			# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
+			# TYPE warpstream_produce_direct_requests_total counter
+			warpstream_produce_direct_requests_total 1
+		`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
 
 		// Per-attempt latency recorded once under outcome=success; no failure
 		// series exists (only the success series is collected).
 		successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), successCount)
-		assert.Equal(t, 1, testutil.CollectAndCount(reg, "produce_direct_request_latency_seconds"))
+		assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_direct_request_latency_seconds"))
 	})
 
 	t.Run("applies per-attempt timeout (TimeoutMillis on wire + client-side ctx deadline)", func(t *testing.T) {
@@ -185,13 +185,13 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 		// Failure was an attempt-timeout (DeadlineExceeded from inner ctx).
 		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-			# HELP produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
-			# TYPE produce_direct_requests_total counter
-			produce_direct_requests_total 1
-			# HELP produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
-			# TYPE produce_direct_requests_failed_total counter
-			produce_direct_requests_failed_total{reason="timeout"} 1
-		`), "produce_direct_requests_total", "produce_direct_requests_failed_total"))
+			# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
+			# TYPE warpstream_produce_direct_requests_total counter
+			warpstream_produce_direct_requests_total 1
+			# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
+			# TYPE warpstream_produce_direct_requests_failed_total counter
+			warpstream_produce_direct_requests_failed_total{reason="timeout"} 1
+		`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
 	})
 
 	// A transport-OK response carrying a per-partition error code is a failure:
@@ -253,10 +253,10 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				assert.ErrorIs(t, res.error(), tc.wantErr)
 
 				require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-					# HELP produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
-					# TYPE produce_direct_requests_failed_total counter
-					produce_direct_requests_failed_total{reason="%s"} 1
-				`, tc.reason)), "produce_direct_requests_failed_total"))
+					# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
+					# TYPE warpstream_produce_direct_requests_failed_total counter
+					warpstream_produce_direct_requests_failed_total{reason="%s"} 1
+				`, tc.reason)), "warpstream_produce_direct_requests_failed_total"))
 
 				successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
 				assert.Equal(t, uint64(0), successCount)

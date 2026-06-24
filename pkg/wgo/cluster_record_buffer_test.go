@@ -76,7 +76,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("single agent: routes through and flushes via linger", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -103,7 +103,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -136,7 +136,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -169,7 +169,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		var fires atomic.Int32
@@ -213,7 +213,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			return nil
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -235,7 +235,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("empty records: done fires synchronously with nil", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -255,7 +255,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("add after close fails fast", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 		c.Close()
 
 		done := make(chan error, 1)
@@ -274,7 +274,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("context already canceled: done fires synchronously with ctx error", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -297,7 +297,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("pre-canceled ctx leaves record timestamps untouched", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -327,7 +327,8 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			return nil
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m)
+		reg := prometheus.NewPedanticRegistry()
+		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, reg)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -339,9 +340,12 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		require.Eventually(t, func() bool { return flush.callCount() == 1 },
 			time.Second, 10*time.Millisecond)
 
-		// While the flush is held, the bytes are accounted as in-flight.
+		// While the flush is held, the bytes are accounted as in-flight, and the
+		// buffered-producer gauges mirror the counters.
 		assert.Equal(t, int64(len(value)), c.BufferedBytes())
 		assert.Equal(t, int64(1), c.BufferedRecords())
+		assert.Equal(t, float64(len(value)), gaugeValue(t, reg, "buffered_produce_bytes"))
+		assert.Equal(t, float64(1), gaugeValue(t, reg, "buffered_produce_records_total"))
 
 		// Cancel while the flush is still blocked.
 		cancel()
@@ -366,6 +370,8 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			time.Second, 10*time.Millisecond)
 		require.Eventually(t, func() bool { return c.BufferedRecords() == 0 },
 			time.Second, 10*time.Millisecond)
+		assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_bytes"))
+		assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_records_total"))
 	})
 
 	t.Run("multi-agent: ctx canceled mid-flight fires done exactly once with ctx error", func(t *testing.T) {
@@ -383,7 +389,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			return nil
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -435,7 +441,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("context canceled after success is a no-op", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -465,7 +471,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("stamps produce time on records before buffering", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		// unset1 and unset2 have no Timestamp; preset already carries one, which the
@@ -502,7 +508,7 @@ func TestClusterRecordBuffer_Close(t *testing.T) {
 	t.Run("idempotent", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 
 		c.Close()
 		c.Close() // must not panic or hang
@@ -517,7 +523,7 @@ func TestClusterRecordBuffer_Close(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m)
+		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
 
 		done := make(chan error, 1)
 		const valueA, valueB = "a", "b"

@@ -26,7 +26,7 @@ func buildProduceRequest(version int16, topic string, topicID [16]byte, records 
 	}
 	resolveTopicID := func(string) ([16]byte, bool) { return topicID, true }
 	// The resolver always returns ok=true, so the error path is unreachable.
-	req, _ := buildMultiTopicProduceRequest(version, resolveTopicID, records)
+	req, _, _ := buildMultiTopicProduceRequest(version, resolveTopicID, records)
 	return req
 }
 
@@ -169,7 +169,7 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 			return [16]byte{}, false
 		}
 
-		req, err := buildMultiTopicProduceRequest(11, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequest(11, resolve, records)
 		require.NoError(t, err)
 		require.NotNil(t, req)
 		require.Equal(t, int16(11), req.Version)
@@ -184,16 +184,30 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 		require.Equal(t, idB, topics["b"].TopicID)
 		assert.Len(t, topics["a"].Partitions, 2)
 		assert.Len(t, topics["b"].Partitions, 1)
+
+		// Stats aggregate across topics/partitions: 4 records in 3 partition
+		// batches (a/0, a/1, b/0), with compressed bytes never exceeding
+		// uncompressed.
+		assert.Equal(t, int64(4), stats.records)
+		assert.Equal(t, int64(3), stats.batches)
+		assert.Positive(t, stats.uncompressedBytes)
+		assert.Positive(t, stats.compressedBytes)
+		assert.LessOrEqual(t, stats.compressedBytes, stats.uncompressedBytes)
 	})
 
 	t.Run("populates the requested API version and acks", func(t *testing.T) {
 		records := []*kgo.Record{makeRecord("t", 0, "v")}
 		resolve := func(string) ([16]byte, bool) { return [16]byte{}, true }
 
-		req, err := buildMultiTopicProduceRequest(13, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequest(13, resolve, records)
 		require.NoError(t, err)
 		assert.Equal(t, int16(13), req.Version)
 		assert.Equal(t, int16(-1), req.Acks)
+
+		assert.Equal(t, int64(1), stats.records)
+		assert.Equal(t, int64(1), stats.batches)
+		assert.Positive(t, stats.uncompressedBytes)
+		assert.Positive(t, stats.compressedBytes)
 	})
 
 	t.Run("returns an error when a topic is unknown", func(t *testing.T) {
@@ -208,18 +222,20 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 			return [16]byte{}, false
 		}
 
-		req, err := buildMultiTopicProduceRequest(11, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequest(11, resolve, records)
 		require.Error(t, err)
 		assert.Nil(t, req)
 		assert.ErrorContains(t, err, "unknown")
+		assert.Equal(t, produceRequestStats{}, stats)
 	})
 
 	t.Run("empty records: returns a request with no topics", func(t *testing.T) {
 		resolve := func(string) ([16]byte, bool) { return [16]byte{}, true }
-		req, err := buildMultiTopicProduceRequest(11, resolve, nil)
+		req, stats, err := buildMultiTopicProduceRequest(11, resolve, nil)
 		require.NoError(t, err)
 		require.NotNil(t, req)
 		assert.Empty(t, req.Topics)
+		assert.Equal(t, produceRequestStats{}, stats)
 	})
 }
 

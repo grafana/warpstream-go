@@ -26,6 +26,10 @@ type Config struct {
 	// SASLOptions are pre-built kgo options for SASL authentication.
 	SASLOptions []kgo.Opt
 
+	// Hooks are franz-go hooks appended to the internal kgo.Client, letting
+	// callers observe the wire layer (e.g. their own metrics or tracing hooks).
+	Hooks []kgo.Hook
+
 	// Producer settings.
 
 	// Linger is how long the buffer waits to coalesce more records into a
@@ -229,6 +233,14 @@ func WithTLSConfig(tlsCfg *tls.Config) Opt {
 // WithSASL sets pre-built kgo options for SASL authentication.
 func WithSASL(opts ...kgo.Opt) Opt {
 	return opt{func(c *Config) { c.SASLOptions = opts }}
+}
+
+// WithHooks appends franz-go hooks to the internal kgo.Client. Hooks observe
+// the wire layer (broker connect/read/write, throttling, request E2E), so a
+// caller can attach its own metrics or tracing. The client also installs its
+// own kprom hook internally; these are added on top.
+func WithHooks(hooks ...kgo.Hook) Opt {
+	return opt{func(c *Config) { c.Hooks = append(c.Hooks, hooks...) }}
 }
 
 // WithLinger sets how long the buffer waits to coalesce more records into a
