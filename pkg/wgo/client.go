@@ -99,7 +99,7 @@ func NewWarpstreamClient(logger log.Logger, reg prometheus.Registerer, opts ...O
 		return nil, fmt.Errorf("invalid warpstream client config: %w", err)
 	}
 
-	kgoClient, err := newKgoClient(cfg)
+	kgoClient, err := newKgoClient(cfg, reg)
 	if err != nil {
 		return nil, fmt.Errorf("creating kgo client: %w", err)
 	}
@@ -143,7 +143,7 @@ func NewWarpstreamClient(logger log.Logger, reg prometheus.Registerer, opts ...O
 	// bound each flush by WriteTimeout. The Hedger is otherwise shaped
 	// like a DirectProducer (same signature as KafkaDirectProducer) so it
 	// composes directly with the buffer.
-	c.buffer = NewClusterRecordBuffer(cfg.Linger, cfg.BatchMaxBytes, c.flushBatch, m)
+	c.buffer = NewClusterRecordBuffer(cfg.Linger, cfg.BatchMaxBytes, c.flushBatch, m, reg)
 	c.startBackgroundRefresh()
 	return c, nil
 }
@@ -413,8 +413,9 @@ func perRecordDone(record *kgo.Record, promise func(*kgo.Record, error)) func(Pr
 }
 
 // newKgoClient constructs the kgo.Client used by the WarpstreamClient for
-// connection management and metadata.
-func newKgoClient(cfg Config) (*kgo.Client, error) {
+// connection management and metadata. It wires the kprom transport-metrics
+// hook (registered on reg) alongside any caller hooks from cfg.
+func newKgoClient(cfg Config, reg prometheus.Registerer) (*kgo.Client, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Address...),
 		kgo.ClientID(cfg.ClientID),
@@ -455,6 +456,13 @@ func newKgoClient(cfg Config) (*kgo.Client, error) {
 		opts = append(opts, kgo.DialTLSConfig(cfg.TLSConfig))
 	}
 	opts = append(opts, cfg.SASLOptions...)
+
+	// kprom tracks the transport-level metrics. The filtering registerer drops
+	// the producer-state metrics this client tracks itself. Caller hooks are appended on top.
+	kpromMetrics := newKpromMetrics(newFilteringRegisterer(reg, kpromProducerStateMetricNames...))
+	hooks := append([]kgo.Hook{kpromMetrics}, cfg.Hooks...)
+	opts = append(opts, kgo.WithHooks(hooks...))
+
 	return kgo.NewClient(opts...)
 }
 

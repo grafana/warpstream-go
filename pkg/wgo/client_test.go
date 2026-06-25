@@ -20,6 +20,31 @@ import (
 	"github.com/grafana/warpstream-go/pkg/wgo/internal/testkafka"
 )
 
+// testWarpstreamOpts returns the options used to build a WarpstreamClient
+// against a test cluster. Shared so a test can supply its own registry.
+func testWarpstreamOpts(clusterAddr, topic string) []Opt {
+	return []Opt{
+		WithAddress(clusterAddr),
+		WithTopic(topic),
+		WithClientID("warpstream-test"),
+		WithDialTimeout(2 * time.Second),
+		WithWriteTimeout(5 * time.Second),
+		WithLinger(10 * time.Millisecond),
+		WithBatchMaxBytes(1 << 20),
+		WithHealthCheckSlowMultiplier(2.0),
+		WithHealthCheckMaxSlowFraction(0.3),
+		WithHealthCheckFaultyThreshold(0.05),
+		WithHealthCheckMaxFaultyFraction(0.3),
+		WithHedgerMinHedgeDelay(10 * time.Millisecond),
+		WithHedgerMaxHedgeAgents(3),
+		WithDemoterProbeInterval(time.Second),
+		WithClusterStatsTTL(time.Second),
+		WithMetadataRefreshInterval(10 * time.Second),
+		WithProduceRequestTimeout(2 * time.Second),
+		WithProduceRequestTimeoutOverhead(time.Second),
+	}
+}
+
 // newTestWarpstreamClient brings up a kfake cluster and wires a
 // WarpstreamClient against it. The background metadata refresh goroutine
 // runs but its ticker (MetadataRefreshInterval) is well above any individual
@@ -33,24 +58,7 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32) (*
 	c, err := NewWarpstreamClient(
 		log.NewNopLogger(),
 		prometheus.NewPedanticRegistry(),
-		WithAddress(clusterAddr),
-		WithTopic(topic),
-		WithClientID("warpstream-test"),
-		WithDialTimeout(2*time.Second),
-		WithWriteTimeout(5*time.Second),
-		WithLinger(10*time.Millisecond),
-		WithBatchMaxBytes(1<<20),
-		WithHealthCheckSlowMultiplier(2.0),
-		WithHealthCheckMaxSlowFraction(0.3),
-		WithHealthCheckFaultyThreshold(0.05),
-		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgerMinHedgeDelay(10*time.Millisecond),
-		WithHedgerMaxHedgeAgents(3),
-		WithDemoterProbeInterval(time.Second),
-		WithClusterStatsTTL(time.Second),
-		WithMetadataRefreshInterval(10*time.Second),
-		WithProduceRequestTimeout(2*time.Second),
-		WithProduceRequestTimeoutOverhead(time.Second),
+		testWarpstreamOpts(clusterAddr, topic)...,
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -497,6 +505,78 @@ func TestWarpstreamClient_Close(t *testing.T) {
 		require.NoError(t, fetches.Err())
 		require.Len(t, fetches.Records(), 1)
 	})
+}
+
+// TestWarpstreamClient_Metrics verifies the metric ownership split: transport
+// metrics come from kprom, producer-state metrics are tracked by this client,
+// and warpstream-specific metrics carry the warpstream_ prefix — all on one
+// registry without a duplicate registration.
+func TestWarpstreamClient_Metrics(t *testing.T) {
+	const topic = "test-topic"
+
+	reg := prometheus.NewPedanticRegistry()
+	_, clusterAddr := testkafka.CreateCluster(t, 1, topic)
+
+	c, err := NewWarpstreamClient(log.NewNopLogger(), reg, testWarpstreamOpts(clusterAddr, topic)...)
+	require.NoError(t, err)
+	t.Cleanup(c.Close)
+
+	results := c.ProduceSync(context.Background(), []*kgo.Record{
+		{Topic: topic, Partition: 0, Key: []byte("k"), Value: []byte("v"), Timestamp: time.Now()},
+	})
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+
+	// Producer-state metrics, tracked by this client with real values.
+	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceWireRecordsTotal))
+	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceWireBatchesTotal))
+	assert.Greater(t, testutil.ToFloat64(c.metrics.produceWireBytesTotal), float64(0))
+	assert.Greater(t, testutil.ToFloat64(c.metrics.produceWireCompressedBytesTotal), float64(0))
+
+	// Registered exactly once (kprom's own versions are filtered out), so
+	// there's no collision.
+	assert.Equal(t, 1, testutil.CollectAndCount(reg, "produce_records_total"))
+	assert.Equal(t, 1, testutil.CollectAndCount(reg, "produce_batches_total"))
+	assert.Equal(t, 1, testutil.CollectAndCount(reg, "buffered_produce_bytes"))
+	assert.Equal(t, 1, testutil.CollectAndCount(reg, "buffered_produce_records_total"))
+
+	// Transport metrics come from kprom and populate on the produce path
+	// (the embedded kgo.Client connects to issue the Produce request).
+	assert.GreaterOrEqual(t, testutil.CollectAndCount(reg, "connects_total"), 1)
+
+	// Warpstream-specific metrics carry the warpstream_ prefix; the
+	// client-boundary record counter is distinct from the wire-level one above.
+	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
+	assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_records_total"))
+	assert.GreaterOrEqual(t, testutil.CollectAndCount(reg, "warpstream_produce_direct_requests_total"), 1)
+
+	// The whole set gathers cleanly: no duplicate registration across kprom,
+	// the producer-state metrics, and the warpstream_ metrics.
+	_, err = reg.Gather()
+	require.NoError(t, err)
+}
+
+// TestNewWarpstreamClient_NilRegisterer verifies the client builds and produces
+// with a nil registerer (metrics disabled), without panicking.
+func TestNewWarpstreamClient_NilRegisterer(t *testing.T) {
+	const topic = "test-topic"
+	_, clusterAddr := testkafka.CreateCluster(t, 1, topic)
+
+	var c *WarpstreamClient
+	require.NotPanics(t, func() {
+		var err error
+		c, err = NewWarpstreamClient(log.NewNopLogger(), nil, testWarpstreamOpts(clusterAddr, topic)...)
+		require.NoError(t, err)
+	})
+	t.Cleanup(c.Close)
+
+	// Producing still works; the metric updates are no-ops on unregistered
+	// collectors.
+	results := c.ProduceSync(context.Background(), []*kgo.Record{
+		{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+	})
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
 }
 
 // produceClient is the minimum surface BenchmarkClient_Produce exercises against

@@ -12,6 +12,7 @@ require (
 	github.com/twmb/franz-go v1.21.3
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260121195810-e0832fcbdccb
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1
+	github.com/twmb/franz-go/plugin/kprom v1.4.0
 )
 
 require (
