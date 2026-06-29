@@ -34,7 +34,7 @@ github.com/kylelemons/godebug/diff
 # github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
 ## explicit
 github.com/munnerz/goautoneg
-# github.com/pierrec/lz4/v4 v4.1.26
+# github.com/pierrec/lz4/v4 v4.1.27
 ## explicit; go 1.17
 github.com/pierrec/lz4/v4
 github.com/pierrec/lz4/v4/internal/lz4block
