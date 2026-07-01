@@ -74,7 +74,7 @@ func defaultCompressionFormats() []Compression {
 }
 
 var gzipPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return gzip.NewWriter(nil)
 	},
 }
@@ -226,12 +226,14 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			rsp.Header().Set(contentEncodingHeader, encodingHeader)
 		}
 
-		var enc expfmt.Encoder
+		var (
+			enc     expfmt.Encoder
+			encOpts []expfmt.EncoderOption
+		)
 		if opts.EnableOpenMetricsTextCreatedSamples {
-			enc = expfmt.NewEncoder(w, contentType, expfmt.WithCreatedLines())
-		} else {
-			enc = expfmt.NewEncoder(w, contentType)
+			encOpts = append(encOpts, expfmt.WithCreatedLines())
 		}
+		enc = expfmt.NewEncoder(w, contentType, encOpts...)
 
 		// handleError handles the error according to opts.ErrorHandling
 		// and returns true if we have to abort after the handling.
@@ -379,7 +381,7 @@ const (
 // log.Logger from the standard library implements this interface, and it is
 // easy to implement by custom loggers, if they don't do so already anyway.
 type Logger interface {
-	Println(v ...interface{})
+	Println(v ...any)
 }
 
 // HandlerOpts specifies options how to serve metrics via an http.Handler. The
