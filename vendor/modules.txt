@@ -93,10 +93,10 @@ github.com/twmb/franz-go/pkg/kmsg/internal/kbin
 # github.com/twmb/franz-go/plugin/kprom v1.4.0
 ## explicit; go 1.25.0
 github.com/twmb/franz-go/plugin/kprom
-# golang.org/x/crypto v0.52.0
+# golang.org/x/crypto v0.53.0
 ## explicit; go 1.25.0
 golang.org/x/crypto/pbkdf2
-# golang.org/x/sys v0.45.0
+# golang.org/x/sys v0.46.0
 ## explicit; go 1.25.0
 golang.org/x/sys/unix
 golang.org/x/sys/windows
