@@ -124,6 +124,10 @@ func (a *AgentBuffer[W]) Add(items []promised[W]) {
 // (startFlushLocked), which keeps each item's done untouched. Caller must hold
 // a.mu.
 func (a *AgentBuffer[W]) addToNextProduceLocked(p promised[W]) {
+	// wireBytes() sizes each item as its own standalone RecordBatch. Same-partition
+	// items later merge into a single batch at flush, so this over-counts one
+	// RecordBatch header per item that ends up merged. The over-count is
+	// conservative: it can only flush early, never let a batch exceed the cap.
 	addBytes := p.item.wireBytes()
 	if a.nextProduceRecords > 0 && a.nextProduceWireBytes+addBytes > int64(a.batchMaxBytes) {
 		a.startFlushLocked()
