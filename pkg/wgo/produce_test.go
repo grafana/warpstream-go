@@ -607,9 +607,18 @@ func TestDecodeBatch_RoundTripsEncodeBatch(t *testing.T) {
 			Key:       []byte("k3"),
 			Timestamp: time.UnixMilli(1_700_000_000_789),
 		},
+		{
+			// A large, highly compressible value forces the batch onto the Snappy
+			// path, so decodeBatch's decompression branch is exercised.
+			Key:       []byte("k4"),
+			Value:     bytes.Repeat([]byte("compress-me"), 512),
+			Timestamp: time.UnixMilli(1_700_000_001_000),
+		},
 	}
 
 	encoded, _, _ := encodeBatch(records)
+	require.Equal(t, int16(2), decodeRecordBatch(t, encoded).Attributes&0x7,
+		"batch must be Snappy-compressed to exercise the decode path")
 	got := decodeBatch(encoded)
 
 	require.Len(t, got, len(records))

@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -134,13 +135,15 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 		// Two separately-encoded batches for the same partition, as the hedge
 		// buffer accumulates across concurrent produces. Merging them must yield a
-		// single RecordBatch: kfake, like a real broker, rejects a partition whose
-		// records field carries more than one batch.
-		rec := func(key, value string) *kgo.Record {
-			return &kgo.Record{Topic: topicName, Partition: partition, Key: []byte(key), Value: []byte(value), Timestamp: time.Now()}
+		// single RecordBatch: a partition carrying more than one batch is not a
+		// valid produce payload (kfake rejects it). Values are large and
+		// compressible so each batch takes the Snappy path, exercising the
+		// decode+re-encode merge end to end.
+		rec := func(key string) *kgo.Record {
+			return &kgo.Record{Topic: topicName, Partition: partition, Key: []byte(key), Value: bytes.Repeat([]byte(key+"|"), 512), Timestamp: time.Now()}
 		}
-		batch1 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k1", "v1"), rec("k2", "v2")})
-		batch2 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k3", "v3")})
+		batch1 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k1"), rec("k2")})
+		batch2 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k3")})
 
 		merged := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
 			{item: routedEncodedTopicPartitionRecords{encodedTopicPartitionRecords: batch1, nodeID: brokerNodeID}},
@@ -171,9 +174,9 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			got = append(got, fetches.Records()...)
 		}
 		require.Len(t, got, 3)
-		assert.Equal(t, []byte("v1"), got[0].Value)
-		assert.Equal(t, []byte("v2"), got[1].Value)
-		assert.Equal(t, []byte("v3"), got[2].Value)
+		assert.Equal(t, bytes.Repeat([]byte("k1|"), 512), got[0].Value)
+		assert.Equal(t, bytes.Repeat([]byte("k2|"), 512), got[1].Value)
+		assert.Equal(t, bytes.Repeat([]byte("k3|"), 512), got[2].Value)
 	})
 
 	t.Run("applies per-attempt timeout (TimeoutMillis on wire + client-side ctx deadline)", func(t *testing.T) {

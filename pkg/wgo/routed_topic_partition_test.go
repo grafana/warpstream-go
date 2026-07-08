@@ -210,10 +210,10 @@ func TestTopicPartitionRecords_RecordCount(t *testing.T) {
 	})
 }
 
-func TestRoutedTopicPartitionRecords_WireBytes(t *testing.T) {
+func TestRoutedTopicPartitionRecords_UncompressedWireBytes(t *testing.T) {
 	recs := makeRecords(0, "v1", "v2")
 	p := routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{records: recs}}
-	assert.Equal(t, multiRecordBatchEstimateBytes(recs), p.wireBytes())
+	assert.Equal(t, multiRecordBatchEstimateBytes(recs), p.uncompressedWireBytes())
 }
 
 func TestRoutedTopicPartitionRecords_MergeWith(t *testing.T) {

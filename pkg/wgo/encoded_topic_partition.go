@@ -62,10 +62,13 @@ func (p routedEncodedTopicPartitionRecords) getTopicPartition() topicPartition {
 
 func (p routedEncodedTopicPartitionRecords) getNodeID() int32 { return p.nodeID }
 
-// wireBytes returns the encoded batch length; the batch header is already
-// included in the bytes.
-func (p routedEncodedTopicPartitionRecords) wireBytes() int64 {
-	return int64(len(p.encoded))
+// uncompressedWireBytes returns the RecordBatch's wire size with the records
+// payload uncompressed (its size before Snappy compression).
+func (p routedEncodedTopicPartitionRecords) uncompressedWireBytes() int64 {
+	if p.encodedStats.records == 0 {
+		return 0
+	}
+	return recordBatchHeaderBytes + p.encodedStats.uncompressedBytes
 }
 
 // splitByMaxBytes returns the item unchanged: an encoded batch is already sized

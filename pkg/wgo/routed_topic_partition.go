@@ -53,9 +53,9 @@ func (p routedTopicPartitionRecords) getTopicPartition() topicPartition {
 
 func (p routedTopicPartitionRecords) getNodeID() int32 { return p.nodeID }
 
-// wireBytes returns the standalone RecordBatch estimate for the group, so the
-// flush-size gate agrees with splitByMaxBytes on what fits.
-func (p routedTopicPartitionRecords) wireBytes() int64 {
+// uncompressedWireBytes returns the uncompressed wire size of the group encoded
+// as a single standalone RecordBatch.
+func (p routedTopicPartitionRecords) uncompressedWireBytes() int64 {
 	return multiRecordBatchEstimateBytes(p.records)
 }
 

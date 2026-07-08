@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -40,15 +41,56 @@ func TestRoutedEncodedTopicPartitionRecords_Getters(t *testing.T) {
 	assert.Equal(t, int32(7), p.getNodeID())
 }
 
-func TestRoutedEncodedTopicPartitionRecords_WireBytes(t *testing.T) {
-	t.Run("is the encoded byte length", func(t *testing.T) {
-		p := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{encoded: []byte("batch-bytes")},
-		}
-		assert.Equal(t, int64(len("batch-bytes")), p.wireBytes())
-	})
+func TestRoutedEncodedTopicPartitionRecords_UncompressedWireBytes(t *testing.T) {
+	// For any records, the encoded batch must report the same uncompressed size as
+	// routedTopicPartitionRecords.uncompressedWireBytes() for those records —
+	// including when the encoded batch is Snappy on the wire.
+	cases := map[string][]*kgo.Record{
+		"single value-only record": {
+			{Value: []byte("v")},
+		},
+		"key, value, and headers": {
+			{Key: []byte("k"), Value: []byte("v"), Headers: []kgo.RecordHeader{{Key: "h1", Value: []byte("hv1")}, {Key: "h2", Value: []byte("hv2")}}},
+		},
+		"several records with a nil key/value mix": {
+			{Key: []byte("k1"), Value: []byte("v1")},
+			{Value: []byte("v2")},
+			{Key: []byte("k3")},
+		},
+		"wide timestamp gaps grow ts-delta varints": {
+			{Value: []byte("a"), Timestamp: time.UnixMilli(1_000_000)},
+			{Value: []byte("b"), Timestamp: time.UnixMilli(1_000_000 + 300_000)},
+			{Value: []byte("c"), Timestamp: time.UnixMilli(1_000_000 + 7_200_000)},
+		},
+		"many records grow offset-delta varints": func() []*kgo.Record {
+			recs := make([]*kgo.Record, 200)
+			for i := range recs {
+				recs[i] = &kgo.Record{Value: []byte("v")}
+			}
+			return recs
+		}(),
+		"large compressible value, Snappy on the wire": {
+			{Key: []byte("big"), Value: bytes.Repeat([]byte("compress-me"), 512)},
+		},
+	}
+
+	for name, recs := range cases {
+		t.Run(name, func(t *testing.T) {
+			records := routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: recs},
+			}
+			encoded := routedEncodedTopicPartitionRecords{
+				encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, recs),
+			}
+
+			got := encoded.uncompressedWireBytes()
+			require.Positive(t, got)
+			assert.Equal(t, records.uncompressedWireBytes(), got)
+		})
+	}
+
 	t.Run("empty batch is zero", func(t *testing.T) {
-		assert.Equal(t, int64(0), routedEncodedTopicPartitionRecords{}.wireBytes())
+		assert.Equal(t, int64(0), routedEncodedTopicPartitionRecords{}.uncompressedWireBytes())
 	})
 }
 
@@ -104,6 +146,35 @@ func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
 		assert.Equal(t, int64(3), merged.encodedStats.records)
 		// The single batch decodes back to every record in arrival order.
 		assert.Equal(t, []string{"a1", "a2", "b1"}, values(decodeBatch(merged.encoded)))
+	})
+
+	t.Run("preserves key, value, headers, and timestamp through the merge", func(t *testing.T) {
+		a := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+				Key:       []byte("ka"),
+				Value:     []byte("va"),
+				Headers:   []kgo.RecordHeader{{Key: "h", Value: []byte("hv")}},
+				Timestamp: time.UnixMilli(1_700_000_000_111),
+			}}),
+			nodeID: 5,
+		}
+		b := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+				Value:     []byte("vb"),
+				Timestamp: time.UnixMilli(1_700_000_000_222),
+			}}),
+			nodeID: 5,
+		}
+
+		got := decodeBatch(a.mergeWith([]routedEncodedTopicPartitionRecords{b}).encoded)
+		require.Len(t, got, 2)
+		assert.Equal(t, []byte("ka"), got[0].Key)
+		assert.Equal(t, []byte("va"), got[0].Value)
+		assert.Equal(t, []kgo.RecordHeader{{Key: "h", Value: []byte("hv")}}, got[0].Headers)
+		assert.Equal(t, int64(1_700_000_000_111), got[0].Timestamp.UnixMilli())
+		assert.Nil(t, got[1].Key)
+		assert.Equal(t, []byte("vb"), got[1].Value)
+		assert.Equal(t, int64(1_700_000_000_222), got[1].Timestamp.UnixMilli())
 	})
 
 	t.Run("merges every item in the group in one shot", func(t *testing.T) {

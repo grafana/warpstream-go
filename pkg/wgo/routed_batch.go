@@ -10,8 +10,12 @@ type routedBatch[W any] interface {
 	getNodeID() int32
 	recordCount() int
 	payloadBytes() int64
-	wireBytes() int64
+	uncompressedWireBytes() int64
 	splitByMaxBytes(max int32) []W
+
+	// mergeWith folds the receiver and others (all sharing the receiver's topic,
+	// partition, and nodeID) into one item. Empty others returns the receiver
+	// unchanged and must be cheap.
 	mergeWith(others []W) W
 }
 

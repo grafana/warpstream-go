@@ -316,8 +316,9 @@ func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compress
 // decodeBatch parses a serialised RecordBatch back into records, inverting
 // encodeBatch for the fields this client sets (key, value, headers, timestamp).
 // It is used to re-merge several pre-encoded batches for one partition into a
-// single batch. The input is always bytes this client encoded, so a decode
-// failure is a bug and panics.
+// single batch. It expects exactly one complete batch; any bytes trailing the
+// first batch are ignored. The input is always bytes this client encoded, so a
+// decode failure is a bug and panics.
 func decodeBatch(encoded []byte) []*kgo.Record {
 	var rb kmsg.RecordBatch
 	if err := rb.ReadFrom(encoded); err != nil {
