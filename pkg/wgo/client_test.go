@@ -302,6 +302,38 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 	})
 }
 
+func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
+	const topic = "test-topic"
+
+	// A record with an unset timestamp routed to an unknown topic-partition fails
+	// before dispatch. The record must be left unstamped so a later retry stamps a
+	// fresh produce time instead of reusing the failed attempt's.
+	t.Run("ProduceSync", func(t *testing.T) {
+		c, _, _ := newTestWarpstreamClient(t, topic, 1)
+		rec := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("v")}
+
+		results := c.ProduceSync(context.Background(), []*kgo.Record{rec})
+		require.Len(t, results, 1)
+		require.Error(t, results[0].Err)
+		assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's record")
+	})
+
+	t.Run("Produce", func(t *testing.T) {
+		c, _, _ := newTestWarpstreamClient(t, topic, 1)
+		rec := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("v")}
+
+		var gotErr error
+		done := make(chan struct{})
+		c.Produce(context.Background(), rec, func(_ *kgo.Record, err error) {
+			gotErr = err
+			close(done)
+		})
+		<-done
+		require.Error(t, gotErr)
+		assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's record")
+	})
+}
+
 func TestWarpstreamClient_Produce(t *testing.T) {
 	const topic = "test-topic"
 
