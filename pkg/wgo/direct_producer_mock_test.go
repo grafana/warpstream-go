@@ -14,7 +14,7 @@ import (
 
 type mockDirectProducerCall struct {
 	nodeID     int32
-	partitions []topicPartitionRecords
+	partitions []encodedTopicPartitionRecords
 	err        error     // nil on success; context.Err() if ctx was cancelled
 	sentAt     time.Time // when the call was recorded (after any configured delay)
 }
@@ -34,7 +34,7 @@ type mockDirectProducer struct {
 	// errors. errs[nodeID] (if set) still takes precedence. Tests that need
 	// scripted per-attempt outcomes (e.g. retry-loop tests) set respFn with
 	// their own atomic counter to vary the response/error per call.
-	respFn func(nodeID int32, partitions []topicPartitionRecords) (*kmsg.ProduceResponse, error)
+	respFn func(nodeID int32, partitions []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error)
 }
 
 func newMockDirectProducer() *mockDirectProducer {
@@ -45,7 +45,7 @@ func newMockDirectProducer() *mockDirectProducer {
 	}
 }
 
-func (m *mockDirectProducer) ProduceSync(ctx context.Context, nodeID int32, partitions []topicPartitionRecords) ProduceResult {
+func (m *mockDirectProducer) ProduceSync(ctx context.Context, nodeID int32, partitions []encodedTopicPartitionRecords) ProduceResult {
 	m.mu.Lock()
 	delay := m.delays[nodeID]
 	err := m.errs[nodeID]
@@ -82,7 +82,7 @@ func (m *mockDirectProducer) ProduceSync(ctx context.Context, nodeID int32, part
 	return ProduceResult{resp: kmsg.NewPtrProduceResponse()}
 }
 
-func (m *mockDirectProducer) record(nodeID int32, partitions []topicPartitionRecords, err error) {
+func (m *mockDirectProducer) record(nodeID int32, partitions []encodedTopicPartitionRecords, err error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, mockDirectProducerCall{nodeID: nodeID, partitions: partitions, err: err, sentAt: time.Now()})
 	m.mu.Unlock()

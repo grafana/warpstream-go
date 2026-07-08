@@ -19,19 +19,19 @@ import (
 // completed. routeBy(topic, partition) returns the destination; the helper
 // is the test equivalent of WarpstreamClient.routeRecords paired with the
 // caller's promise/wait coordination.
-func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, sharedDone func(error)) []promisedRoutedTopicPartitionRecords {
+func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, sharedDone func(error)) []promised[routedTopicPartitionRecords] {
 	if len(records) == 0 {
 		sharedDone(nil)
 		return nil
 	}
-	groups := make(map[topicPartition]*promisedRoutedTopicPartitionRecords)
+	groups := make(map[topicPartition]*promised[routedTopicPartitionRecords])
 	var order []topicPartition
 	for _, r := range records {
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
 		g, ok := groups[key]
 		if !ok {
-			g = &promisedRoutedTopicPartitionRecords{
-				routedTopicPartitionRecords: routedTopicPartitionRecords{
+			g = &promised[routedTopicPartitionRecords]{
+				item: routedTopicPartitionRecords{
 					topicPartitionRecords: topicPartitionRecords{topic: r.Topic, partition: r.Partition},
 					nodeID:                routeBy(r.Topic, r.Partition),
 				},
@@ -39,7 +39,7 @@ func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, shar
 			groups[key] = g
 			order = append(order, key)
 		}
-		g.records = append(g.records, r)
+		g.item.records = append(g.item.records, r)
 	}
 	var (
 		mu       sync.Mutex
@@ -63,7 +63,7 @@ func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, shar
 			sharedDone(final)
 		}
 	}
-	out := make([]promisedRoutedTopicPartitionRecords, 0, len(order))
+	out := make([]promised[routedTopicPartitionRecords], 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		g.done = fan
@@ -72,11 +72,11 @@ func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, shar
 	return out
 }
 
-func TestClusterRecordBuffer_Add(t *testing.T) {
+func TestClusterBuffer_Add(t *testing.T) {
 	t.Run("single agent: routes through and flushes via linger", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -103,7 +103,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -136,7 +136,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -169,7 +169,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		var fires atomic.Int32
@@ -213,7 +213,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			return nil
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -235,7 +235,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("empty records: done fires synchronously with nil", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
@@ -255,7 +255,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("add after close fails fast", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 		c.Close()
 
 		done := make(chan error, 1)
@@ -274,7 +274,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("context already canceled: done fires synchronously with ctx error", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -294,17 +294,17 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.Equal(t, int64(0), c.BufferedRecords())
 	})
 
-	t.Run("pre-canceled ctx leaves record timestamps untouched", func(t *testing.T) {
+	t.Run("pre-canceled ctx fails without dispatching a flush", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		// The produce is a no-op, so the detached caller's record must not be
-		// mutated: its Timestamp stays zero and a later retry gets a fresh now.
+		// The pre-cancel fast path resolves done with ctx.Err() and never
+		// dispatches to the flush (distinct from a mid-flight cancel).
 		rec := makeRecord("t", 0, "v")
 		done := make(chan error, 1)
 		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{rec}, func(err error) { done <- err }))
@@ -315,7 +315,6 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("done did not fire for pre-canceled ctx")
 		}
-		assert.True(t, rec.Timestamp.IsZero())
 		assert.Equal(t, 0, flush.callCount())
 	})
 
@@ -328,7 +327,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
 		reg := prometheus.NewPedanticRegistry()
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, reg)
+		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, reg)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -389,7 +388,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 			return nil
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -441,7 +440,7 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 	t.Run("context canceled after success is a no-op", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(10*time.Millisecond, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
 		t.Cleanup(c.Close)
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -468,47 +467,13 @@ func TestClusterRecordBuffer_Add(t *testing.T) {
 		assert.Equal(t, int64(0), c.BufferedRecords())
 	})
 
-	t.Run("stamps produce time on records before buffering", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(20*time.Millisecond, 1<<20, flush.Func(), m, nil)
-		t.Cleanup(c.Close)
-
-		// unset1 and unset2 have no Timestamp; preset already carries one, which the
-		// client must leave untouched.
-		unset1 := makeRecord("t", 0, "unset")
-		unset2 := makeRecord("t", 1, "unset2")
-		preset := makeRecord("t", 0, "preset")
-		presetTS := time.Date(2021, 5, 4, 3, 2, 1, 123_456_789, time.UTC)
-		preset.Timestamp = presetTS
-
-		start := time.Now()
-		done := make(chan error, 1)
-		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{unset1, unset2, preset}, func(err error) { done <- err }))
-
-		// Add stamps synchronously before buffering, so the records carry their
-		// produce timestamp as soon as Add returns.
-		assert.False(t, unset1.Timestamp.IsZero())
-		assert.WithinDuration(t, start, unset1.Timestamp, time.Second)
-		assert.Equal(t, unset1.Timestamp.Truncate(time.Millisecond), unset1.Timestamp)
-		assert.Equal(t, presetTS, preset.Timestamp)
-		// Records buffered together share one produce time (a single now per Add).
-		assert.Equal(t, unset1.Timestamp, unset2.Timestamp)
-
-		select {
-		case err := <-done:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire")
-		}
-	})
 }
 
-func TestClusterRecordBuffer_Close(t *testing.T) {
+func TestClusterBuffer_Close(t *testing.T) {
 	t.Run("idempotent", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 
 		c.Close()
 		c.Close() // must not panic or hang
@@ -523,7 +488,7 @@ func TestClusterRecordBuffer_Close(t *testing.T) {
 		}
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterRecordBuffer(time.Hour, 1<<20, flush.Func(), m, nil)
+		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
 
 		done := make(chan error, 1)
 		const valueA, valueB = "a", "b"

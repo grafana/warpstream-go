@@ -162,6 +162,22 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		assert.WithinDuration(t, ts.Truncate(time.Millisecond), fetches.Records()[0].Timestamp, 0)
 	})
 
+	t.Run("unset timestamps in one call share a single produce time", func(t *testing.T) {
+		c, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+		// ProduceSync stamps every unset record with one shared now, so records
+		// buffered together carry an identical produce timestamp.
+		rec1 := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("a")}
+		rec2 := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("b")}
+		results := c.ProduceSync(context.Background(), []*kgo.Record{rec1, rec2})
+		require.Len(t, results, 2)
+		require.NoError(t, results[0].Err)
+		require.NoError(t, results[1].Err)
+
+		assert.False(t, rec1.Timestamp.IsZero())
+		assert.Equal(t, rec1.Timestamp, rec2.Timestamp)
+	})
+
 	t.Run("records across two partitions both succeed", func(t *testing.T) {
 		c, _, _ := newTestWarpstreamClient(t, topic, 2)
 

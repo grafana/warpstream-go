@@ -26,7 +26,7 @@ func buildProduceRequest(version int16, topic string, topicID [16]byte, records 
 	}
 	resolveTopicID := func(string) ([16]byte, bool) { return topicID, true }
 	// The resolver always returns ok=true, so the error path is unreachable.
-	req, _, _ := buildMultiTopicProduceRequest(version, resolveTopicID, records)
+	req, _, _ := buildMultiTopicProduceRequestFromRecords(version, resolveTopicID, records)
 	return req
 }
 
@@ -145,7 +145,7 @@ func TestBuildProduceRequest_BatchFields(t *testing.T) {
 	})
 }
 
-func TestBuildMultiTopicProduceRequest(t *testing.T) {
+func TestBuildMultiTopicProduceRequestFromRecords(t *testing.T) {
 	makeRecord := func(topic string, partition int32, value string) *kgo.Record {
 		return &kgo.Record{Topic: topic, Partition: partition, Value: []byte(value), Timestamp: time.Now()}
 	}
@@ -169,7 +169,7 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 			return [16]byte{}, false
 		}
 
-		req, stats, err := buildMultiTopicProduceRequest(11, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequestFromRecords(11, resolve, records)
 		require.NoError(t, err)
 		require.NotNil(t, req)
 		require.Equal(t, int16(11), req.Version)
@@ -199,7 +199,7 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 		records := []*kgo.Record{makeRecord("t", 0, "v")}
 		resolve := func(string) ([16]byte, bool) { return [16]byte{}, true }
 
-		req, stats, err := buildMultiTopicProduceRequest(13, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequestFromRecords(13, resolve, records)
 		require.NoError(t, err)
 		assert.Equal(t, int16(13), req.Version)
 		assert.Equal(t, int16(-1), req.Acks)
@@ -222,7 +222,7 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 			return [16]byte{}, false
 		}
 
-		req, stats, err := buildMultiTopicProduceRequest(11, resolve, records)
+		req, stats, err := buildMultiTopicProduceRequestFromRecords(11, resolve, records)
 		require.Error(t, err)
 		assert.Nil(t, req)
 		assert.ErrorContains(t, err, "unknown")
@@ -231,7 +231,7 @@ func TestBuildMultiTopicProduceRequest(t *testing.T) {
 
 	t.Run("empty records: returns a request with no topics", func(t *testing.T) {
 		resolve := func(string) ([16]byte, bool) { return [16]byte{}, true }
-		req, stats, err := buildMultiTopicProduceRequest(11, resolve, nil)
+		req, stats, err := buildMultiTopicProduceRequestFromRecords(11, resolve, nil)
 		require.NoError(t, err)
 		require.NotNil(t, req)
 		assert.Empty(t, req.Topics)
@@ -559,10 +559,9 @@ func makeProduceResponseTopicPartition(partition int32, errorCode int16) kmsg.Pr
 }
 
 func TestEnsureRecordTimestamp_ConcurrentRestampDoesNotRaceWithEncodeRead(t *testing.T) {
-	// The hedger re-buffers already-stamped records through a second
-	// ClusterRecordBuffer (re-invoking ensureRecordTimestamp) while the primary
-	// leg is still encoding them, which reads Timestamp. Re-stamping an
-	// already-stamped record must not write, or the two collide under -race.
+	// ensureRecordTimestamp must not write to an already-stamped record: a write
+	// would race with any concurrent read of Timestamp (e.g. the encoder) under
+	// -race. This guards the IsZero short-circuit.
 	rec := &kgo.Record{Timestamp: time.UnixMilli(1_700_000_000_123)}
 
 	var wg sync.WaitGroup
@@ -572,4 +571,112 @@ func TestEnsureRecordTimestamp_ConcurrentRestampDoesNotRaceWithEncodeRead(t *tes
 		go func() { defer wg.Done(); _ = rec.Timestamp.UnixMilli() }()
 	}
 	wg.Wait()
+}
+
+func TestEnsureRecordTimestamp_StampsOnlyUnset(t *testing.T) {
+	now := time.UnixMilli(1_700_000_000_123).Add(456 * time.Microsecond)
+
+	t.Run("unset timestamp is stamped truncated to the millisecond", func(t *testing.T) {
+		rec := &kgo.Record{}
+		ensureRecordTimestamp(rec, now)
+		assert.Equal(t, int64(1_700_000_000_123), rec.Timestamp.UnixMilli())
+		assert.Zero(t, rec.Timestamp.Nanosecond()%int(time.Millisecond), "sub-millisecond precision must be truncated")
+	})
+
+	t.Run("preset timestamp is left untouched", func(t *testing.T) {
+		preset := time.UnixMilli(1_600_000_000_000)
+		rec := &kgo.Record{Timestamp: preset}
+		ensureRecordTimestamp(rec, now)
+		assert.Equal(t, preset, rec.Timestamp)
+	})
+}
+
+func TestProduceRequestStats_Add(t *testing.T) {
+	a := produceRequestStats{records: 1, batches: 2, uncompressedBytes: 3, compressedBytes: 4}
+	b := produceRequestStats{records: 10, batches: 20, uncompressedBytes: 30, compressedBytes: 40}
+	assert.Equal(t, produceRequestStats{records: 11, batches: 22, uncompressedBytes: 33, compressedBytes: 44}, a.add(b))
+}
+
+func TestBuildMultiTopicProduceRequestFromEncoded(t *testing.T) {
+	resolve := func(string) ([16]byte, bool) { return [16]byte{}, true }
+
+	t.Run("uses the pre-encoded batch bytes verbatim and sums stats", func(t *testing.T) {
+		batchA := []byte("pre-encoded-batch-a")
+		batchB := []byte("pre-encoded-batch-b")
+		statsA := produceRequestStats{records: 3, batches: 1, uncompressedBytes: 100, compressedBytes: 40}
+		statsB := produceRequestStats{records: 2, batches: 1, uncompressedBytes: 50, compressedBytes: 20}
+
+		req, gotStats, err := buildMultiTopicProduceRequestFromEncoded(11, resolve, []encodedTopicPartitionRecords{
+			{topic: "t", partition: 0, encoded: batchA, encodedStats: statsA},
+			{topic: "t", partition: 1, encoded: batchB, encodedStats: statsB},
+		})
+		require.NoError(t, err)
+		require.Len(t, req.Topics, 1)
+		require.Len(t, req.Topics[0].Partitions, 2)
+		assert.Equal(t, batchA, req.Topics[0].Partitions[0].Records)
+		assert.Equal(t, batchB, req.Topics[0].Partitions[1].Records)
+		assert.Equal(t, statsA.add(statsB), gotStats)
+	})
+
+	t.Run("skips a partition with no encoded batch", func(t *testing.T) {
+		req, gotStats, err := buildMultiTopicProduceRequestFromEncoded(11, resolve, []encodedTopicPartitionRecords{
+			{topic: "t", partition: 0},
+		})
+		require.NoError(t, err)
+		require.Len(t, req.Topics, 1)
+		assert.Empty(t, req.Topics[0].Partitions)
+		assert.Equal(t, produceRequestStats{}, gotStats)
+	})
+
+	t.Run("returns an error when a topic is unknown", func(t *testing.T) {
+		req, gotStats, err := buildMultiTopicProduceRequestFromEncoded(11, func(string) ([16]byte, bool) { return [16]byte{}, false }, []encodedTopicPartitionRecords{
+			{topic: "t", partition: 0, encoded: []byte("b"), encodedStats: produceRequestStats{records: 1, batches: 1}},
+		})
+		require.Error(t, err)
+		assert.Nil(t, req)
+		assert.ErrorContains(t, err, "not known")
+		assert.Equal(t, produceRequestStats{}, gotStats)
+	})
+
+	t.Run("returns an error on a duplicate topic-partition", func(t *testing.T) {
+		// A duplicate (topic, partition) is rejected rather than merged, so it
+		// can't produce a malformed request with two entries for one partition.
+		req, gotStats, err := buildMultiTopicProduceRequestFromEncoded(11, resolve, []encodedTopicPartitionRecords{
+			{topic: "t", partition: 0, encoded: []byte("a"), encodedStats: produceRequestStats{records: 1, batches: 1}},
+			{topic: "t", partition: 0, encoded: []byte("b"), encodedStats: produceRequestStats{records: 1, batches: 1}},
+		})
+		require.Error(t, err)
+		assert.Nil(t, req)
+		assert.ErrorContains(t, err, "duplicate partition 0")
+		assert.ErrorContains(t, err, `topic "t"`)
+		assert.Equal(t, produceRequestStats{}, gotStats)
+	})
+}
+
+// buildMultiTopicProduceRequestFromRecords builds a ProduceRequest from a flat record slice
+// by grouping it into (topic, partition) batches and encoding each. It is a
+// test-only helper that mirrors what flushBatch does in production (encode each
+// partition once, then build from the encoded bytes).
+func buildMultiTopicProduceRequestFromRecords(version int16, topicID func(string) ([16]byte, bool), records []*kgo.Record) (*kmsg.ProduceRequest, produceRequestStats, error) {
+	index := make(map[topicPartition]int)
+	grouped := make([]topicPartitionRecords, 0)
+	for _, r := range records {
+		key := topicPartition{topic: r.Topic, partition: r.Partition}
+		i, ok := index[key]
+		if !ok {
+			index[key] = len(grouped)
+			grouped = append(grouped, topicPartitionRecords{topic: r.Topic, partition: r.Partition})
+			i = len(grouped) - 1
+		}
+		grouped[i].records = append(grouped[i].records, r)
+	}
+
+	encoded := make([]encodedTopicPartitionRecords, 0, len(grouped))
+	for _, g := range grouped {
+		if len(g.records) == 0 {
+			continue
+		}
+		encoded = append(encoded, newEncodedTopicPartitionRecords(g.topic, g.partition, g.records))
+	}
+	return buildMultiTopicProduceRequestFromEncoded(version, topicID, encoded)
 }

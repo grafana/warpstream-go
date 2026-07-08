@@ -89,7 +89,7 @@ func TestProducerStateMetricsMatchKprom(t *testing.T) {
 		}
 	}
 	assert.ElementsMatch(t, kpromProducerStateMetricNames, got,
-		"kprom's producer-state metric names changed; update kpromProducerStateMetricNames and the names this client registers in newMetrics / NewClusterRecordBuffer")
+		"kprom's producer-state metric names changed; update kpromProducerStateMetricNames and the names this client registers in newMetrics / NewClusterBuffer")
 }
 
 // gaugeValue returns the single-series value of the named gauge family.

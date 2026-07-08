@@ -267,10 +267,9 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 	})
 }
 
-// partitionsForTest groups records by (topic, partition) into a slice of
-// routedTopicPartitionRecords. done is left nil because callers in this file
-// (DirectProducer-level tests) don't go through the buffer.
-func partitionsForTest(records []*kgo.Record) []topicPartitionRecords {
+// partitionsForTest groups records by (topic, partition) and encodes each into
+// an encodedTopicPartitionRecords, the input the DirectProducer chain takes.
+func partitionsForTest(records []*kgo.Record) []encodedTopicPartitionRecords {
 	groups := make(map[topicPartition]*topicPartitionRecords)
 	var order []topicPartition
 	for _, r := range records {
@@ -283,9 +282,10 @@ func partitionsForTest(records []*kgo.Record) []topicPartitionRecords {
 		}
 		g.records = append(g.records, r)
 	}
-	out := make([]topicPartitionRecords, 0, len(order))
+	out := make([]encodedTopicPartitionRecords, 0, len(order))
 	for _, k := range order {
-		out = append(out, *groups[k])
+		g := groups[k]
+		out = append(out, newEncodedTopicPartitionRecords(g.topic, g.partition, g.records))
 	}
 	return out
 }
