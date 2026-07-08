@@ -2,7 +2,8 @@ package main
 
 import (
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 )
@@ -74,11 +75,7 @@ func (rr *resultsReport) writeErrorTable(b *strings.Builder, res scenarioResult)
 	for e := range res.kgoErrorCounts {
 		seen[e] = struct{}{}
 	}
-	errs := make([]string, 0, len(seen))
-	for e := range seen {
-		errs = append(errs, e)
-	}
-	sort.Strings(errs)
+	errs := slices.Sorted(maps.Keys(seen))
 
 	b.WriteString("\n| error | wgo | kgo |\n| --- | --- | --- |\n")
 	for _, e := range errs {
