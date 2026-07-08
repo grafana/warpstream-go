@@ -108,6 +108,74 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 		assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_direct_request_latency_seconds"))
 	})
 
+	t.Run("merged same-partition batches round-trip as a single batch", func(t *testing.T) {
+		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName)
+
+		client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		metaResp, err := client.Request(context.Background(), &kmsg.MetadataRequest{
+			Topics: []kmsg.MetadataRequestTopic{{Topic: kmsg.StringPtr(topicName)}},
+		})
+		require.NoError(t, err)
+		topicID := metaResp.(*kmsg.MetadataResponse).Topics[0].TopicID
+
+		topicIDFn := func(name string) ([16]byte, bool) {
+			if name == topicName {
+				return topicID, true
+			}
+			return [16]byte{}, false
+		}
+		producer := NewKafkaDirectProducer(client, topicIDFn, 9, KafkaDirectProducerConfig{
+			ProduceRequestTimeout:         time.Second,
+			ProduceRequestTimeoutOverhead: time.Second,
+		}, newMetrics(prometheus.NewPedanticRegistry()))
+
+		// Two separately-encoded batches for the same partition, as the hedge
+		// buffer accumulates across concurrent produces. Merging them must yield a
+		// single RecordBatch: kfake, like a real broker, rejects a partition whose
+		// records field carries more than one batch.
+		rec := func(key, value string) *kgo.Record {
+			return &kgo.Record{Topic: topicName, Partition: partition, Key: []byte(key), Value: []byte(value), Timestamp: time.Now()}
+		}
+		batch1 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k1", "v1"), rec("k2", "v2")})
+		batch2 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k3", "v3")})
+
+		merged := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
+			{item: routedEncodedTopicPartitionRecords{encodedTopicPartitionRecords: batch1, nodeID: brokerNodeID}},
+			{item: routedEncodedTopicPartitionRecords{encodedTopicPartitionRecords: batch2, nodeID: brokerNodeID}},
+		})
+		require.Len(t, merged, 1)
+
+		res := producer.ProduceSync(context.Background(), brokerNodeID, unrouteEncodedTopicPartitionRecords(merged))
+		require.NoError(t, res.err)
+		require.NoError(t, parseProduceResponse(res.resp))
+
+		consumer, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+				topicName: {partition: kgo.NewOffset().AtStart()},
+			}),
+		)
+		require.NoError(t, err)
+		t.Cleanup(consumer.Close)
+
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(cancel)
+
+		var got []*kgo.Record
+		for len(got) < 3 {
+			fetches := consumer.PollFetches(fetchCtx)
+			require.NoError(t, fetches.Err())
+			got = append(got, fetches.Records()...)
+		}
+		require.Len(t, got, 3)
+		assert.Equal(t, []byte("v1"), got[0].Value)
+		assert.Equal(t, []byte("v2"), got[1].Value)
+		assert.Equal(t, []byte("v3"), got[2].Value)
+	})
+
 	t.Run("applies per-attempt timeout (TimeoutMillis on wire + client-side ctx deadline)", func(t *testing.T) {
 		cluster, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName)
 

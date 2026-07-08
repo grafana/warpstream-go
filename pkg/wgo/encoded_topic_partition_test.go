@@ -3,9 +3,11 @@ package wgo
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -67,79 +69,82 @@ func TestRoutedEncodedTopicPartitionRecords_SplitByMaxBytes(t *testing.T) {
 }
 
 func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
-	t.Run("concatenates bytes, sums stats, and keeps identity/routing of the receiver", func(t *testing.T) {
-		a := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{
-				topic: "t", partition: 0,
-				encoded:      []byte("AAA"),
-				encodedStats: produceRequestStats{records: 2, batches: 1, uncompressedBytes: 30, compressedBytes: 10},
-			},
-			nodeID:    5,
-			nodeState: AgentStateHealthy,
+	mk := func(topic string, partition, nodeID int32, state AgentState, values ...string) routedEncodedTopicPartitionRecords {
+		recs := make([]*kgo.Record, len(values))
+		for i, v := range values {
+			recs[i] = &kgo.Record{Value: []byte(v), Timestamp: time.UnixMilli(1_700_000_000_000 + int64(i))}
 		}
-		b := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{
-				topic: "t", partition: 0,
-				encoded:      []byte("BB"),
-				encodedStats: produceRequestStats{records: 3, batches: 1, uncompressedBytes: 20, compressedBytes: 8},
-			},
-			nodeID:    5,
-			nodeState: AgentStateDemoted,
+		return routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, recs),
+			nodeID:                       nodeID,
+			nodeState:                    state,
 		}
+	}
+	values := func(records []*kgo.Record) []string {
+		out := make([]string, len(records))
+		for i, r := range records {
+			out[i] = string(r.Value)
+		}
+		return out
+	}
 
-		merged := a.mergeWith(b)
+	t.Run("merges into one batch decoding to all records in order, latest nodeState wins", func(t *testing.T) {
+		a := mk("t", 0, 5, AgentStateHealthy, "a1", "a2")
+		b := mk("t", 0, 5, AgentStateDemoted, "b1")
 
-		assert.Equal(t, []byte("AAABB"), merged.encoded)
-		assert.Equal(t, produceRequestStats{records: 5, batches: 2, uncompressedBytes: 50, compressedBytes: 18}, merged.encodedStats)
+		merged := a.mergeWith([]routedEncodedTopicPartitionRecords{b})
+
 		assert.Equal(t, "t", merged.topic)
 		assert.Equal(t, int32(0), merged.partition)
 		assert.Equal(t, int32(5), merged.nodeID)
-		// The freshest routing-time classification (the other's) wins.
+		// The freshest routing-time classification (the last contributor's) wins.
 		assert.Equal(t, AgentStateDemoted, merged.nodeState)
+		// One standard batch (not two concatenated), with recomputed stats.
+		assert.Equal(t, int64(1), merged.encodedStats.batches)
+		assert.Equal(t, int64(3), merged.encodedStats.records)
+		// The single batch decodes back to every record in arrival order.
+		assert.Equal(t, []string{"a1", "a2", "b1"}, values(decodeBatch(merged.encoded)))
 	})
 
-	t.Run("panics when the two items target different routing", func(t *testing.T) {
-		base := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{topic: "t", partition: 0, encoded: []byte("A")},
-			nodeID:                       1,
-		}
-		diffTopic := base
-		diffTopic.topic = "u"
-		diffPartition := base
-		diffPartition.partition = 1
-		diffNodeID := base
-		diffNodeID.nodeID = 2
+	t.Run("merges every item in the group in one shot", func(t *testing.T) {
+		a := mk("t", 0, 5, AgentStateHealthy, "a")
+		b := mk("t", 0, 5, AgentStateHealthy, "b")
+		c := mk("t", 0, 5, AgentStateHealthy, "c")
 
-		assert.Panics(t, func() { base.mergeWith(diffTopic) })
-		assert.Panics(t, func() { base.mergeWith(diffPartition) })
-		assert.Panics(t, func() { base.mergeWith(diffNodeID) })
+		merged := a.mergeWith([]routedEncodedTopicPartitionRecords{b, c})
+		assert.Equal(t, int64(1), merged.encodedStats.batches)
+		assert.Equal(t, []string{"a", "b", "c"}, values(decodeBatch(merged.encoded)))
 	})
 
-	t.Run("returns a freshly allocated batch without mutating either input", func(t *testing.T) {
-		// The receiver slice has spare capacity, so an in-place append would
-		// clobber the byte past its length.
-		first := make([]byte, 3, 8)
-		copy(first, "AAA")
-		a := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{topic: "t", encoded: first, encodedStats: produceRequestStats{records: 1}},
-		}
-		b := routedEncodedTopicPartitionRecords{
-			encodedTopicPartitionRecords: encodedTopicPartitionRecords{topic: "t", encoded: []byte("BB"), encodedStats: produceRequestStats{records: 1}},
-		}
+	t.Run("returns the receiver unchanged when there is nothing to merge", func(t *testing.T) {
+		a := mk("t", 0, 5, AgentStateHealthy, "a")
+		assert.Equal(t, a, a.mergeWith(nil))
+	})
 
-		merged := a.mergeWith(b)
-		assert.Equal(t, []byte("AAABB"), merged.encoded)
+	t.Run("panics when an item targets different routing", func(t *testing.T) {
+		base := mk("t", 0, 1, AgentStateHealthy, "x")
+		diffTopic := mk("u", 0, 1, AgentStateHealthy, "x")
+		diffPartition := mk("t", 1, 1, AgentStateHealthy, "x")
+		diffNodeID := mk("t", 0, 2, AgentStateHealthy, "x")
 
-		// Neither input is mutated in place.
-		assert.Equal(t, []byte("AAA"), a.encoded)
-		assert.Equal(t, produceRequestStats{records: 1}, a.encodedStats)
-		assert.Equal(t, []byte("BB"), b.encoded)
-		assert.Equal(t, produceRequestStats{records: 1}, b.encodedStats)
-		assert.Equal(t, byte(0), first[:cap(first)][3], "merge must not write into the receiver's spare capacity")
+		assert.Panics(t, func() { base.mergeWith([]routedEncodedTopicPartitionRecords{diffTopic}) })
+		assert.Panics(t, func() { base.mergeWith([]routedEncodedTopicPartitionRecords{diffPartition}) })
+		assert.Panics(t, func() { base.mergeWith([]routedEncodedTopicPartitionRecords{diffNodeID}) })
+	})
 
-		// The returned batch is a fresh allocation, aliasing neither input's array.
-		assert.NotSame(t, &a.encoded[0], &merged.encoded[0])
-		assert.NotSame(t, &b.encoded[0], &merged.encoded[0])
+	t.Run("does not mutate the inputs", func(t *testing.T) {
+		a := mk("t", 0, 5, AgentStateHealthy, "a")
+		b := mk("t", 0, 5, AgentStateHealthy, "b")
+		aEncoded := append([]byte(nil), a.encoded...)
+		bEncoded := append([]byte(nil), b.encoded...)
+		aStats, bStats := a.encodedStats, b.encodedStats
+
+		_ = a.mergeWith([]routedEncodedTopicPartitionRecords{b})
+
+		assert.Equal(t, aEncoded, a.encoded)
+		assert.Equal(t, aStats, a.encodedStats)
+		assert.Equal(t, bEncoded, b.encoded)
+		assert.Equal(t, bStats, b.encodedStats)
 	})
 }
 

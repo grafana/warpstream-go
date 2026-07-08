@@ -591,6 +591,37 @@ func TestEnsureRecordTimestamp_StampsOnlyUnset(t *testing.T) {
 	})
 }
 
+func TestDecodeBatch_RoundTripsEncodeBatch(t *testing.T) {
+	records := []*kgo.Record{
+		{
+			Key:       []byte("k1"),
+			Value:     []byte("v1"),
+			Headers:   []kgo.RecordHeader{{Key: "h1", Value: []byte("hv1")}, {Key: "h2", Value: []byte("hv2")}},
+			Timestamp: time.UnixMilli(1_700_000_000_123),
+		},
+		{
+			Value:     []byte("v2"),
+			Timestamp: time.UnixMilli(1_700_000_000_456),
+		},
+		{
+			Key:       []byte("k3"),
+			Timestamp: time.UnixMilli(1_700_000_000_789),
+		},
+	}
+
+	encoded, _, _ := encodeBatch(records)
+	got := decodeBatch(encoded)
+
+	require.Len(t, got, len(records))
+	for i := range records {
+		assert.Equal(t, records[i].Key, got[i].Key)
+		assert.Equal(t, records[i].Value, got[i].Value)
+		// The encoder stores millisecond resolution, so compare at that resolution.
+		assert.Equal(t, records[i].Timestamp.UnixMilli(), got[i].Timestamp.UnixMilli())
+		assert.Equal(t, records[i].Headers, got[i].Headers)
+	}
+}
+
 func TestProduceRequestStats_Add(t *testing.T) {
 	a := produceRequestStats{records: 1, batches: 2, uncompressedBytes: 3, compressedBytes: 4}
 	b := produceRequestStats{records: 10, batches: 20, uncompressedBytes: 30, compressedBytes: 40}

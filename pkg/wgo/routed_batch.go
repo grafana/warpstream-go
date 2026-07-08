@@ -12,7 +12,7 @@ type routedBatch[W any] interface {
 	payloadBytes() int64
 	wireBytes() int64
 	splitByMaxBytes(max int32) []W
-	mergeWith(other W) W
+	mergeWith(others []W) W
 }
 
 // Compile-time assertion that both item types satisfy routedBatch. It also marks
@@ -95,16 +95,21 @@ func splitPromisedRoutedBatchByBatchMaxBytes[W routedBatch[W]](in promised[W], b
 // (topic, partition), merging items that share a partition in arrival order via
 // W.mergeWith. Backing arrays of the inputs are never mutated.
 func mergePromisedRoutedBatchByTopicPartition[W routedBatch[W]](entries []promised[W]) []W {
-	out := make([]W, 0, len(entries))
-	index := make(map[topicPartition]int, len(entries))
+	order := make([]topicPartition, 0, len(entries))
+	groups := make(map[topicPartition][]W, len(entries))
 	for _, e := range entries {
 		tp := e.item.getTopicPartition()
-		if i, ok := index[tp]; ok {
-			out[i] = out[i].mergeWith(e.item)
-			continue
+		if _, ok := groups[tp]; !ok {
+			order = append(order, tp)
 		}
-		index[tp] = len(out)
-		out = append(out, e.item)
+		groups[tp] = append(groups[tp], e.item)
+	}
+
+	// Merge each partition's items in one shot.
+	out := make([]W, 0, len(order))
+	for _, tp := range order {
+		g := groups[tp]
+		out = append(out, g[0].mergeWith(g[1:]))
 	}
 	return out
 }

@@ -153,53 +153,45 @@ func TestMergePromisedRoutedBatchByTopicPartition_Records(t *testing.T) {
 }
 
 func TestMergePromisedRoutedBatchByTopicPartition_Encoded(t *testing.T) {
-	promEnc := func(topic string, partition int32, batch string, records int64) promised[routedEncodedTopicPartitionRecords] {
+	promEnc := func(topic string, partition int32, values ...string) promised[routedEncodedTopicPartitionRecords] {
+		recs := make([]*kgo.Record, len(values))
+		for i, v := range values {
+			recs[i] = &kgo.Record{Value: []byte(v), Timestamp: time.UnixMilli(1_700_000_000_000 + int64(i))}
+		}
 		return promised[routedEncodedTopicPartitionRecords]{
 			item: routedEncodedTopicPartitionRecords{
-				encodedTopicPartitionRecords: encodedTopicPartitionRecords{
-					topic:        topic,
-					partition:    partition,
-					encoded:      []byte(batch),
-					encodedStats: produceRequestStats{records: records, batches: 1, uncompressedBytes: int64(len(batch)), compressedBytes: int64(len(batch))},
-				},
-				nodeID:    7,
-				nodeState: AgentStateDemoted,
+				encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, recs),
+				nodeID:                       7,
+				nodeState:                    AgentStateDemoted,
 			},
 		}
 	}
+	values := func(records []*kgo.Record) []string {
+		out := make([]string, len(records))
+		for i, r := range records {
+			out[i] = string(r.Value)
+		}
+		return out
+	}
 
-	t.Run("same topic-partition encoded entries concatenate batch bytes and sum stats", func(t *testing.T) {
+	t.Run("same topic-partition entries merge into one batch decoding to all records in order", func(t *testing.T) {
 		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
-			promEnc("t", 0, "AAA", 2),
-			promEnc("u", 0, "ZZ", 1),
-			promEnc("t", 0, "BB", 3), // merges into the first t/0 entry
+			promEnc("t", 0, "a1", "a2"),
+			promEnc("u", 0, "z1"),
+			promEnc("t", 0, "b1"), // merges into the first t/0 entry
 		})
 		require.Len(t, out, 2)
-		assert.Equal(t, []byte("AAABB"), out[0].encoded)
-		assert.Equal(t, produceRequestStats{records: 5, batches: 2, uncompressedBytes: 5, compressedBytes: 5}, out[0].encodedStats)
-		assert.Equal(t, []byte("ZZ"), out[1].encoded)
+
+		// t/0: a single batch carrying all three records in arrival order.
+		assert.Equal(t, int64(1), out[0].encodedStats.batches)
+		assert.Equal(t, int64(3), out[0].encodedStats.records)
+		assert.Equal(t, []string{"a1", "a2", "b1"}, values(decodeBatch(out[0].encoded)))
 		// Routing decision is carried onto the merged wire view.
 		assert.Equal(t, int32(7), out[0].nodeID)
-	})
 
-	t.Run("merge does not append into an input's spare capacity", func(t *testing.T) {
-		// The first entry's encoded slice has spare capacity, so an in-place
-		// append during merge would clobber the byte past its length.
-		first := make([]byte, 3, 8)
-		copy(first, "AAA")
-		firstEntry := promised[routedEncodedTopicPartitionRecords]{
-			item: routedEncodedTopicPartitionRecords{
-				encodedTopicPartitionRecords: encodedTopicPartitionRecords{topic: "t", partition: 0, encoded: first},
-				nodeID:                       7,
-			},
-		}
-		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
-			firstEntry,
-			promEnc("t", 0, "BB", 1),
-		})
-		require.Len(t, out, 1)
-		assert.Equal(t, []byte("AAABB"), out[0].encoded)
-		assert.Equal(t, byte(0), first[:cap(first)][3], "merge must not write into the input's spare capacity")
+		// u/0 is a single entry, returned unchanged (still one batch).
+		assert.Equal(t, int64(1), out[1].encodedStats.records)
+		assert.Equal(t, []string{"z1"}, values(decodeBatch(out[1].encoded)))
 	})
 
 	t.Run("empty input returns empty", func(t *testing.T) {
@@ -236,7 +228,7 @@ func TestRoutedTopicPartitionRecords_MergeWith(t *testing.T) {
 		other.records = []*kgo.Record{{Value: []byte("b")}}
 		other.nodeState = AgentStateDemoted
 
-		merged := base.mergeWith(other)
+		merged := base.mergeWith([]routedTopicPartitionRecords{other})
 		require.Len(t, merged.records, 2)
 		assert.Equal(t, []byte("a"), merged.records[0].Value)
 		assert.Equal(t, []byte("b"), merged.records[1].Value)
@@ -251,9 +243,9 @@ func TestRoutedTopicPartitionRecords_MergeWith(t *testing.T) {
 		diffNodeID := base
 		diffNodeID.nodeID = 2
 
-		assert.Panics(t, func() { base.mergeWith(diffTopic) })
-		assert.Panics(t, func() { base.mergeWith(diffPartition) })
-		assert.Panics(t, func() { base.mergeWith(diffNodeID) })
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffTopic}) })
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffPartition}) })
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffNodeID}) })
 	})
 
 	t.Run("returns a freshly allocated batch without mutating either input", func(t *testing.T) {
@@ -273,7 +265,7 @@ func TestRoutedTopicPartitionRecords_MergeWith(t *testing.T) {
 			nodeState:             AgentStateDemoted,
 		}
 
-		merged := a.mergeWith(b)
+		merged := a.mergeWith([]routedTopicPartitionRecords{b})
 		assert.Equal(t, []*kgo.Record{ra, rb}, merged.records)
 
 		// Neither input is mutated in place.
