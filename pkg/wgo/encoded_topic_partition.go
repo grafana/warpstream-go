@@ -38,9 +38,7 @@ func (p encodedTopicPartitionRecords) recordCount() int {
 	return int(p.encodedStats.records)
 }
 
-// payloadBytes returns 0: an encoded batch retains no caller-owned record
-// payload to account for, and the buffered-bytes counter it feeds (on the hedge
-// buffer, which exposes no gauge) is never read anyway.
+// payloadBytes is unsupported and returns 0.
 func (p encodedTopicPartitionRecords) payloadBytes() int64 {
 	return 0
 }
