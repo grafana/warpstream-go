@@ -15,6 +15,14 @@ type routedBatch[W any] interface {
 	mergeWith(other W) W
 }
 
+// Compile-time assertion that both item types satisfy routedBatch. It also marks
+// methods reached only through the type parameter as used, which the unused
+// linter does not track across generic instantiation.
+var (
+	_ routedBatch[routedTopicPartitionRecords]        = routedTopicPartitionRecords{}
+	_ routedBatch[routedEncodedTopicPartitionRecords] = routedEncodedTopicPartitionRecords{}
+)
+
 // promised pairs a routedBatch item with a done callback that fires exactly once
 // with the item's terminal ProduceResult: a full ProduceResponse on success, or
 // an error result on failure or ctx-cancel (which may still carry a partial
