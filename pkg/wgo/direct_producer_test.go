@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -106,6 +107,76 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 		successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), successCount)
 		assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_direct_request_latency_seconds"))
+	})
+
+	t.Run("merged same-partition batches round-trip as a single batch", func(t *testing.T) {
+		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName)
+
+		client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+
+		metaResp, err := client.Request(context.Background(), &kmsg.MetadataRequest{
+			Topics: []kmsg.MetadataRequestTopic{{Topic: kmsg.StringPtr(topicName)}},
+		})
+		require.NoError(t, err)
+		topicID := metaResp.(*kmsg.MetadataResponse).Topics[0].TopicID
+
+		topicIDFn := func(name string) ([16]byte, bool) {
+			if name == topicName {
+				return topicID, true
+			}
+			return [16]byte{}, false
+		}
+		producer := NewKafkaDirectProducer(client, topicIDFn, 9, KafkaDirectProducerConfig{
+			ProduceRequestTimeout:         time.Second,
+			ProduceRequestTimeoutOverhead: time.Second,
+		}, newMetrics(prometheus.NewPedanticRegistry()))
+
+		// Two separately-encoded batches for the same partition, as the hedge
+		// buffer accumulates across concurrent produces. Merging them must yield a
+		// single RecordBatch: a partition carrying more than one batch is not a
+		// valid produce payload (kfake rejects it). Values are large and
+		// compressible so each batch takes the Snappy path, exercising the
+		// decode+re-encode merge end to end.
+		rec := func(key string) *kgo.Record {
+			return &kgo.Record{Topic: topicName, Partition: partition, Key: []byte(key), Value: bytes.Repeat([]byte(key+"|"), 512), Timestamp: time.Now()}
+		}
+		batch1 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k1"), rec("k2")})
+		batch2 := newEncodedTopicPartitionRecords(topicName, partition, []*kgo.Record{rec("k3")})
+
+		merged := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
+			{item: routedEncodedTopicPartitionRecords{encodedTopicPartitionRecords: batch1, nodeID: brokerNodeID}},
+			{item: routedEncodedTopicPartitionRecords{encodedTopicPartitionRecords: batch2, nodeID: brokerNodeID}},
+		})
+		require.Len(t, merged, 1)
+
+		res := producer.ProduceSync(context.Background(), brokerNodeID, unrouteEncodedTopicPartitionRecords(merged))
+		require.NoError(t, res.err)
+		require.NoError(t, parseProduceResponse(res.resp))
+
+		consumer, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+				topicName: {partition: kgo.NewOffset().AtStart()},
+			}),
+		)
+		require.NoError(t, err)
+		t.Cleanup(consumer.Close)
+
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		t.Cleanup(cancel)
+
+		var got []*kgo.Record
+		for len(got) < 3 {
+			fetches := consumer.PollFetches(fetchCtx)
+			require.NoError(t, fetches.Err())
+			got = append(got, fetches.Records()...)
+		}
+		require.Len(t, got, 3)
+		assert.Equal(t, bytes.Repeat([]byte("k1|"), 512), got[0].Value)
+		assert.Equal(t, bytes.Repeat([]byte("k2|"), 512), got[1].Value)
+		assert.Equal(t, bytes.Repeat([]byte("k3|"), 512), got[2].Value)
 	})
 
 	t.Run("applies per-attempt timeout (TimeoutMillis on wire + client-side ctx deadline)", func(t *testing.T) {
@@ -267,10 +338,9 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 	})
 }
 
-// partitionsForTest groups records by (topic, partition) into a slice of
-// routedTopicPartitionRecords. done is left nil because callers in this file
-// (DirectProducer-level tests) don't go through the buffer.
-func partitionsForTest(records []*kgo.Record) []topicPartitionRecords {
+// partitionsForTest groups records by (topic, partition) and encodes each into
+// an encodedTopicPartitionRecords, the input the DirectProducer chain takes.
+func partitionsForTest(records []*kgo.Record) []encodedTopicPartitionRecords {
 	groups := make(map[topicPartition]*topicPartitionRecords)
 	var order []topicPartition
 	for _, r := range records {
@@ -283,9 +353,10 @@ func partitionsForTest(records []*kgo.Record) []topicPartitionRecords {
 		}
 		g.records = append(g.records, r)
 	}
-	out := make([]topicPartitionRecords, 0, len(order))
+	out := make([]encodedTopicPartitionRecords, 0, len(order))
 	for _, k := range order {
-		out = append(out, *groups[k])
+		g := groups[k]
+		out = append(out, newEncodedTopicPartitionRecords(g.topic, g.partition, g.records))
 	}
 	return out
 }

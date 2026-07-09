@@ -13,7 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func TestTopicPartitionRecords_RecordPayloadBytes(t *testing.T) {
+func TestTopicPartitionRecords_PayloadBytes(t *testing.T) {
 	tests := map[string]struct {
 		records       []*kgo.Record
 		expectedBytes int64
@@ -52,75 +52,16 @@ func TestTopicPartitionRecords_RecordPayloadBytes(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			p := topicPartitionRecords{records: tc.records}
-			assert.Equal(t, tc.expectedBytes, p.recordPayloadBytes())
+			assert.Equal(t, tc.expectedBytes, p.payloadBytes())
 		})
 	}
 }
 
-func TestNewMultiRoutedTopicPartitionRecords(t *testing.T) {
-	t.Run("stamps every entry with the same nodeID and done", func(t *testing.T) {
-		parts := []topicPartitionRecords{
-			{topic: "t", partition: 0, records: []*kgo.Record{{Topic: "t", Partition: 0}}},
-			{topic: "t", partition: 1, records: []*kgo.Record{{Topic: "t", Partition: 1}}},
-			{topic: "u", partition: 5, records: []*kgo.Record{{Topic: "u", Partition: 5}}},
-		}
-		var fired int
-		done := func(ProduceResult) { fired++ }
-
-		out := newMultiRoutedTopicPartitionRecords(parts, 42, done)
-		require.Len(t, out, len(parts))
-		for i, r := range out {
-			assert.Equal(t, parts[i].topic, r.topic)
-			assert.Equal(t, parts[i].partition, r.partition)
-			assert.Equal(t, parts[i].records, r.records)
-			assert.Equal(t, int32(42), r.nodeID)
-			require.NotNil(t, r.done)
-			r.done(ProduceResult{})
-		}
-		assert.Equal(t, len(parts), fired)
-	})
-
-	t.Run("empty input returns empty slice", func(t *testing.T) {
-		out := newMultiRoutedTopicPartitionRecords(nil, 1, func(ProduceResult) {})
-		assert.Empty(t, out)
-	})
-
-	t.Run("nil done is preserved", func(t *testing.T) {
-		parts := []topicPartitionRecords{{topic: "t", partition: 0}}
-		out := newMultiRoutedTopicPartitionRecords(parts, 1, nil)
-		require.Len(t, out, 1)
-		assert.Nil(t, out[0].done)
-	})
-
-	t.Run("done propagates the ProduceResult to every entry", func(t *testing.T) {
-		parts := []topicPartitionRecords{
-			{topic: "t", partition: 0},
-			{topic: "t", partition: 1},
-		}
-		want := errors.New("boom")
-		resp := &kmsg.ProduceResponse{}
-		var calls []ProduceResult
-		done := func(res ProduceResult) {
-			calls = append(calls, res)
-		}
-
-		out := newMultiRoutedTopicPartitionRecords(parts, 7, done)
-		for _, r := range out {
-			r.done(ProduceResult{resp: resp, err: want})
-		}
-		require.Len(t, calls, len(parts))
-		for _, c := range calls {
-			assert.Same(t, resp, c.resp)
-			assert.Same(t, want, c.err)
-		}
-	})
-}
-
-func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) {
+func TestMergePromisedRoutedBatchByTopicPartition_Records(t *testing.T) {
 	rec := func(v string) *kgo.Record { return &kgo.Record{Value: []byte(v)} }
-	prom := func(topic string, partition int32, recs ...*kgo.Record) promisedRoutedTopicPartitionRecords {
-		return promisedRoutedTopicPartitionRecords{
-			routedTopicPartitionRecords: routedTopicPartitionRecords{
+	prom := func(topic string, partition int32, recs ...*kgo.Record) promised[routedTopicPartitionRecords] {
+		return promised[routedTopicPartitionRecords]{
+			item: routedTopicPartitionRecords{
 				topicPartitionRecords: topicPartitionRecords{topic: topic, partition: partition, records: recs},
 				nodeID:                7,
 				nodeState:             AgentStateDemoted,
@@ -130,7 +71,7 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 
 	t.Run("distinct partitions are kept separate, in first-seen order", func(t *testing.T) {
 		a, b, c := rec("a"), rec("b"), rec("c")
-		out := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedTopicPartitionRecords]{
 			prom("t", 0, a),
 			prom("t", 1, b),
 			prom("u", 0, c),
@@ -146,7 +87,7 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 
 	t.Run("same topic-partition entries merge with records concatenated in arrival order", func(t *testing.T) {
 		a, b, c, d := rec("a"), rec("b"), rec("c"), rec("d")
-		out := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedTopicPartitionRecords]{
 			prom("t", 0, a),
 			prom("u", 0, c),
 			prom("t", 0, b, d), // merges into the first t/0 entry
@@ -162,12 +103,13 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 		// append during merge would clobber index 1 of this backing array.
 		first := make([]*kgo.Record, 1, 4)
 		first[0] = a
-		firstEntry := promisedRoutedTopicPartitionRecords{
-			routedTopicPartitionRecords: routedTopicPartitionRecords{
+		firstEntry := promised[routedTopicPartitionRecords]{
+			item: routedTopicPartitionRecords{
 				topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: first},
+				nodeID:                7,
 			},
 		}
-		out := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedTopicPartitionRecords]{
 			firstEntry,
 			prom("t", 0, b),
 		})
@@ -179,9 +121,9 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 	})
 
 	t.Run("merged entry takes the last contributor's nodeState", func(t *testing.T) {
-		promState := func(state AgentState, r *kgo.Record) promisedRoutedTopicPartitionRecords {
-			return promisedRoutedTopicPartitionRecords{
-				routedTopicPartitionRecords: routedTopicPartitionRecords{
+		promState := func(state AgentState, r *kgo.Record) promised[routedTopicPartitionRecords] {
+			return promised[routedTopicPartitionRecords]{
+				item: routedTopicPartitionRecords{
 					topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: []*kgo.Record{r}},
 					nodeID:                7,
 					nodeState:             state,
@@ -190,14 +132,14 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 		}
 		// The last Add's routing-time state is the freshest, so it wins — whether
 		// that means an agent just got demoted or just recovered.
-		demotedLast := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+		demotedLast := mergePromisedRoutedBatchByTopicPartition([]promised[routedTopicPartitionRecords]{
 			promState(AgentStateHealthy, rec("a")),
 			promState(AgentStateDemoted, rec("b")),
 		})
 		require.Len(t, demotedLast, 1)
 		assert.Equal(t, AgentStateDemoted, demotedLast[0].nodeState)
 
-		healthyLast := mergePromisedRoutedTopicPartitionRecordsByTopicPartition([]promisedRoutedTopicPartitionRecords{
+		healthyLast := mergePromisedRoutedBatchByTopicPartition([]promised[routedTopicPartitionRecords]{
 			promState(AgentStateDemoted, rec("a")),
 			promState(AgentStateHealthy, rec("b")),
 		})
@@ -206,15 +148,144 @@ func TestMergePromisedRoutedTopicPartitionRecordsByTopicPartition(t *testing.T) 
 	})
 
 	t.Run("empty input returns empty", func(t *testing.T) {
-		assert.Empty(t, mergePromisedRoutedTopicPartitionRecordsByTopicPartition(nil))
+		assert.Empty(t, mergePromisedRoutedBatchByTopicPartition[routedTopicPartitionRecords](nil))
 	})
 }
 
-func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
+func TestMergePromisedRoutedBatchByTopicPartition_Encoded(t *testing.T) {
+	promEnc := func(topic string, partition int32, values ...string) promised[routedEncodedTopicPartitionRecords] {
+		recs := make([]*kgo.Record, len(values))
+		for i, v := range values {
+			recs[i] = &kgo.Record{Value: []byte(v), Timestamp: time.UnixMilli(1_700_000_000_000 + int64(i))}
+		}
+		return promised[routedEncodedTopicPartitionRecords]{
+			item: routedEncodedTopicPartitionRecords{
+				encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, recs),
+				nodeID:                       7,
+				nodeState:                    AgentStateDemoted,
+			},
+		}
+	}
+	values := func(records []*kgo.Record) []string {
+		out := make([]string, len(records))
+		for i, r := range records {
+			out[i] = string(r.Value)
+		}
+		return out
+	}
+
+	t.Run("same topic-partition entries merge into one batch decoding to all records in order", func(t *testing.T) {
+		out := mergePromisedRoutedBatchByTopicPartition([]promised[routedEncodedTopicPartitionRecords]{
+			promEnc("t", 0, "a1", "a2"),
+			promEnc("u", 0, "z1"),
+			promEnc("t", 0, "b1"), // merges into the first t/0 entry
+		})
+		require.Len(t, out, 2)
+
+		// t/0: a single batch carrying all three records in arrival order.
+		assert.Equal(t, int64(1), out[0].encodedStats.batches)
+		assert.Equal(t, int64(3), out[0].encodedStats.records)
+		assert.Equal(t, []string{"a1", "a2", "b1"}, values(decodeBatch(out[0].encoded)))
+		// Routing decision is carried onto the merged wire view.
+		assert.Equal(t, int32(7), out[0].nodeID)
+
+		// u/0 is a single entry, returned unchanged (still one batch).
+		assert.Equal(t, int64(1), out[1].encodedStats.records)
+		assert.Equal(t, []string{"z1"}, values(decodeBatch(out[1].encoded)))
+	})
+
+	t.Run("empty input returns empty", func(t *testing.T) {
+		assert.Empty(t, mergePromisedRoutedBatchByTopicPartition[routedEncodedTopicPartitionRecords](nil))
+	})
+}
+
+func TestTopicPartitionRecords_RecordCount(t *testing.T) {
+	t.Run("records state returns the live count", func(t *testing.T) {
+		p := topicPartitionRecords{records: []*kgo.Record{{}, {}}}
+		assert.Equal(t, 2, p.recordCount())
+	})
+	t.Run("empty group returns zero", func(t *testing.T) {
+		p := topicPartitionRecords{}
+		assert.Equal(t, 0, p.recordCount())
+	})
+}
+
+func TestRoutedTopicPartitionRecords_UncompressedWireBytes(t *testing.T) {
+	recs := makeRecords(0, "v1", "v2")
+	p := routedTopicPartitionRecords{topicPartitionRecords: topicPartitionRecords{records: recs}}
+	assert.Equal(t, multiRecordBatchEstimateBytes(recs), p.uncompressedWireBytes())
+}
+
+func TestRoutedTopicPartitionRecords_MergeWith(t *testing.T) {
+	base := routedTopicPartitionRecords{
+		topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: []*kgo.Record{{Value: []byte("a")}}},
+		nodeID:                1,
+		nodeState:             AgentStateHealthy,
+	}
+
+	t.Run("concatenates records and takes the later contributor's nodeState", func(t *testing.T) {
+		other := base
+		other.records = []*kgo.Record{{Value: []byte("b")}}
+		other.nodeState = AgentStateDemoted
+
+		merged := base.mergeWith([]routedTopicPartitionRecords{other})
+		require.Len(t, merged.records, 2)
+		assert.Equal(t, []byte("a"), merged.records[0].Value)
+		assert.Equal(t, []byte("b"), merged.records[1].Value)
+		assert.Equal(t, AgentStateDemoted, merged.nodeState)
+	})
+
+	t.Run("panics when the two items target different routing", func(t *testing.T) {
+		diffTopic := base
+		diffTopic.topic = "u"
+		diffPartition := base
+		diffPartition.partition = 1
+		diffNodeID := base
+		diffNodeID.nodeID = 2
+
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffTopic}) })
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffPartition}) })
+		assert.Panics(t, func() { base.mergeWith([]routedTopicPartitionRecords{diffNodeID}) })
+	})
+
+	t.Run("returns a freshly allocated batch without mutating either input", func(t *testing.T) {
+		ra, rb := &kgo.Record{Value: []byte("a")}, &kgo.Record{Value: []byte("b")}
+		// The receiver slice has spare capacity, so an in-place append would
+		// clobber index 1 of its backing array.
+		first := make([]*kgo.Record, 1, 4)
+		first[0] = ra
+		a := routedTopicPartitionRecords{
+			topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: first},
+			nodeID:                1,
+			nodeState:             AgentStateHealthy,
+		}
+		b := routedTopicPartitionRecords{
+			topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 0, records: []*kgo.Record{rb}},
+			nodeID:                1,
+			nodeState:             AgentStateDemoted,
+		}
+
+		merged := a.mergeWith([]routedTopicPartitionRecords{b})
+		assert.Equal(t, []*kgo.Record{ra, rb}, merged.records)
+
+		// Neither input is mutated in place.
+		assert.Equal(t, []*kgo.Record{ra}, a.records)
+		assert.Equal(t, AgentStateHealthy, a.nodeState)
+		assert.Equal(t, []*kgo.Record{rb}, b.records)
+		assert.Equal(t, AgentStateDemoted, b.nodeState)
+		assert.Nil(t, first[:cap(first)][1], "merge must not write into the receiver's spare capacity")
+
+		// The returned batch is a fresh allocation, aliasing neither input's array.
+		assert.NotSame(t, &a.records[0], &merged.records[0])
+		assert.NotSame(t, &b.records[0], &merged.records[0])
+	})
+}
+
+func TestSplitPromisedRoutedBatchByBatchMaxBytes(t *testing.T) {
 	const batchMaxBytes = 512
-	mk := func(recs []*kgo.Record, done func(ProduceResult)) promisedRoutedTopicPartitionRecords {
-		return promisedRoutedTopicPartitionRecords{
-			routedTopicPartitionRecords: routedTopicPartitionRecords{
+	mk := func(recs []*kgo.Record, done func(ProduceResult)) promised[routedTopicPartitionRecords] {
+		return promised[routedTopicPartitionRecords]{
+			item: routedTopicPartitionRecords{
 				topicPartitionRecords: topicPartitionRecords{topic: "t", partition: 3, records: recs},
 				nodeID:                9,
 				nodeState:             AgentStateDemoted,
@@ -234,25 +305,25 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 
 	t.Run("group within cap is returned unchanged", func(t *testing.T) {
 		recs := []*kgo.Record{{Value: []byte("v")}}
-		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
+		out := splitPromisedRoutedBatchByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Len(t, out, 1)
-		assert.Equal(t, recs, out[0].records)
+		assert.Equal(t, recs, out[0].item.records)
 	})
 
 	t.Run("oversized group splits into <=cap chunks, records preserved in order, routing kept", func(t *testing.T) {
 		recs := oversized()
-		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
+		out := splitPromisedRoutedBatchByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 
 		var got []*kgo.Record
 		for _, c := range out {
-			require.NotEmpty(t, c.records)
-			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(batchMaxBytes))
-			assert.Equal(t, "t", c.topic)
-			assert.Equal(t, int32(3), c.partition)
-			assert.Equal(t, int32(9), c.nodeID)
-			assert.Equal(t, AgentStateDemoted, c.nodeState)
-			got = append(got, c.records...)
+			require.NotEmpty(t, c.item.records)
+			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.item.records), int64(batchMaxBytes))
+			assert.Equal(t, "t", c.item.topic)
+			assert.Equal(t, int32(3), c.item.partition)
+			assert.Equal(t, int32(9), c.item.nodeID)
+			assert.Equal(t, AgentStateDemoted, c.item.nodeState)
+			got = append(got, c.item.records...)
 		}
 		assert.Equal(t, recs, got)
 	})
@@ -274,15 +345,15 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 		for i := range recs {
 			recs[i] = &kgo.Record{Timestamp: base.Add(time.Duration(i) * time.Hour)}
 		}
-		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
+		out := splitPromisedRoutedBatchByBatchMaxBytes(mk(recs, func(ProduceResult) {}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
 
 		var got []*kgo.Record
 		for _, c := range out {
-			require.NotEmpty(t, c.records)
-			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.records), int64(batchMaxBytes),
+			require.NotEmpty(t, c.item.records)
+			assert.LessOrEqual(t, multiRecordBatchEstimateBytes(c.item.records), int64(batchMaxBytes),
 				"each chunk's real wire size must stay within the cap")
-			got = append(got, c.records...)
+			got = append(got, c.item.records...)
 		}
 		assert.Equal(t, recs, got)
 	})
@@ -296,7 +367,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 			calls int
 			got   ProduceResult
 		)
-		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(res ProduceResult) {
+		out := splitPromisedRoutedBatchByBatchMaxBytes(mk(oversized(), func(res ProduceResult) {
 			calls++
 			got = res
 		}), batchMaxBytes)
@@ -318,7 +389,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 		// single result delivered to the original done.
 		run := func(t *testing.T, results func(n int) []ProduceResult) ProduceResult {
 			var got ProduceResult
-			out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(res ProduceResult) { got = res }), batchMaxBytes)
+			out := splitPromisedRoutedBatchByBatchMaxBytes(mk(oversized(), func(res ProduceResult) { got = res }), batchMaxBytes)
 			require.GreaterOrEqual(t, len(out), 3, "oversized() must split into >=3 chunks to exercise these orderings")
 			rs := results(len(out))
 			for i, c := range out {
@@ -358,7 +429,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 
 	t.Run("concurrent chunk dones fire the original exactly once", func(t *testing.T) {
 		var calls int32
-		out := splitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(mk(oversized(), func(ProduceResult) {
+		out := splitPromisedRoutedBatchByBatchMaxBytes(mk(oversized(), func(ProduceResult) {
 			atomic.AddInt32(&calls, 1)
 		}), batchMaxBytes)
 		require.Greater(t, len(out), 1)
@@ -366,7 +437,7 @@ func TestSplitPromisedRoutedTopicPartitionRecordsByBatchMaxBytes(t *testing.T) {
 		var wg sync.WaitGroup
 		for _, c := range out {
 			wg.Add(1)
-			go func(c promisedRoutedTopicPartitionRecords) {
+			go func(c promised[routedTopicPartitionRecords]) {
 				defer wg.Done()
 				c.done(success)
 			}(c)
