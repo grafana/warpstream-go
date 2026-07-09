@@ -651,6 +651,20 @@ func TestNewWarpstreamClient_UsesLoggerForEmbeddedClient(t *testing.T) {
 	require.NotEmpty(t, buf.String(), "embedded franz-go client should log through the provided logger")
 }
 
+func TestLog(t *testing.T) {
+	t.Run("emits when the level is enabled", func(t *testing.T) {
+		var buf bytes.Buffer
+		log(kgo.BasicLogger(&buf, kgo.LogLevelInfo, nil), kgo.LogLevelInfo, "hello")
+		require.Contains(t, buf.String(), "hello")
+	})
+
+	t.Run("suppresses when the level is disabled", func(t *testing.T) {
+		var buf bytes.Buffer
+		log(kgo.BasicLogger(&buf, kgo.LogLevelWarn, nil), kgo.LogLevelInfo, "hello")
+		require.Empty(t, buf.String())
+	})
+}
+
 // produceClient is the minimum surface BenchmarkClient_Produce exercises against
 // both kgo.Client and *WarpstreamClient.
 type produceClient interface {

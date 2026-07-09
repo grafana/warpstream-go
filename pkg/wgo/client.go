@@ -340,7 +340,7 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 			case <-ticker.C:
 				removed, err := c.pool.Refresh(c.refreshCtx)
 				if err != nil {
-					c.logger.Log(kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
+					log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
 					continue
 				}
 				if len(removed) > 0 {
@@ -537,3 +537,11 @@ type nopLogger struct{}
 
 func (nopLogger) Level() kgo.LogLevel              { return kgo.LogLevelNone }
 func (nopLogger) Log(kgo.LogLevel, string, ...any) {}
+
+// log emits msg through logger only when level is enabled, matching how the
+// embedded franz-go client gates its own logs by Logger.Level().
+func log(logger kgo.Logger, level kgo.LogLevel, msg string, keyvals ...any) {
+	if level <= logger.Level() {
+		logger.Log(level, msg, keyvals...)
+	}
+}

@@ -284,9 +284,9 @@ func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterSta
 
 	switch {
 	case demoted:
-		d.logger.Log(kgo.LogLevelInfo, "warpstream agent demoted", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
+		log(d.logger, kgo.LogLevelInfo, "warpstream agent demoted", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
 	case restored:
-		d.logger.Log(kgo.LogLevelInfo, "warpstream agent restored", "node_id", nodeID)
+		log(d.logger, kgo.LogLevelInfo, "warpstream agent restored", "node_id", nodeID)
 	}
 
 	return isFaulty
