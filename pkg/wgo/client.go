@@ -16,14 +16,14 @@ import (
 	"github.com/twmb/franz-go/pkg/kversion"
 )
 
-// produceAPIVersion is the Kafka Produce API version this client emits. v11
+// ProduceAPIVersion is the Kafka Produce API version this client emits. v11
 // matches franz-go's own negotiated default for ProduceRequest, addresses
 // topics by name on the wire (so stale TopicIDs cannot mis-route), and is
 // supported by every broker this client targets (vanilla Kafka 2.4+, Warpstream).
 // Topic UUID is the addressing mode at v13+; bumping past v11 would make
 // TopicID load-bearing and require dropping the topic name from requests,
 // which we do not need today.
-const produceAPIVersion int16 = 11
+const ProduceAPIVersion int16 = 11
 
 // WarpstreamClient is a produce-only Kafka client tailored to Warpstream's
 // stateless-agent architecture. It exists because franz-go's standard produce
@@ -114,7 +114,7 @@ func NewWarpstreamClient(logger log.Logger, reg prometheus.Registerer, opts ...O
 	innerTracker := NewAverageAgentStatsTracker()
 	tracker := NewCachedAgentStatsTracker(innerTracker, cfg.ClusterStatsTTL)
 
-	directProducer := NewKafkaDirectProducer(kgoClient, pool.TopicID, produceAPIVersion, cfg.DirectProducer, m)
+	directProducer := NewKafkaDirectProducer(kgoClient, pool.TopicID, ProduceAPIVersion, cfg.DirectProducer, m)
 	// Tracker observes each per-attempt outcome directly. Cross-agent
 	// retry is handled by the Hedger as part of its per-call wave loop,
 	// so the agent stats here reflect per-attempt quality and the Hedger
@@ -483,7 +483,7 @@ func newKgoClient(cfg Config, reg prometheus.Registerer) (*kgo.Client, error) {
 		kgo.ProducerLinger(cfg.Linger),
 		kgo.ProducerBatchMaxBytes(cfg.BatchMaxBytes),
 
-		// Pin Produce to produceAPIVersion: our wire builders set
+		// Pin Produce to ProduceAPIVersion: our wire builders set
 		// req.Version explicitly, but kgo.Broker.Request overrides it
 		// to the negotiated max. Without this cap, brokers supporting
 		// v13+ would receive UUID-only requests/responses, which our
@@ -510,11 +510,11 @@ func newKgoClient(cfg Config, reg prometheus.Registerer) (*kgo.Client, error) {
 
 // produceMaxVersions returns a kversion.Versions snapshot identical to
 // kgo's default kversion.Stable() except Produce is capped at
-// produceAPIVersion so kgo's per-request version negotiation can't
+// ProduceAPIVersion so kgo's per-request version negotiation can't
 // promote us past the wire format we generate and parse.
 func produceMaxVersions() *kversion.Versions {
 	v := kversion.Stable()
-	v.SetMaxKeyVersion(kmsg.Produce.Int16(), produceAPIVersion)
+	v.SetMaxKeyVersion(kmsg.Produce.Int16(), ProduceAPIVersion)
 	return v
 }
 
