@@ -4,7 +4,6 @@ go 1.25.10
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/go-kit/log v0.2.1
 	github.com/klauspost/compress v1.18.6
 	github.com/prometheus/client_golang v1.23.3-0.20260305100053-48a6770e980b
 	github.com/prometheus/client_model v0.6.2
@@ -18,7 +17,6 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/go-logfmt/logfmt v0.6.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
