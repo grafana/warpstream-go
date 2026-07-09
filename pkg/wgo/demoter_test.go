@@ -7,18 +7,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // newTestDemoter builds a Demoter with a throwaway registry (so the gauges can
 // be asserted) and a no-op logger.
 func newTestDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig) (*Demoter, *prometheus.Registry) {
 	reg := prometheus.NewPedanticRegistry()
-	return NewDemoter(inner, tracker, health, cfg, log.NewNopLogger(), reg), reg
+	return NewDemoter(inner, tracker, health, cfg, nil, reg), reg
 }
 
 func TestDemoter_Candidates(t *testing.T) {
@@ -706,7 +706,7 @@ func TestDemoter_Candidates(t *testing.T) {
 
 	t.Run("logs demote and restore transitions", func(t *testing.T) {
 		var buf bytes.Buffer
-		logger := log.NewLogfmtLogger(&buf)
+		logger := kgo.BasicLogger(&buf, kgo.LogLevelInfo, nil)
 		reg := prometheus.NewPedanticRegistry()
 
 		tr := NewAverageAgentStatsTracker()
@@ -727,13 +727,13 @@ func TestDemoter_Candidates(t *testing.T) {
 		d.Candidates(topic, part, 2)
 		demoteLog := buf.String()
 		assert.Contains(t, demoteLog, "warpstream agent demoted")
-		assert.Contains(t, demoteLog, "node_id="+strconv.Itoa(int(slowID)))
-		assert.Contains(t, demoteLog, "error_rate=")
-		assert.Contains(t, demoteLog, "request_count=")
+		assert.Contains(t, demoteLog, "node_id: "+strconv.Itoa(int(slowID)))
+		assert.Contains(t, demoteLog, "error_rate: ")
+		assert.Contains(t, demoteLog, "request_count: ")
 		// The demotion edge applies the strict gate, so min_requests is
 		// errorRateMinRequests(0.05)=20, not the relaxed 1.
-		assert.Contains(t, demoteLog, "min_requests=20")
-		assert.Contains(t, demoteLog, "faulty_threshold=0.05")
+		assert.Contains(t, demoteLog, "min_requests: 20")
+		assert.Contains(t, demoteLog, "faulty_threshold: 0.05")
 
 		// Recovery: all-successful traffic clears the probe state and logs restore.
 		buf.Reset()
@@ -742,7 +742,7 @@ func TestDemoter_Candidates(t *testing.T) {
 		d.Candidates(topic, part, 2)
 		restoreLog := buf.String()
 		assert.Contains(t, restoreLog, "warpstream agent restored")
-		assert.Contains(t, restoreLog, "node_id="+strconv.Itoa(int(slowID)))
+		assert.Contains(t, restoreLog, "node_id: "+strconv.Itoa(int(slowID)))
 	})
 }
 

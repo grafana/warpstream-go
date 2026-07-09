@@ -1,13 +1,13 @@
 package wgo
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -56,7 +56,7 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32) (*
 	cluster, clusterAddr := testkafka.CreateCluster(t, numPartitions, topic)
 
 	c, err := NewWarpstreamClient(
-		log.NewNopLogger(),
+		nil,
 		prometheus.NewPedanticRegistry(),
 		testWarpstreamOpts(clusterAddr, topic)...,
 	)
@@ -565,7 +565,7 @@ func TestWarpstreamClient_Metrics(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	_, clusterAddr := testkafka.CreateCluster(t, 1, topic)
 
-	c, err := NewWarpstreamClient(log.NewNopLogger(), reg, testWarpstreamOpts(clusterAddr, topic)...)
+	c, err := NewWarpstreamClient(nil, reg, testWarpstreamOpts(clusterAddr, topic)...)
 	require.NoError(t, err)
 	t.Cleanup(c.Close)
 
@@ -613,7 +613,7 @@ func TestNewWarpstreamClient_NilRegisterer(t *testing.T) {
 	var c *WarpstreamClient
 	require.NotPanics(t, func() {
 		var err error
-		c, err = NewWarpstreamClient(log.NewNopLogger(), nil, testWarpstreamOpts(clusterAddr, topic)...)
+		c, err = NewWarpstreamClient(nil, nil, testWarpstreamOpts(clusterAddr, topic)...)
 		require.NoError(t, err)
 	})
 	t.Cleanup(c.Close)
@@ -625,6 +625,44 @@ func TestNewWarpstreamClient_NilRegisterer(t *testing.T) {
 	})
 	require.Len(t, results, 1)
 	require.NoError(t, results[0].Err)
+}
+
+// TestNewWarpstreamClient_UsesLoggerForEmbeddedClient verifies the logger passed
+// to NewWarpstreamClient is installed on the embedded franz-go client. A clean
+// produce logs nothing from wgo itself, so any captured output comes from
+// franz-go. The logger is at debug because franz-go emits nothing at info+ here.
+func TestNewWarpstreamClient_UsesLoggerForEmbeddedClient(t *testing.T) {
+	const topic = "test-topic"
+	_, clusterAddr := testkafka.CreateCluster(t, 1, topic)
+
+	var buf bytes.Buffer
+	logger := kgo.BasicLogger(&buf, kgo.LogLevelDebug, nil)
+
+	c, err := NewWarpstreamClient(logger, prometheus.NewPedanticRegistry(), testWarpstreamOpts(clusterAddr, topic)...)
+	require.NoError(t, err)
+	t.Cleanup(c.Close)
+
+	results := c.ProduceSync(context.Background(), []*kgo.Record{
+		{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+	})
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+
+	require.NotEmpty(t, buf.String(), "embedded franz-go client should log through the provided logger")
+}
+
+func TestLog(t *testing.T) {
+	t.Run("emits when the level is enabled", func(t *testing.T) {
+		var buf bytes.Buffer
+		log(kgo.BasicLogger(&buf, kgo.LogLevelInfo, nil), kgo.LogLevelInfo, "hello")
+		require.Contains(t, buf.String(), "hello")
+	})
+
+	t.Run("suppresses when the level is disabled", func(t *testing.T) {
+		var buf bytes.Buffer
+		log(kgo.BasicLogger(&buf, kgo.LogLevelWarn, nil), kgo.LogLevelInfo, "hello")
+		require.Empty(t, buf.String())
+	})
 }
 
 // produceClient is the minimum surface BenchmarkClient_Produce exercises against
@@ -654,7 +692,7 @@ func BenchmarkClient_Produce(b *testing.B) {
 	b.Cleanup(cluster.Close)
 
 	wsc, err := NewWarpstreamClient(
-		log.NewNopLogger(),
+		nil,
 		prometheus.NewPedanticRegistry(),
 		WithAddress(addr),
 		WithTopic(topic),
@@ -757,7 +795,7 @@ func TestWarpstreamClient_ReusedPooledRecordsAreRaceFree(t *testing.T) {
 
 		_, addr := testkafka.CreateCluster(t, numPartitions, topic, testkafka.WithNumBrokers(3))
 
-		c, err := NewWarpstreamClient(log.NewNopLogger(), prometheus.NewPedanticRegistry(), []Opt{
+		c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), []Opt{
 			WithAddress(addr),
 			WithTopic(topic),
 			WithClientID("pooled-record-race-test"),
