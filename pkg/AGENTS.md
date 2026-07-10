@@ -16,6 +16,13 @@ rename a `Config` field, make the same change to its `With…` option, and keep 
 option's doc comment aligned with the field's documentation. A defaulted field
 also needs its `Default…` constant and a line in `DefaultConfig`.
 
+## Naming
+
+When two functions do the same thing but one takes a single input and the other
+takes many, name the single-input one plainly and give the multi-input one a
+`Multi` prefix — e.g. `Add` (one record) / `MultiAdd` (many). The plain name is
+the single-item case; the `Multi` prefix signals "same operation, batched".
+
 ## Comments
 
 Default to writing **no** comment. Add one only when the *why* is non-obvious: a

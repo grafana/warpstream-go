@@ -146,103 +146,238 @@ func makeRecord(topic string, partition int32, value string) *kgo.Record {
 	return &kgo.Record{Topic: topic, Partition: partition, Value: []byte(value)}
 }
 
+// singleRouted builds a one-item promised carrying records for a single
+// (topic, partition) at nodeID, plus the channel its done resolves on. It is the
+// single-item input shared by the Add / MultiAdd parameterized tests.
+func singleRouted(nodeID int32, records []*kgo.Record) (promised[routedTopicPartitionRecords], chan error) {
+	done := make(chan error, 1)
+	return routedToSharedDone(nodeID, records, func(err error) { done <- err })[0], done
+}
+
+// TestAgentBuffer_Add runs every single-item enqueue case against both Add and
+// MultiAdd (via a one-element slice): each case enqueues one item, so both entry
+// points must behave identically.
 func TestAgentBuffer_Add(t *testing.T) {
-	t.Run("linger timer triggers flush", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		a := NewAgentBuffer[routedTopicPartitionRecords](1, 20*time.Millisecond, 1<<20, flush.Func(), m)
-		t.Cleanup(a.Close)
+	adders := []struct {
+		name string
+		add  func(*AgentBuffer[routedTopicPartitionRecords], promised[routedTopicPartitionRecords])
+	}{
+		{
+			"Add",
+			func(a *AgentBuffer[routedTopicPartitionRecords], p promised[routedTopicPartitionRecords]) {
+				a.Add(p)
+			},
+		}, {
+			"MultiAdd",
+			func(a *AgentBuffer[routedTopicPartitionRecords], p promised[routedTopicPartitionRecords]) {
+				a.MultiAdd([]promised[routedTopicPartitionRecords]{p})
+			},
+		},
+	}
 
-		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
+	for _, adder := range adders {
+		t.Run(adder.name, func(t *testing.T) {
+			t.Run("linger timer triggers flush", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, 20*time.Millisecond, 1<<20, flush.Func(), m)
+				t.Cleanup(a.Close)
 
-		select {
-		case err := <-done:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("done callback did not fire after linger expired")
-		}
-		require.Equal(t, 1, flush.callCount())
-		assert.Equal(t, int32(1), flush.snapshot()[0].nodeID)
-		assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
-	})
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(a, p)
 
-	t.Run("batch full triggers immediate flush before linger", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		// Small cap so the second Add's bytes overflow.
-		a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 100, flush.Func(), m)
-		t.Cleanup(a.Close)
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("done callback did not fire after linger expired")
+				}
+				require.Equal(t, 1, flush.callCount())
+				assert.Equal(t, int32(1), flush.snapshot()[0].nodeID)
+				assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
+			})
 
-		first := makeRecord("t", 0, string(make([]byte, 50)))
-		second := makeRecord("t", 0, string(make([]byte, 50)))
+			t.Run("batch full triggers immediate flush before linger", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				// Cap admits one record's batch but not two, so the first add fits
+				// directly and the second overflows the pending batch.
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 150, flush.Func(), m)
+				t.Cleanup(a.Close)
 
-		done1 := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{first}, func(err error) { done1 <- err }))
+				p1, done1 := singleRouted(1, []*kgo.Record{makeRecord("t", 0, string(make([]byte, 50)))})
+				adder.add(a, p1)
+				p2, done2 := singleRouted(1, []*kgo.Record{makeRecord("t", 0, string(make([]byte, 50)))})
+				adder.add(a, p2)
 
-		done2 := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{second}, func(err error) { done2 <- err }))
+				require.Eventually(t, func() bool { return flush.callCount() >= 1 }, time.Second, 10*time.Millisecond)
+				select {
+				case err := <-done1:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("first done did not fire after overflow flush")
+				}
 
-		require.Eventually(t, func() bool { return flush.callCount() >= 1 }, time.Second, 10*time.Millisecond)
+				a.Close()
+				select {
+				case err := <-done2:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("second done did not fire after Close")
+				}
+				assert.Equal(t, float64(2), testutil.ToFloat64(m.lingerFlushesTotal))
+			})
 
-		select {
-		case err := <-done1:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("first done did not fire after overflow flush")
-		}
+			t.Run("close flushes pending batch", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				a := NewAgentBuffer[routedTopicPartitionRecords](7, time.Hour, 1<<20, flush.Func(), m)
 
-		a.Close()
-		select {
-		case err := <-done2:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("second done did not fire after Close")
-		}
-		assert.Equal(t, float64(2), testutil.ToFloat64(m.lingerFlushesTotal))
-	})
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(a, p)
 
-	t.Run("close flushes pending batch", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		a := NewAgentBuffer[routedTopicPartitionRecords](7, time.Hour, 1<<20, flush.Func(), m)
+				require.Equal(t, 0, flush.callCount())
+				a.Close()
 
-		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire after Close")
+				}
+				require.Equal(t, 1, flush.callCount())
+				assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
+			})
 
-		require.Equal(t, 0, flush.callCount())
-		a.Close()
+			t.Run("done propagates flush error", func(t *testing.T) {
+				flush := newRecordingFlush()
+				boom := errors.New("boom")
+				flush.onFlush = func(int32, []*kgo.Record) error { return boom }
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, 10*time.Millisecond, 1<<20, flush.Func(), m)
+				t.Cleanup(a.Close)
 
-		select {
-		case err := <-done:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire after Close")
-		}
-		require.Equal(t, 1, flush.callCount())
-		assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
-	})
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(a, p)
 
-	t.Run("done propagates flush error", func(t *testing.T) {
-		flush := newRecordingFlush()
-		boom := errors.New("boom")
-		flush.onFlush = func(int32, []*kgo.Record) error { return boom }
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		a := NewAgentBuffer[routedTopicPartitionRecords](1, 10*time.Millisecond, 1<<20, flush.Func(), m)
-		t.Cleanup(a.Close)
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, boom)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire")
+				}
+				assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
+			})
 
-		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
+			t.Run("add after close fails fast", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 1<<20, flush.Func(), m)
+				a.Close()
 
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, boom)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire")
-		}
-		assert.Equal(t, float64(1), testutil.ToFloat64(m.lingerFlushesTotal))
-	})
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(a, p)
 
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, errBufferClosed)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire after add on closed buffer")
+				}
+				assert.Equal(t, float64(0), testutil.ToFloat64(m.lingerFlushesTotal))
+			})
+
+			// A single (topic, partition) item whose records together exceed
+			// batchMaxBytes (each record individually under the cap) is split across
+			// multiple flushes, each a RecordBatch within the cap — never one
+			// oversized batch the broker would reject — and its done fires once.
+			t.Run("oversized item splits across flushes, done fires once", func(t *testing.T) {
+				const batchMaxBytes = 512
+				flush := newRecordingFlush()
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, batchMaxBytes, flush.Func(), newMetrics(prometheus.NewPedanticRegistry()))
+
+				records := make([]*kgo.Record, 5)
+				for i := range records {
+					records[i] = makeRecord("t", 0, string(bytes.Repeat([]byte("x"), 200)))
+				}
+
+				var doneCalls int32
+				done := make(chan error, 1)
+				p := routedToSharedDone(1, records, func(err error) {
+					atomic.AddInt32(&doneCalls, 1)
+					done <- err
+				})[0]
+				adder.add(a, p)
+				a.Close() // flush whatever remains buffered
+
+				calls := flush.snapshot()
+				require.Greater(t, len(calls), 1, "oversized item must be split across multiple flushes")
+				flushed := 0
+				for _, c := range calls {
+					assert.LessOrEqualf(t, actualUncompressedMultiRecordBatchWireSize(c.records), int32(batchMaxBytes),
+						"flushed batch must stay within batchMaxBytes")
+					flushed += len(c.records)
+				}
+				assert.Equal(t, len(records), flushed, "every record must be flushed exactly once")
+
+				select {
+				case err := <-done:
+					assert.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("split item's done did not fire")
+				}
+				assert.Equal(t, int32(1), atomic.LoadInt32(&doneCalls), "done must fire exactly once")
+			})
+
+			// Two same-partition adds within one flush window coalesce into a single
+			// wire entry (the downstream accumulator rejects duplicate partitions),
+			// while each add's done still fires.
+			t.Run("same-partition adds coalesce into one wire entry", func(t *testing.T) {
+				var (
+					mu          sync.Mutex
+					flushes     int
+					entries     int
+					wireRecords int
+				)
+				flush := func(_ context.Context, _ int32, parts []routedTopicPartitionRecords) ProduceResult {
+					mu.Lock()
+					flushes++
+					entries += len(parts)
+					for _, p := range parts {
+						wireRecords += len(p.records)
+					}
+					mu.Unlock()
+					return ProduceResult{}
+				}
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 1<<20, flush, newMetrics(prometheus.NewPedanticRegistry()))
+
+				p1, done1 := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "a")})
+				adder.add(a, p1)
+				p2, done2 := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "b")})
+				adder.add(a, p2)
+				a.Close()
+
+				mu.Lock()
+				defer mu.Unlock()
+				require.Equal(t, 1, flushes)
+				assert.Equal(t, 1, entries, "same-partition adds must coalesce to one wire entry")
+				assert.Equal(t, 2, wireRecords, "both records must reach the wire")
+				for _, ch := range []chan error{done1, done2} {
+					select {
+					case err := <-ch:
+						assert.NoError(t, err)
+					case <-time.After(time.Second):
+						t.Fatal("a caller's done did not fire")
+					}
+				}
+			})
+		})
+	}
+}
+
+// TestAgentBuffer_MultiAdd covers behavior specific to the multi-item entry
+// point; the single-item cases it shares with Add live in TestAgentBuffer_Add.
+func TestAgentBuffer_MultiAdd(t *testing.T) {
 	t.Run("empty records: cb fires synchronously with nil", func(t *testing.T) {
 		flush := newRecordingFlush()
 		m := newMetrics(prometheus.NewPedanticRegistry())
@@ -250,7 +385,7 @@ func TestAgentBuffer_Add(t *testing.T) {
 		t.Cleanup(a.Close)
 
 		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, nil, func(err error) { done <- err }))
+		a.MultiAdd(routedToSharedDone(1, nil, func(err error) { done <- err }))
 
 		select {
 		case err := <-done:
@@ -261,114 +396,6 @@ func TestAgentBuffer_Add(t *testing.T) {
 		assert.Equal(t, 0, flush.callCount())
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.lingerFlushesTotal))
 	})
-
-	t.Run("add after close fails fast", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 1<<20, flush.Func(), m)
-		a.Close()
-
-		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
-
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, errBufferClosed)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire after Add on closed buffer")
-		}
-		assert.Equal(t, float64(0), testutil.ToFloat64(m.lingerFlushesTotal))
-	})
-}
-
-// TestAgentBuffer_Add_SplitsOversizedPartitionGroup checks that a single
-// (topic, partition) group whose records together exceed batchMaxBytes (each
-// record individually under the cap) is split across multiple flushes, each a
-// RecordBatch within the cap — never one oversized batch the broker would
-// reject MessageTooLarge — and that the group's done still fires exactly once.
-func TestAgentBuffer_Add_SplitsOversizedPartitionGroup(t *testing.T) {
-	const batchMaxBytes = 512
-	flush := newRecordingFlush()
-	a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, batchMaxBytes, flush.Func(), newMetrics(prometheus.NewPedanticRegistry()))
-
-	// Five 200-byte records for one partition in a single Add: each record's
-	// own batch is under the cap, but two already fill it, so the group can't
-	// be flushed as one batch.
-	records := make([]*kgo.Record, 5)
-	for i := range records {
-		records[i] = makeRecord("t", 0, string(bytes.Repeat([]byte("x"), 200)))
-	}
-
-	done := make(chan error, 1)
-	var doneCalls int32
-	a.Add(routedToSharedDone(1, records, func(err error) {
-		atomic.AddInt32(&doneCalls, 1)
-		done <- err
-	}))
-	a.Close() // flush whatever remains buffered
-
-	calls := flush.snapshot()
-	require.Greater(t, len(calls), 1, "oversized group must be split across multiple flushes")
-
-	flushed := 0
-	for _, c := range calls {
-		assert.LessOrEqualf(t, actualUncompressedMultiRecordBatchWireSize(c.records), int32(batchMaxBytes),
-			"flushed batch must stay within batchMaxBytes")
-		flushed += len(c.records)
-	}
-	assert.Equal(t, len(records), flushed, "every record must be flushed exactly once")
-
-	select {
-	case err := <-done:
-		assert.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("split group's done did not fire")
-	}
-	assert.Equal(t, int32(1), atomic.LoadInt32(&doneCalls), "done must fire exactly once")
-}
-
-// TestAgentBuffer_Add_CoalescesSamePartitionAcrossAdds verifies that two
-// separate Adds for the same partition within one flush window are coalesced
-// into a single wire entry (the downstream accumulator rejects duplicate
-// partitions), while each Add's done still fires.
-func TestAgentBuffer_Add_CoalescesSamePartitionAcrossAdds(t *testing.T) {
-	var (
-		mu          sync.Mutex
-		flushes     int
-		entries     int
-		wireRecords int
-	)
-	flush := func(_ context.Context, _ int32, parts []routedTopicPartitionRecords) ProduceResult {
-		mu.Lock()
-		flushes++
-		entries += len(parts)
-		for _, p := range parts {
-			wireRecords += len(p.records)
-		}
-		mu.Unlock()
-		return ProduceResult{}
-	}
-	a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, 1<<20, flush, newMetrics(prometheus.NewPedanticRegistry()))
-
-	done1 := make(chan error, 1)
-	done2 := make(chan error, 1)
-	a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "a")}, func(err error) { done1 <- err }))
-	a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "b")}, func(err error) { done2 <- err }))
-	a.Close()
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.Equal(t, 1, flushes)
-	assert.Equal(t, 1, entries, "same-partition Adds must coalesce to one wire entry")
-	assert.Equal(t, 2, wireRecords, "both records must reach the wire")
-	for _, ch := range []chan error{done1, done2} {
-		select {
-		case err := <-ch:
-			assert.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("a caller's done did not fire")
-		}
-	}
 }
 
 // TestAgentBuffer_NextProduceWireBytes verifies the running wire-byte
@@ -452,7 +479,7 @@ func TestAgentBuffer_NextProduceWireBytes(t *testing.T) {
 			)
 			t.Cleanup(a.Close)
 
-			a.Add(routedToSharedDone(1, tc.records, func(error) {}))
+			a.MultiAdd(routedToSharedDone(1, tc.records, func(error) {}))
 
 			a.mu.Lock()
 			running := a.nextProduceWireBytes
@@ -493,14 +520,14 @@ func TestAgentBuffer_NextProduceWireBytes_AfterEarlyFlush(t *testing.T) {
 		{Value: bytes.Repeat([]byte("x"), 200), Timestamp: time.UnixMilli(1_000_000)},
 		{Value: bytes.Repeat([]byte("y"), 200), Timestamp: time.UnixMilli(1_000_010)},
 	}
-	a.Add(routedToSharedDone(1, first, func(error) {}))
+	a.MultiAdd(routedToSharedDone(1, first, func(error) {}))
 
 	// Second Add doesn't fit on top of the first → must trigger an early
 	// flush of `first` and re-cost as a fresh batch anchored on second[0].
 	second := []*kgo.Record{
 		{Value: bytes.Repeat([]byte("z"), 200), Timestamp: time.UnixMilli(2_000_000)},
 	}
-	a.Add(routedToSharedDone(1, second, func(error) {}))
+	a.MultiAdd(routedToSharedDone(1, second, func(error) {}))
 
 	// First batch must have been flushed with exactly `first`.
 	select {
@@ -540,7 +567,7 @@ func TestAgentBuffer_Close(t *testing.T) {
 		a := NewAgentBuffer[routedTopicPartitionRecords](1, 10*time.Millisecond, 1<<20, flush.Func(), m)
 
 		done := make(chan error, 1)
-		a.Add(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
+		a.MultiAdd(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
 
 		require.Eventually(t, func() bool { return flush.callCount() == 1 },
 			time.Second, 10*time.Millisecond)

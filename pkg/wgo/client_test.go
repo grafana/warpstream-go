@@ -576,7 +576,7 @@ func TestWarpstreamClient_Close(t *testing.T) {
 
 			// Produce without waiting for the linger.
 			doneCh := make(chan error, 1)
-			c.buffer.Add(t.Context(), routedToSharedDone(0, []*kgo.Record{
+			c.buffer.MultiAdd(t.Context(), routedToSharedDone(0, []*kgo.Record{
 				{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
 			}, func(err error) { doneCh <- err }))
 
