@@ -466,6 +466,89 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 	})
 }
 
+// TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce verifies that a produce
+// to a completely unresponsive agent still returns once the write timeout
+// expires — whether or not the caller's context is cancelable, and without it
+// being canceled.
+func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
+	const (
+		topic = "test-topic"
+		// The write timeout is set to its configured floor (the per-attempt
+		// timeout), so the stuck attempt's deadline is exactly the write-timeout
+		// ceiling. Hedging is disabled so nothing else resolves the produce.
+		produceRequestTimeout  = 2 * time.Second
+		produceTimeoutOverhead = time.Second
+		writeTimeout           = produceRequestTimeout + produceTimeoutOverhead
+	)
+	opts := []Opt{
+		WithWriteTimeout(writeTimeout),
+		WithProduceRequestTimeout(produceRequestTimeout),
+		WithProduceRequestTimeoutOverhead(produceTimeoutOverhead),
+		WithHedgerMinHedgeDelay(time.Hour),
+	}
+
+	// wedgeAgent makes every Produce request to the cluster block until the test
+	// ends, simulating a completely stuck agent.
+	wedgeAgent := func(t *testing.T, cluster *kfake.Cluster) {
+		hold := make(chan struct{})
+		t.Cleanup(sync.OnceFunc(func() { close(hold) }))
+		cluster.ControlKey(int16(kmsg.Produce), func(kmsg.Request) (kmsg.Response, error, bool) {
+			<-hold
+			return nil, nil, false
+		})
+	}
+
+	rec := func() *kgo.Record {
+		return &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+	}
+
+	ctxCases := []struct {
+		name string
+		make func(t *testing.T) context.Context
+	}{
+		{"cancelable ctx", func(t *testing.T) context.Context { return t.Context() }},
+		{"non-cancelable ctx", func(t *testing.T) context.Context { return context.WithoutCancel(t.Context()) }},
+	}
+
+	for _, cc := range ctxCases {
+		t.Run(cc.name, func(t *testing.T) {
+			t.Run("ProduceSync", func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1, opts...)
+					wedgeAgent(t, cluster)
+
+					start := time.Now()
+					res := c.ProduceSync(cc.make(t), []*kgo.Record{rec()})
+					elapsed := time.Since(start)
+
+					require.Len(t, res, 1)
+					require.ErrorIs(t, res[0].Err, kgo.ErrRecordTimeout)
+					// Returned at the write-timeout ceiling, not hanging.
+					assert.GreaterOrEqual(t, elapsed, writeTimeout)
+					assert.Less(t, elapsed, writeTimeout+time.Second)
+				})
+			})
+
+			t.Run("Produce", func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1, opts...)
+					wedgeAgent(t, cluster)
+
+					done := make(chan error, 1)
+					c.Produce(cc.make(t), rec(), func(_ *kgo.Record, err error) { done <- err })
+
+					select {
+					case err := <-done:
+						require.ErrorIs(t, err, kgo.ErrRecordTimeout)
+					case <-time.After(5 * time.Second):
+						t.Fatal("Produce promise did not fire within the write-timeout bound")
+					}
+				})
+			})
+		})
+	}
+}
+
 func TestWarpstreamClient_BufferedProduceBytes(t *testing.T) {
 	const topic = "test-topic"
 
@@ -786,37 +869,55 @@ func BenchmarkClient_Produce(b *testing.B) {
 		{name: "warpstream", client: wsc},
 	}
 
+	// ctxCases exercises both produce ctx paths: a non-cancelable ctx
+	// (context.Background) skips the per-record ctx-cancel watch, while a
+	// cancelable ctx — never canceled here, so every produce still completes via
+	// the flush — pays for the AfterFunc watch and its once-gates.
+	ctxCases := []struct {
+		name string
+		make func(b *testing.B) context.Context
+	}{
+		{"noncancelable", func(*testing.B) context.Context { return context.Background() }},
+		{"cancelable", func(b *testing.B) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			b.Cleanup(cancel) // canceled only after wg.Wait, never mid-produce
+			return ctx
+		}},
+	}
+
 	value := make([]byte, valueLen)
 	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			p := tc.client
-			ctx := context.Background()
-			var (
-				wg        sync.WaitGroup
-				partition atomic.Int32
-			)
+		for _, cc := range ctxCases {
+			b.Run(tc.name+"/"+cc.name, func(b *testing.B) {
+				p := tc.client
+				ctx := cc.make(b)
+				var (
+					wg        sync.WaitGroup
+					partition atomic.Int32
+				)
 
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					wg.Add(recordsPerOp)
-					for i := 0; i < recordsPerOp; i++ {
-						pid := partition.Add(1) % numPartitions
-						rec := &kgo.Record{
-							Topic:     topic,
-							Partition: pid,
-							Value:     value,
+				b.ReportAllocs()
+				b.ResetTimer()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						wg.Add(recordsPerOp)
+						for i := 0; i < recordsPerOp; i++ {
+							pid := partition.Add(1) % numPartitions
+							rec := &kgo.Record{
+								Topic:     topic,
+								Partition: pid,
+								Value:     value,
+							}
+							p.Produce(ctx, rec, func(*kgo.Record, error) { wg.Done() })
 						}
-						p.Produce(ctx, rec, func(*kgo.Record, error) { wg.Done() })
 					}
-				}
-			})
-			wg.Wait()
-			b.StopTimer()
+				})
+				wg.Wait()
+				b.StopTimer()
 
-			b.ReportMetric(float64(b.N*recordsPerOp)/b.Elapsed().Seconds(), "records/sec")
-		})
+				b.ReportMetric(float64(b.N*recordsPerOp)/b.Elapsed().Seconds(), "records/sec")
+			})
+		}
 	}
 }
 
