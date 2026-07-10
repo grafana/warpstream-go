@@ -1,12 +1,14 @@
 package wgo
 
 import (
-	"context"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -19,59 +21,42 @@ func TestAgentPool_Refresh(t *testing.T) {
 		numPartitions = int32(3)
 	)
 
-	_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName)
-	client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr))
-	require.NoError(t, err)
-	t.Cleanup(client.Close)
+	synctest.Test(t, func(t *testing.T) {
+		var vnet kfake.VirtualNetwork
+		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName, testkafka.WithVirtualNetwork(&vnet))
+		client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr), kgo.Dialer(vnet.DialContext))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
 
-	pool := NewAgentPool(client)
+		pool := NewAgentPool(client)
 
-	t.Run("populates strategy from metadata", func(t *testing.T) {
-		removed, err := pool.Refresh(context.Background())
+		removed, err := pool.Refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
 		assert.NotNil(t, pool.Strategy())
-	})
 
-	t.Run("topic ID is populated after refresh", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
-		require.NoError(t, err)
 		id, ok := pool.TopicID(topicName)
 		require.True(t, ok)
 		assert.NotEqual(t, [16]byte{}, id)
-	})
 
-	t.Run("Strategy.Candidates returns a non-zero leader for each partition", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
-		require.NoError(t, err)
 		strategy := pool.Strategy()
 		for part := int32(0); part < numPartitions; part++ {
 			cands := strategy.Candidates(topicName, part, 1)
 			require.NotEmpty(t, cands)
 			assert.GreaterOrEqual(t, cands[0].NodeID, int32(0))
 		}
-	})
 
-	t.Run("repeated refresh with unchanged topology returns no removed agents", func(t *testing.T) {
-		removed, err := pool.Refresh(context.Background())
+		removed, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
-	})
 
-	t.Run("each Refresh returns a new strategy instance", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
-		require.NoError(t, err)
 		s1 := pool.Strategy()
-		_, err = pool.Refresh(context.Background())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		s2 := pool.Strategy()
 		assert.NotSame(t, s1, s2)
-	})
 
-	t.Run("TopicID returns ok=false for an unknown topic", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
-		require.NoError(t, err)
-		_, ok := pool.TopicID("does-not-exist")
+		_, ok = pool.TopicID("does-not-exist")
 		assert.False(t, ok)
 	})
 }
@@ -98,34 +83,39 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		numPartitions = int32(2)
 	)
 
-	_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicA)
+	// Two stateful steps (create+discover, then delete+evict) share one client,
+	// so they run sequentially in a single bubble.
+	synctest.Test(t, func(t *testing.T) {
+		var vnet kfake.VirtualNetwork
+		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicA, testkafka.WithVirtualNetwork(&vnet))
 
-	// Set kgo's metadata cache to its minimum allowed value (10ms; kgo rejects
-	// MetadataMinAge=0) so the test sees CreateTopics / DeleteTopics changes on
-	// the next Refresh without waiting for the default 5-second cache window.
-	// In production the longer default is desirable; the test just needs
-	// deterministic visibility.
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(clusterAddr),
-		kgo.MetadataMinAge(10*time.Millisecond),
-	)
-	require.NoError(t, err)
-	t.Cleanup(client.Close)
+		// Set kgo's metadata cache to its minimum allowed value (10ms; kgo rejects
+		// MetadataMinAge=0) so the test sees CreateTopics / DeleteTopics changes on
+		// the next Refresh without waiting for the default 5-second cache window.
+		// In production the longer default is desirable; the test just needs
+		// deterministic visibility.
+		client, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.Dialer(vnet.DialContext),
+			kgo.MetadataMinAge(10*time.Millisecond),
+		)
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
 
-	// Create the second topic via the standard CreateTopics protocol.
-	createReq := kmsg.NewPtrCreateTopicsRequest()
-	createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
-		Topic:             topicB,
-		NumPartitions:     numPartitions,
-		ReplicationFactor: 1,
-	}}
-	_, err = client.Request(context.Background(), createReq)
-	require.NoError(t, err)
+		// Create the second topic via the standard CreateTopics protocol.
+		createReq := kmsg.NewPtrCreateTopicsRequest()
+		createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
+			Topic:             topicB,
+			NumPartitions:     numPartitions,
+			ReplicationFactor: 1,
+		}}
+		_, err = client.Request(t.Context(), createReq)
+		require.NoError(t, err)
 
-	pool := NewAgentPool(client)
+		pool := NewAgentPool(client)
 
-	t.Run("Refresh discovers all topics in the cluster", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
+		// Refresh discovers all topics in the cluster.
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 
 		idA, okA := pool.TopicID(topicA)
@@ -145,29 +135,27 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 			require.NotEmpty(t, candsB)
 			assert.GreaterOrEqual(t, candsB[0].NodeID, int32(0))
 		}
-	})
 
-	t.Run("topics deleted from the cluster are evicted from the snapshot", func(t *testing.T) {
-		_, err := pool.Refresh(context.Background())
-		require.NoError(t, err)
+		// Topics deleted from the cluster are evicted from the snapshot.
 		_, ok := pool.TopicID(topicB)
 		require.True(t, ok)
 
 		deleteReq := kmsg.NewPtrDeleteTopicsRequest()
 		deleteReq.TopicNames = []string{topicB}
 		deleteReq.Topics = []kmsg.DeleteTopicsRequestTopic{{Topic: kmsg.StringPtr(topicB)}}
-		_, err = client.Request(context.Background(), deleteReq)
+		_, err = client.Request(t.Context(), deleteReq)
 		require.NoError(t, err)
 
-		// Wait for kgo's metadata cache (MetadataMinAge=10ms above) to expire so
-		// the next Refresh fetches fresh metadata reflecting the deletion.
+		// Advance past kgo's metadata cache (MetadataMinAge=10ms above) so the next
+		// Refresh fetches fresh metadata reflecting the deletion. Under the fake
+		// clock this sleep is instant and deterministic.
 		time.Sleep(20 * time.Millisecond)
 
-		_, err = pool.Refresh(context.Background())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
-		_, okB := pool.TopicID(topicB)
+		_, okB = pool.TopicID(topicB)
 		assert.False(t, okB)
-		_, okA := pool.TopicID(topicA)
+		_, okA = pool.TopicID(topicA)
 		assert.True(t, okA)
 	})
 }
@@ -306,27 +294,33 @@ func TestAgentPool_StrategyConcurrent(t *testing.T) {
 		numPartitions = int32(4)
 	)
 
-	_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName)
-	client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr))
-	require.NoError(t, err)
-	t.Cleanup(client.Close)
+	synctest.Test(t, func(t *testing.T) {
+		var vnet kfake.VirtualNetwork
+		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName, testkafka.WithVirtualNetwork(&vnet))
+		client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr), kgo.Dialer(vnet.DialContext))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
 
-	pool := NewAgentPool(client)
-	_, err = pool.Refresh(context.Background())
-	require.NoError(t, err)
+		pool := NewAgentPool(client)
+		_, err = pool.Refresh(t.Context())
+		require.NoError(t, err)
 
-	const goroutines = 20
-	done := make(chan struct{})
-	for range goroutines {
-		go func() {
-			defer func() { done <- struct{}{} }()
-			strategy := pool.Strategy()
-			for part := int32(0); part < numPartitions; part++ {
-				_ = strategy.Candidates(topicName, part, 2)
-			}
-		}()
-	}
-	for range goroutines {
-		<-done
-	}
+		// Spin up concurrent readers and let them overlap. The value of this test
+		// is genuinely-concurrent Strategy()/Candidates() reads under -race, so we
+		// do NOT insert a synctest.Wait() between spawning and running them (that
+		// would serialise them); we only join at the end.
+		const goroutines = 20
+		var wg sync.WaitGroup
+		wg.Add(goroutines)
+		for range goroutines {
+			go func() {
+				defer wg.Done()
+				strategy := pool.Strategy()
+				for part := int32(0); part < numPartitions; part++ {
+					_ = strategy.Candidates(topicName, part, 2)
+				}
+			}()
+		}
+		wg.Wait()
+	})
 }

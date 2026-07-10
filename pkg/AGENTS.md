@@ -47,3 +47,10 @@ behaviour that would surprise a reader.
   invariant — and prefer a leading `// comment` for that. Format-style diagnostic
   args that surface values at failure time are fine; the required-substring arg of
   `assert.ErrorContains` is not a message, don't strip it.
+- `kfake` tests run under `testing/synctest`: wrap the body in `synctest.Test`,
+  create the cluster with `testkafka.WithVirtualNetwork(&vnet)`, and give every
+  client `vnet.DialContext` (`WithDialer` / `kgo.Dialer`) — a real socket blocks a
+  goroutine on network I/O and deadlocks the bubble. Never poll with
+  `require.Eventually`; use `synctest.Wait()` to settle goroutines and `time.Sleep`
+  only to advance the fake clock past a timer. No `t.Run` inside a bubble (wrap each
+  subtest in its own `synctest.Test`).
