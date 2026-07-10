@@ -94,6 +94,25 @@ Every produce attempt (primary or hedge wave) feeds latency and error data into 
 
 The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequest` to `kgo.Client.Broker().Request()`. We do not use `kgo.Client.Produce()` because that's where franz-go's leader-pinning lives. By dropping into the raw `Broker.Request` path we keep all of franz-go's connection pooling, TLS/SASL, and wire encoding while taking complete control of which broker each request actually goes to.
 
+### Hooks
+
+The client accepts [franz-go hooks](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Hook)
+via `WithHooks`, so you can attach your own metrics, tracing, or connection
+instrumentation. However, the following hooks are currently **not supported**:
+
+- `HookProduceBatchWritten`
+- `HookProduceRecordPartitioned`
+
+### Tracing
+
+The client is a drop-in for a franz-go producer traced with
+[`kotel`](https://pkg.go.dev/github.com/twmb/franz-go/plugin/kotel): pass your kotel hooks
+(or any hook implementing the produce-record hooks) via `WithHooks`. On each produce your
+tracer starts a producer span and injects the trace-context header into the record, so the
+record carries the trace to downstream consumers; the span ends when the produce is
+acknowledged or fails. Consume-side tracing works through the embedded client with no extra
+wiring. See [`docs/internal/tracing.md`](docs/internal/tracing.md) for the design.
+
 ## FAQ
 
 ### Is this a replacement for franz-go?

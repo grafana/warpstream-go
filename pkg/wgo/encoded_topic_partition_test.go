@@ -177,6 +177,33 @@ func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
 		assert.Equal(t, int64(1_700_000_000_222), got[1].Timestamp.UnixMilli())
 	})
 
+	t.Run("preserves each record's injected trace-context header", func(t *testing.T) {
+		// Produce tracing rides on a record header (e.g. traceparent). The
+		// merge decodes and re-encodes, so this guards that the header a tracer
+		// injects survives to the wire even when a same-partition merge runs.
+		a := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+				Value:     []byte("a"),
+				Headers:   []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-trace-a-01")}},
+				Timestamp: time.UnixMilli(1_700_000_000_000),
+			}}),
+			nodeID: 5,
+		}
+		b := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+				Value:     []byte("b"),
+				Headers:   []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-trace-b-01")}},
+				Timestamp: time.UnixMilli(1_700_000_000_001),
+			}}),
+			nodeID: 5,
+		}
+
+		got := decodeBatch(a.mergeWith([]routedEncodedTopicPartitionRecords{b}).encoded)
+		require.Len(t, got, 2)
+		assert.Equal(t, []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-trace-a-01")}}, got[0].Headers)
+		assert.Equal(t, []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-trace-b-01")}}, got[1].Headers)
+	})
+
 	t.Run("merges every item in the group in one shot", func(t *testing.T) {
 		a := mk("t", 0, 5, AgentStateHealthy, "a")
 		b := mk("t", 0, 5, AgentStateHealthy, "b")
