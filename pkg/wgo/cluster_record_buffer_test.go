@@ -72,28 +72,186 @@ func routedToMany(records []*kgo.Record, routeBy func(string, int32) int32, shar
 	return out
 }
 
+// TestClusterBuffer_Add runs every single-item enqueue case against both Add and
+// MultiAdd (via a one-element slice): each case enqueues one item, so both entry
+// points must behave identically.
 func TestClusterBuffer_Add(t *testing.T) {
-	t.Run("single agent: routes through and flushes via linger", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
-		t.Cleanup(c.Close)
+	adders := []struct {
+		name string
+		add  func(*ClusterBuffer[routedTopicPartitionRecords], context.Context, promised[routedTopicPartitionRecords])
+	}{
+		{
+			"Add",
+			func(c *ClusterBuffer[routedTopicPartitionRecords], ctx context.Context, p promised[routedTopicPartitionRecords]) {
+				c.Add(ctx, p)
+			},
+		}, {
+			"MultiAdd",
+			func(c *ClusterBuffer[routedTopicPartitionRecords], ctx context.Context, p promised[routedTopicPartitionRecords]) {
+				c.MultiAdd(ctx, []promised[routedTopicPartitionRecords]{p})
+			},
+		},
+	}
 
-		done := make(chan error, 1)
-		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
+	for _, adder := range adders {
+		t.Run(adder.name, func(t *testing.T) {
+			t.Run("routes through and flushes via linger", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
+				t.Cleanup(c.Close)
 
-		select {
-		case err := <-done:
-			require.NoError(t, err)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire")
-		}
-		require.Equal(t, 1, flush.callCount())
-		assert.Equal(t, int32(1), flush.snapshot()[0].nodeID)
-		assert.Equal(t, int64(0), c.BufferedBytes())
-		assert.Equal(t, int64(0), c.BufferedRecords())
-	})
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(c, context.Background(), p)
 
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire")
+				}
+				require.Equal(t, 1, flush.callCount())
+				assert.Equal(t, int32(1), flush.snapshot()[0].nodeID)
+				assert.Equal(t, int64(0), c.BufferedBytes())
+				assert.Equal(t, int64(0), c.BufferedRecords())
+			})
+
+			t.Run("add after close fails fast", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
+				c.Close()
+
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(c, context.Background(), p)
+
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, errBufferClosed)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire after add on closed cluster")
+				}
+				assert.Equal(t, int64(0), c.BufferedBytes())
+				assert.Equal(t, int64(0), c.BufferedRecords())
+			})
+
+			t.Run("pre-canceled ctx fails without dispatching a flush", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
+				t.Cleanup(c.Close)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+
+				// The pre-cancel fast path resolves done with ctx.Err() and never
+				// dispatches to the flush (distinct from a mid-flight cancel).
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(c, ctx, p)
+
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire for pre-canceled ctx")
+				}
+				assert.Equal(t, 0, flush.callCount())
+				assert.Equal(t, int64(0), c.BufferedBytes())
+				assert.Equal(t, int64(0), c.BufferedRecords())
+			})
+
+			t.Run("ctx canceled mid-flight: done fires with ctx error but records still flush", func(t *testing.T) {
+				flush := newRecordingFlush()
+				release := make(chan struct{})
+				flush.onFlush = func(int32, []*kgo.Record) error {
+					<-release
+					return nil
+				}
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				reg := prometheus.NewPedanticRegistry()
+				c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, reg)
+				t.Cleanup(c.Close)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				const value = "v"
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, value)})
+				adder.add(c, ctx, p)
+
+				// Wait for the linger to fire and the flush goroutine to enter onFlush.
+				require.Eventually(t, func() bool { return flush.callCount() == 1 },
+					time.Second, 10*time.Millisecond)
+
+				// While the flush is held, the bytes are accounted as in-flight, and
+				// the buffered-producer gauges mirror the counters.
+				assert.Equal(t, int64(len(value)), c.BufferedBytes())
+				assert.Equal(t, int64(1), c.BufferedRecords())
+				assert.Equal(t, float64(len(value)), gaugeValue(t, reg, "buffered_produce_bytes"))
+				assert.Equal(t, float64(1), gaugeValue(t, reg, "buffered_produce_records_total"))
+
+				// Cancel while the flush is still blocked.
+				cancel()
+				select {
+				case err := <-done:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire after ctx cancel")
+				}
+
+				// ctx-cancel detaches the caller, but the records are still being
+				// produced — bufferedBytes / bufferedRecords stay non-zero until the
+				// actual flush completes.
+				assert.Equal(t, int64(len(value)), c.BufferedBytes())
+				assert.Equal(t, int64(1), c.BufferedRecords())
+
+				// Release the flush; the records still get produced even though the
+				// caller already gave up. Bookkeeping drains once the flush reports.
+				close(release)
+				require.Eventually(t, func() bool { return c.BufferedBytes() == 0 },
+					time.Second, 10*time.Millisecond)
+				require.Eventually(t, func() bool { return c.BufferedRecords() == 0 },
+					time.Second, 10*time.Millisecond)
+				assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_bytes"))
+				assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_records_total"))
+			})
+
+			t.Run("ctx canceled after success is a no-op", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
+				t.Cleanup(c.Close)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				var fires atomic.Int32
+				var observedErr atomic.Pointer[error]
+				p := routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) {
+					fires.Add(1)
+					observedErr.Store(&err)
+				})[0]
+				adder.add(c, ctx, p)
+
+				require.Eventually(t, func() bool { return fires.Load() == 1 },
+					time.Second, 10*time.Millisecond, "done did not fire on flush success")
+				// Success drained bufferedBytes; the late ctx-cancel must not touch it.
+				assert.Equal(t, int64(0), c.BufferedBytes())
+
+				// Cancel after the success has already fired done; the watcher should
+				// have been detached, so no second firing occurs.
+				cancel()
+				require.Never(t, func() bool { return fires.Load() > 1 },
+					100*time.Millisecond, 10*time.Millisecond)
+				require.NotNil(t, observedErr.Load())
+				assert.NoError(t, *observedErr.Load())
+				assert.Equal(t, int64(0), c.BufferedBytes())
+				assert.Equal(t, int64(0), c.BufferedRecords())
+			})
+		})
+	}
+}
+
+// TestClusterBuffer_MultiAdd covers behavior specific to the multi-item entry
+// point (multiple partitions / agents in one call); the single-item cases it
+// shares with Add live in TestClusterBuffer_Add.
+func TestClusterBuffer_MultiAdd(t *testing.T) {
 	t.Run("two agents flush independently into separate batches", func(t *testing.T) {
 		strategy := &mockPartitionAssignmentStrategy{
 			candidates: map[partitionKey][]Agent{
@@ -107,7 +265,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
-		c.Add(context.Background(), routedToMany([]*kgo.Record{
+		c.MultiAdd(context.Background(), routedToMany([]*kgo.Record{
 			makeRecord("t", 0, "a"),
 			makeRecord("t", 1, "b"),
 		}, primaryOf(strategy), func(err error) { done <- err }))
@@ -140,7 +298,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
-		c.Add(context.Background(), routedToMany([]*kgo.Record{
+		c.MultiAdd(context.Background(), routedToMany([]*kgo.Record{
 			makeRecord("t", 0, "a"),
 			makeRecord("t", 1, "b"),
 		}, primaryOf(strategy), func(err error) { done <- err }))
@@ -174,7 +332,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 
 		var fires atomic.Int32
 		ch := make(chan struct{}, 1)
-		c.Add(context.Background(), routedToMany([]*kgo.Record{
+		c.MultiAdd(context.Background(), routedToMany([]*kgo.Record{
 			makeRecord("t", 0, "a"),
 			makeRecord("t", 1, "b"),
 		}, primaryOf(strategy), func(error) {
@@ -217,7 +375,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
-		c.Add(context.Background(), routedToMany([]*kgo.Record{
+		c.MultiAdd(context.Background(), routedToMany([]*kgo.Record{
 			makeRecord("t", 0, "a"),
 			makeRecord("t", 1, "b"),
 		}, primaryOf(strategy), func(err error) { done <- err }))
@@ -239,7 +397,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 		t.Cleanup(c.Close)
 
 		done := make(chan error, 1)
-		c.Add(context.Background(), routedToSharedDone(1, nil, func(err error) { done <- err }))
+		c.MultiAdd(context.Background(), routedToSharedDone(1, nil, func(err error) { done <- err }))
 
 		select {
 		case err := <-done:
@@ -250,127 +408,6 @@ func TestClusterBuffer_Add(t *testing.T) {
 		assert.Equal(t, 0, flush.callCount())
 		assert.Equal(t, int64(0), c.BufferedBytes())
 		assert.Equal(t, int64(0), c.BufferedRecords())
-	})
-
-	t.Run("add after close fails fast", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
-		c.Close()
-
-		done := make(chan error, 1)
-		c.Add(context.Background(), routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
-
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, errBufferClosed)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire after Add on closed cluster")
-		}
-		assert.Equal(t, int64(0), c.BufferedBytes())
-		assert.Equal(t, int64(0), c.BufferedRecords())
-	})
-
-	t.Run("context already canceled: done fires synchronously with ctx error", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
-		t.Cleanup(c.Close)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		done := make(chan error, 1)
-		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done <- err }))
-
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, context.Canceled)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire for pre-canceled ctx")
-		}
-		assert.Equal(t, 0, flush.callCount())
-		assert.Equal(t, int64(0), c.BufferedBytes())
-		assert.Equal(t, int64(0), c.BufferedRecords())
-	})
-
-	t.Run("pre-canceled ctx fails without dispatching a flush", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterBuffer[routedTopicPartitionRecords](time.Hour, 1<<20, flush.Func(), m, nil)
-		t.Cleanup(c.Close)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		// The pre-cancel fast path resolves done with ctx.Err() and never
-		// dispatches to the flush (distinct from a mid-flight cancel).
-		rec := makeRecord("t", 0, "v")
-		done := make(chan error, 1)
-		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{rec}, func(err error) { done <- err }))
-
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, context.Canceled)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire for pre-canceled ctx")
-		}
-		assert.Equal(t, 0, flush.callCount())
-	})
-
-	t.Run("context canceled mid-flight: done fires with ctx error but records still flush", func(t *testing.T) {
-		flush := newRecordingFlush()
-		release := make(chan struct{})
-		flush.onFlush = func(int32, []*kgo.Record) error {
-			<-release
-			return nil
-		}
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		reg := prometheus.NewPedanticRegistry()
-		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, reg)
-		t.Cleanup(c.Close)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		const value = "v"
-		done := make(chan error, 1)
-		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, value)}, func(err error) { done <- err }))
-
-		// Wait for the linger to fire and the flush goroutine to enter onFlush.
-		require.Eventually(t, func() bool { return flush.callCount() == 1 },
-			time.Second, 10*time.Millisecond)
-
-		// While the flush is held, the bytes are accounted as in-flight, and the
-		// buffered-producer gauges mirror the counters.
-		assert.Equal(t, int64(len(value)), c.BufferedBytes())
-		assert.Equal(t, int64(1), c.BufferedRecords())
-		assert.Equal(t, float64(len(value)), gaugeValue(t, reg, "buffered_produce_bytes"))
-		assert.Equal(t, float64(1), gaugeValue(t, reg, "buffered_produce_records_total"))
-
-		// Cancel while the flush is still blocked.
-		cancel()
-		select {
-		case err := <-done:
-			require.ErrorIs(t, err, context.Canceled)
-		case <-time.After(time.Second):
-			t.Fatal("done did not fire after ctx cancel")
-		}
-
-		// ctx-cancel detaches the caller, but the records are still being
-		// produced — bufferedBytes / bufferedRecords stay non-zero until the
-		// actual flush completes. This matches franz-go's
-		// BufferedProduceBytes / BufferedProduceRecords semantics.
-		assert.Equal(t, int64(len(value)), c.BufferedBytes())
-		assert.Equal(t, int64(1), c.BufferedRecords())
-
-		// Release the flush; the records still get produced even though the
-		// caller already gave up. Bookkeeping drains once the flush reports.
-		close(release)
-		require.Eventually(t, func() bool { return c.BufferedBytes() == 0 },
-			time.Second, 10*time.Millisecond)
-		require.Eventually(t, func() bool { return c.BufferedRecords() == 0 },
-			time.Second, 10*time.Millisecond)
-		assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_bytes"))
-		assert.Equal(t, float64(0), gaugeValue(t, reg, "buffered_produce_records_total"))
 	})
 
 	t.Run("multi-agent: ctx canceled mid-flight fires done exactly once with ctx error", func(t *testing.T) {
@@ -395,7 +432,7 @@ func TestClusterBuffer_Add(t *testing.T) {
 		var fires atomic.Int32
 		done := make(chan error, 1)
 		const valueA, valueB = "aa", "bb"
-		c.Add(ctx, routedToMany([]*kgo.Record{
+		c.MultiAdd(ctx, routedToMany([]*kgo.Record{
 			makeRecord("t", 0, valueA),
 			makeRecord("t", 1, valueB),
 		}, primaryOf(strategy), func(err error) {
@@ -436,37 +473,6 @@ func TestClusterBuffer_Add(t *testing.T) {
 		require.Eventually(t, func() bool { return c.BufferedRecords() == 0 },
 			time.Second, 10*time.Millisecond)
 	})
-
-	t.Run("context canceled after success is a no-op", func(t *testing.T) {
-		flush := newRecordingFlush()
-		m := newMetrics(prometheus.NewPedanticRegistry())
-		c := NewClusterBuffer[routedTopicPartitionRecords](10*time.Millisecond, 1<<20, flush.Func(), m, nil)
-		t.Cleanup(c.Close)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		var fires atomic.Int32
-		var observedErr atomic.Pointer[error]
-		c.Add(ctx, routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) {
-			fires.Add(1)
-			observedErr.Store(&err)
-		}))
-
-		require.Eventually(t, func() bool { return fires.Load() == 1 },
-			time.Second, 10*time.Millisecond, "done did not fire on flush success")
-		// Success drained bufferedBytes; the late ctx-cancel must not touch it.
-		assert.Equal(t, int64(0), c.BufferedBytes())
-
-		// Cancel after the success has already fired done; the watcher should
-		// have been detached, so no second firing occurs.
-		cancel()
-		require.Never(t, func() bool { return fires.Load() > 1 },
-			100*time.Millisecond, 10*time.Millisecond)
-		require.NotNil(t, observedErr.Load())
-		assert.NoError(t, *observedErr.Load())
-		assert.Equal(t, int64(0), c.BufferedBytes())
-		assert.Equal(t, int64(0), c.BufferedRecords())
-	})
-
 }
 
 func TestClusterBuffer_Close(t *testing.T) {
@@ -492,7 +498,7 @@ func TestClusterBuffer_Close(t *testing.T) {
 
 		done := make(chan error, 1)
 		const valueA, valueB = "a", "b"
-		c.Add(context.Background(), routedToMany([]*kgo.Record{
+		c.MultiAdd(context.Background(), routedToMany([]*kgo.Record{
 			makeRecord("t", 0, valueA),
 			makeRecord("t", 1, valueB),
 		}, primaryOf(strategy), func(err error) { done <- err }))
