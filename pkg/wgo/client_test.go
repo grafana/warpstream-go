@@ -52,21 +52,22 @@ func testWarpstreamOpts(clusterAddr, topic string) []Opt {
 // returned VirtualNetwork's DialContext must be passed to any other client
 // (e.g. a consumer) so it shares the same in-memory transport.
 //
+// Extra opts are appended after the shared defaults, so a test can add options
+// (e.g. WithHooks) or override a default.
+//
 // The background metadata refresh goroutine runs but its ticker
 // (MetadataRefreshInterval) is well above any individual test's virtual runtime,
 // so it never fires; t.Cleanup runs inside the bubble and Close cancels the
 // refresh ctx and joins the goroutine before the bubble ends.
-func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32) (*WarpstreamClient, *kfake.Cluster, string, *kfake.VirtualNetwork) {
+func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32, opts ...Opt) (*WarpstreamClient, *kfake.Cluster, string, *kfake.VirtualNetwork) {
 	t.Helper()
 
 	vnet := &kfake.VirtualNetwork{}
 	cluster, clusterAddr := testkafka.CreateCluster(t, numPartitions, topic, testkafka.WithVirtualNetwork(vnet))
 
-	c, err := NewWarpstreamClient(
-		nil,
-		prometheus.NewPedanticRegistry(),
-		append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...,
-	)
+	allOpts := append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))
+	allOpts = append(allOpts, opts...)
+	c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), allOpts...)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		c.Close()

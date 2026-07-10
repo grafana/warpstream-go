@@ -50,9 +50,3 @@ Metrics with no franz-go counterpart describe behaviour unique to this client:
 hedging, agent demotion, direct-request and attempt accounting, and
 client-boundary record counters. They carry a `warpstream_` prefix so they never
 collide with franz-go/kprom names and are unambiguously backend-specific.
-
-## Caller hooks
-
-Callers can supply their own franz-go hooks; they are attached to the embedded
-client alongside kprom, so a caller can add its own transport-layer metrics or
-tracing.
