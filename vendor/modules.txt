@@ -67,7 +67,7 @@ github.com/prometheus/procfs/internal/util
 github.com/stretchr/testify/assert
 github.com/stretchr/testify/assert/yaml
 github.com/stretchr/testify/require
-# github.com/twmb/franz-go v1.21.5
+# github.com/twmb/franz-go v1.21.5 => github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7
 ## explicit; go 1.25.0
 github.com/twmb/franz-go/pkg/kbin
 github.com/twmb/franz-go/pkg/kerr
@@ -127,3 +127,4 @@ google.golang.org/protobuf/types/known/timestamppb
 # gopkg.in/yaml.v3 v3.0.1
 ## explicit
 gopkg.in/yaml.v3
+# github.com/twmb/franz-go => github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7

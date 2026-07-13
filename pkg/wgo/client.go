@@ -172,16 +172,19 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	// Seed the record's parent context (like franz-go).
 	ensureRecordContext(record, ctx)
 
-	// Fire the buffered hook (which may inject a trace header) before any rejection,
-	// and wrap the promise so the unbuffered hook fires just before the caller sees
-	// the outcome on every path.
+	// Fire the buffered hook (which may inject a trace header) before any rejection.
 	if c.produceHooks.enabled() {
 		c.produceHooks.fireBuffered(record)
-		userPromise := promise
-		promise = func(r *kgo.Record, err error) {
-			c.produceHooks.fireUnbuffered(r, err)
-			userPromise(r, err)
-		}
+	}
+
+	// Wrap the promise once: every path below invokes it, so this stamps the
+	// produce-result fields and fires the unbuffered hook on every completion.
+	// Order matches franz-go: set fields, then unbuffered hook, then user promise.
+	userPromise := promise
+	promise = func(r *kgo.Record, err error) {
+		setProducedRecordFields(r)
+		c.produceHooks.fireUnbuffered(r, err)
+		userPromise(r, err)
 	}
 
 	c.metrics.produceRecordsTotal.Inc()
@@ -241,17 +244,19 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 
 	results := make(kgo.ProduceResults, len(records))
 
-	// Fire the unbuffered hook for each record from this goroutine, in input order,
-	// just before returning. Every return path below fully populates results first
-	// (wg.Wait blocks until the async completions have run), so the terminal error
-	// is final here. Mirrors franz-go's "unbuffered hook, then the record's outcome".
-	if hasProduceHooks {
-		defer func() {
-			for i, r := range records {
+	// Stamp the produce-result fields on every record and fire the unbuffered hook
+	// (when set) from this goroutine, in input order, just before returning. Every
+	// return path below fully populates results first (wg.Wait blocks until the
+	// async completions have run), so the terminal error is final here. Mirrors
+	// franz-go's "set fields, then unbuffered hook, then the record's outcome".
+	defer func() {
+		for i, r := range records {
+			setProducedRecordFields(r)
+			if hasProduceHooks {
 				c.produceHooks.fireUnbuffered(r, results[i].Err)
 			}
-		}()
-	}
+		}
+	}()
 
 	var (
 		okRecords []*kgo.Record
@@ -334,7 +339,16 @@ func (c *WarpstreamClient) flushBatch(ctx context.Context, nodeID int32, partiti
 
 	flushCtx, cancel := context.WithTimeout(ctx, c.cfg.WriteTimeout)
 	defer cancel()
-	return c.hedger.ProduceSync(flushCtx, nodeID, encoded)
+	res := c.hedger.ProduceSync(flushCtx, nodeID, encoded)
+
+	// Set Attrs here because the compression type is known only after encoding and the
+	// result only after the Hedger returns.
+	//
+	// This is race-free even against a still-draining hedge leg: each record is
+	// flushed exactly once, so no second flush touches it concurrently.
+	setProducedRecordAttrs(partitions, encoded, res)
+
+	return res
 }
 
 // BufferedProduceBytes returns the bytes of all records awaiting ack.

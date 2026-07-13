@@ -294,9 +294,12 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			require.Error(t, results[0].Err)
 			assert.ErrorIs(t, results[0].Err, kerr.MessageTooLarge)
 			assert.Same(t, records[0], results[0].Record)
+			// The rejected record is stamped like franz-go stamps a failed record.
+			assertProducedRecordFields(t, results[0].Record)
 
 			assert.NoError(t, results[1].Err)
 			assert.Same(t, records[1], results[1].Record)
+			assertProducedRecordFields(t, results[1].Record)
 
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
@@ -335,8 +338,10 @@ func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
 	const topic = "test-topic"
 
 	// A record with an unset timestamp routed to an unknown topic-partition fails
-	// before dispatch. The record must be left unstamped so a later retry stamps a
-	// fresh produce time instead of reusing the failed attempt's.
+	// before dispatch. The record must be left with an unstamped timestamp so a
+	// later retry stamps a fresh produce time instead of reusing the failed
+	// attempt's. The produce-result fields are still stamped, as franz-go does for
+	// every completion.
 	t.Run("ProduceSync", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
@@ -345,7 +350,8 @@ func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
 			results := c.ProduceSync(t.Context(), []*kgo.Record{rec})
 			require.Len(t, results, 1)
 			require.Error(t, results[0].Err)
-			assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's record")
+			assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's timestamp")
+			assertProducedRecordFields(t, rec)
 		})
 	})
 
@@ -362,7 +368,139 @@ func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
 			})
 			<-done
 			require.Error(t, gotErr)
-			assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's record")
+			assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's timestamp")
+			assertProducedRecordFields(t, rec)
+		})
+	})
+}
+
+// assertProducedRecordFields asserts the produce-result metadata this client
+// stamps to match franz-go's non-idempotent producer contract.
+func assertProducedRecordFields(t *testing.T, r *kgo.Record) {
+	t.Helper()
+	assert.Equal(t, int32(-1), r.LeaderEpoch)
+	assert.Equal(t, int64(-1), r.ProducerID)
+	assert.Equal(t, int16(-1), r.ProducerEpoch)
+}
+
+// TestWarpstreamClient_ProducedRecordFieldsMatchFranzGo produces the same record
+// through this client and a real non-idempotent franz-go client, then asserts
+// the produce-result fields the caller gets back are identical. franz-go with
+// idempotency disabled is the exact mode this client emulates.
+func TestWarpstreamClient_ProducedRecordFieldsMatchFranzGo(t *testing.T) {
+	const topic = "test-topic"
+
+	newFranzClient := func(t *testing.T, clusterAddr string, vnet *kfake.VirtualNetwork) *kgo.Client {
+		fc, err := kgo.NewClient(
+			kgo.SeedBrokers(clusterAddr),
+			kgo.Dialer(vnet.DialContext),
+			kgo.DisableIdempotentWrite(),
+		)
+		require.NoError(t, err)
+		t.Cleanup(fc.Close)
+		return fc
+	}
+
+	assertMatch := func(t *testing.T, franzRec, wgoRec *kgo.Record) {
+		t.Helper()
+		// Sanity-check the franz-go contract we mirror before comparing.
+		assert.Equal(t, int32(-1), franzRec.LeaderEpoch)
+		assert.Equal(t, int64(-1), franzRec.ProducerID)
+		assert.Equal(t, int16(-1), franzRec.ProducerEpoch)
+		assert.Equal(t, franzRec.LeaderEpoch, wgoRec.LeaderEpoch)
+		assert.Equal(t, franzRec.ProducerID, wgoRec.ProducerID)
+		assert.Equal(t, franzRec.ProducerEpoch, wgoRec.ProducerEpoch)
+	}
+
+	t.Run("ProduceSync success", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
+			fc := newFranzClient(t, clusterAddr, vnet)
+
+			franzRec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			require.NoError(t, fc.ProduceSync(t.Context(), franzRec).FirstErr())
+
+			wgoRec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			wres := c.ProduceSync(t.Context(), []*kgo.Record{wgoRec})
+			require.NoError(t, wres[0].Err)
+
+			assertMatch(t, franzRec, wgoRec)
+		})
+	})
+
+	t.Run("Produce success", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
+			fc := newFranzClient(t, clusterAddr, vnet)
+
+			franzRec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			require.NoError(t, fc.ProduceSync(t.Context(), franzRec).FirstErr())
+
+			wgoRec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			done := make(chan error, 1)
+			c.Produce(t.Context(), wgoRec, func(_ *kgo.Record, err error) { done <- err })
+			require.NoError(t, <-done)
+
+			assertMatch(t, franzRec, wgoRec)
+		})
+	})
+
+	t.Run("Attrs on success with a compressible payload", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
+			fc := newFranzClient(t, clusterAddr, vnet)
+
+			// A compressible payload so both clients apply snappy: this client
+			// compresses only when it shrinks the batch, and franz-go's default
+			// codec preference is snappy. Incompressible payloads legitimately
+			// diverge (this client falls back to no compression, franz-go does not),
+			// which is a compression-policy difference, not a record-field one.
+			value := bytes.Repeat([]byte("compress-me-"), 64)
+
+			franzRec := &kgo.Record{Topic: topic, Partition: 0, Value: value, Timestamp: time.Now()}
+			require.NoError(t, fc.ProduceSync(t.Context(), franzRec).FirstErr())
+
+			wgoRec := &kgo.Record{Topic: topic, Partition: 0, Value: value, Timestamp: time.Now()}
+			require.NoError(t, c.ProduceSync(t.Context(), []*kgo.Record{wgoRec})[0].Err)
+
+			require.Equal(t, uint8(2), franzRec.Attrs.CompressionType(), "franz-go must snappy-compress this payload")
+			assert.Equal(t, franzRec.Attrs, wgoRec.Attrs)
+			assert.Equal(t, uint8(2), wgoRec.Attrs.CompressionType())
+			assert.Equal(t, int8(0), wgoRec.Attrs.TimestampType())
+		})
+	})
+}
+
+// TestWarpstreamClient_ProducedRecordFieldsOnFailure verifies the produce-result
+// fields are stamped on a failing post-dispatch completion too, as franz-go does.
+func TestWarpstreamClient_ProducedRecordFieldsOnFailure(t *testing.T) {
+	const topic = "test-topic"
+
+	t.Run("ProduceSync", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			rec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			results := c.ProduceSync(ctx, []*kgo.Record{rec})
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			assertProducedRecordFields(t, rec)
+			// franz-go leaves Attrs unset on a failed produce.
+			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
+		})
+	})
+
+	t.Run("Produce", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			rec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			done := make(chan error, 1)
+			c.Produce(ctx, rec, func(_ *kgo.Record, err error) { done <- err })
+			require.ErrorIs(t, <-done, context.Canceled)
+			assertProducedRecordFields(t, rec)
+			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
 		})
 	})
 }

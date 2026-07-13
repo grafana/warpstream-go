@@ -29,3 +29,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/twmb/franz-go => github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7

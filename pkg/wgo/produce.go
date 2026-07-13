@@ -72,6 +72,49 @@ func ensureRecordContext(record *kgo.Record, ctx context.Context) {
 	}
 }
 
+// setProducedRecordFields sets the produce-result metadata franz-go writes
+// onto a record before its promise fires.
+func setProducedRecordFields(r *kgo.Record) {
+	// The broker does not return a leader epoch on produce, so franz-go always
+	// reports -1.
+	r.LeaderEpoch = -1
+
+	// This client is always a non-idempotent, non-transactional producer, so
+	// there is no producer id/epoch; franz-go reports -1 for both in that mode.
+	r.ProducerID = -1
+	r.ProducerEpoch = -1
+}
+
+// setProducedRecordAttrs sets Record.Attrs on the caller's records for every
+// partition that succeeded, mirroring franz-go, which sets Attrs only on a
+// successful produce.
+//
+// A transport error (nil resp) or a per-partition error leaves Attrs unset.
+func setProducedRecordAttrs(partitions []routedTopicPartitionRecords, encoded []routedEncodedTopicPartitionRecords, res ProduceResult) {
+	if res.resp == nil {
+		return
+	}
+
+	compressionTypeByTP := make(map[topicPartition]uint8, len(encoded))
+	for _, e := range encoded {
+		compressionTypeByTP[topicPartition{topic: e.topic, partition: e.partition}] = e.compressionType
+	}
+
+	for _, p := range partitions {
+		if len(p.records) == 0 {
+			continue
+		}
+		if partitionErrorFromResp(res.resp, p.topic, p.partition) != nil {
+			continue
+		}
+
+		attrs := kgo.NewRecordAttrs(compressionTypeByTP[topicPartition{topic: p.topic, partition: p.partition}], 0, false, false)
+		for _, r := range p.records {
+			r.Attrs = attrs
+		}
+	}
+}
+
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
 // given offsetDelta and tsDelta — the length-prefix varint plus the
 // length-prefixed body. Used to keep the batch counter aligned with the
@@ -259,9 +302,9 @@ func partitionErrorFromResp(resp *kmsg.ProduceResponse, topic string, partition 
 
 // encodeBatch serialises records into a Kafka RecordBatch (magic=2) with Snappy
 // compression. It also returns the uncompressed and compressed record-payload
-// sizes (excluding the batch wrapper); the two are equal when compression does
-// not shrink the payload.
-func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compressedBytes int) {
+// sizes (excluding the batch wrapper; the two are equal when compression does
+// not shrink the payload) and the compression type applied.
+func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compressedBytes int, compressionType uint8) {
 	firstTS := records[0].Timestamp.UnixMilli()
 	maxTS := firstTS
 	for _, r := range records[1:] {
@@ -292,6 +335,7 @@ func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compress
 
 	uncompressedBytes = len(raw)
 	compressedBytes = len(payload)
+	compressionType = uint8(attributes)
 
 	batch := kmsg.RecordBatch{
 		PartitionLeaderEpoch: -1,
@@ -319,7 +363,7 @@ func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compress
 	putBuf(rawPtr, raw)
 	putBuf(compPtr, comp)
 
-	return buf, uncompressedBytes, compressedBytes
+	return buf, uncompressedBytes, compressedBytes, compressionType
 }
 
 // decodeBatch parses a serialised RecordBatch back into records, inverting
