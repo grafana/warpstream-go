@@ -113,8 +113,8 @@ wiring. See [`docs/internal/tracing.md`](docs/internal/tracing.md) for the desig
 
 ## Known differences from franz-go
 
-`wgo` is a drop-in for a franz-go producer on the produce path, but a few
-behaviours differ on purpose. These are accepted, not bugs:
+`wgo` aims to be a drop-in for a franz-go producer on the produce path, but currently a few
+known behaviours differ:
 
 | Area | Difference |
 | --- | --- |
