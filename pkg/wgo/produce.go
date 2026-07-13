@@ -72,8 +72,9 @@ func ensureRecordContext(record *kgo.Record, ctx context.Context) {
 	}
 }
 
-// setProducedRecordFields sets the produce-result metadata franz-go writes
-// onto a record before its promise fires.
+// setProducedRecordFields sets the LeaderEpoch and producer id/epoch fields
+// franz-go stamps onto a record before its promise fires. Attrs is set on the
+// success path; Offset is not populated (see README "Known differences").
 func setProducedRecordFields(r *kgo.Record) {
 	// The broker does not return a leader epoch on produce, so franz-go always
 	// reports -1.

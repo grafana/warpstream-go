@@ -30,4 +30,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
+// TODO(temporary): drop this replace and bump to a released franz-go once the
+// NewRecordAttrs constructor lands upstream (github.com/twmb/franz-go#1369).
 replace github.com/twmb/franz-go => github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7

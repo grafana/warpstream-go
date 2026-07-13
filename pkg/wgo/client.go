@@ -198,8 +198,9 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	routed, err := c.routeRecord(record, func(res ProduceResult) {
 		resErr := recordErrFromResult(res, record.Topic, record.Partition)
 		if resErr == nil {
-			// On success set Attrs from this same completion so the write stays
-			// synchronized with the promise (never on the flush goroutine).
+			// Set Attrs from the completion, which fires exactly once and before
+			// the promise. Doing it in flushBatch would race a ctx-cancel that
+			// fires the promise on another goroutine.
 			record.Attrs = producedRecordAttrs(res, record.Topic, record.Partition)
 		}
 		// Post-dispatch failure counts on any non-nil error; the pre-dispatch
@@ -484,8 +485,9 @@ func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResu
 
 // perPartitionDone adapts a batch-wide ProduceResult callback to a
 // per-partition outcome for one (topic, partition). On success it sets Attrs on
-// records, from this same completion so the write stays synchronized with the
-// promise (never on the flush goroutine).
+// records from this completion, which fires exactly once and before the promise;
+// doing it in flushBatch would race a ctx-cancel that fires the promise on
+// another goroutine.
 func perPartitionDone(topic string, partition int32, records []*kgo.Record, user func(error)) func(ProduceResult) {
 	return func(res ProduceResult) {
 		err := recordErrFromResult(res, topic, partition)
@@ -511,7 +513,12 @@ func recordErrFromResult(res ProduceResult, topic string, partition int32) error
 	// a partition that actually succeeded must report success even
 	// when res.err says some peer partition failed.
 	if res.resp == nil {
-		return res.err
+		if res.err != nil {
+			return res.err
+		}
+		// No response and no error is not a success; treat it as the empty
+		// result the rest of the package rejects (see ProduceResult.error).
+		return errEmptyProduceResult
 	}
 	err := partitionErrorFromResp(res.resp, topic, partition)
 	// A retriable kerr surfaced here means the Hedger exhausted its

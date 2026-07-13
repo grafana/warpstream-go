@@ -476,6 +476,22 @@ func TestWarpstreamClient_ProducedRecordFieldsMatchFranzGo(t *testing.T) {
 func TestWarpstreamClient_ProducedRecordFieldsOnFailure(t *testing.T) {
 	const topic = "test-topic"
 
+	// injectPartitionError makes the fake cluster return errorCode for topic/0 on
+	// every produce, so the record fails after dispatch — i.e. after encoding, so
+	// its result carries a populated compressionTypes and a broken success guard
+	// would stamp Attrs.
+	injectPartitionError := func(cluster *kfake.Cluster, errorCode int16) {
+		cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+			pr := req.(*kmsg.ProduceRequest)
+			resp := pr.ResponseKind().(*kmsg.ProduceResponse)
+			resp.Topics = []kmsg.ProduceResponseTopic{{
+				Topic:      topic,
+				Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: 0, ErrorCode: errorCode}},
+			}}
+			return resp, nil, true
+		})
+	}
+
 	t.Run("ProduceSync", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
@@ -499,6 +515,36 @@ func TestWarpstreamClient_ProducedRecordFieldsOnFailure(t *testing.T) {
 			done := make(chan error, 1)
 			c.Produce(ctx, rec, func(_ *kgo.Record, err error) { done <- err })
 			require.ErrorIs(t, <-done, context.Canceled)
+			assertProducedRecordFields(t, rec)
+			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
+		})
+	})
+
+	// A post-dispatch broker error must not stamp Attrs. The compressible payload
+	// makes its batch compress (so compressionTypes is populated) — a broken
+	// success guard would then stamp a non-zero Snappy Attrs, which these catch.
+	t.Run("ProduceSync broker error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+			injectPartitionError(cluster, kerr.MessageTooLarge.Code)
+			rec := &kgo.Record{Topic: topic, Partition: 0, Value: bytes.Repeat([]byte("compress-me-"), 64), Timestamp: time.Now()}
+			results := c.ProduceSync(t.Context(), []*kgo.Record{rec})
+			// The exact surfaced error is topology-dependent (the hedger may
+			// report its retry-exhausted envelope); only that it failed matters.
+			require.Error(t, results[0].Err)
+			assertProducedRecordFields(t, rec)
+			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
+		})
+	})
+
+	t.Run("Produce broker error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+			injectPartitionError(cluster, kerr.MessageTooLarge.Code)
+			rec := &kgo.Record{Topic: topic, Partition: 0, Value: bytes.Repeat([]byte("compress-me-"), 64), Timestamp: time.Now()}
+			done := make(chan error, 1)
+			c.Produce(t.Context(), rec, func(_ *kgo.Record, err error) { done <- err })
+			require.Error(t, <-done)
 			assertProducedRecordFields(t, rec)
 			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
 		})
