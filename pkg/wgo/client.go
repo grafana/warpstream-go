@@ -490,6 +490,10 @@ func perPartitionDone(topic string, partition int32, records []*kgo.Record, user
 	return func(res ProduceResult) {
 		err := recordErrFromResult(res, topic, partition)
 		if err == nil {
+			// One compression type for the whole group. A group split across
+			// batches (a single call's records for one partition exceeding
+			// BatchMaxBytes) may span batches that compressed differently; that
+			// mismatch is an accepted difference (see README "Known differences").
 			attrs := producedRecordAttrs(res, topic, partition)
 			for _, r := range records {
 				r.Attrs = attrs
