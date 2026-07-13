@@ -503,6 +503,46 @@ func TestWarpstreamClient_ProducedRecordFieldsOnFailure(t *testing.T) {
 			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs)
 		})
 	})
+
+	// A ctx canceled while the produce is in flight fires the promise with the
+	// cancel error, then the produce succeeds in the background. Attrs must stay
+	// unset (the completion reported cancel, not success), and the background
+	// success must not write the record — otherwise it would race the promise's
+	// reader.
+	t.Run("canceled mid-flight then succeeds leaves Attrs unset", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			// Hold the produce in flight until released, so the cancel below lands
+			// while it is still dispatched. The hook runs after the broker replied
+			// success, so releasing it lets the produce complete successfully.
+			release := make(chan struct{})
+			c.SetTestProduceResponseHook(func(context.Context, int32, *kmsg.ProduceResponse, error) {
+				<-release
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			// Compressible so a stamped Attrs would be Snappy (non-zero) and thus
+			// distinguishable from the unset zero value.
+			rec := &kgo.Record{Topic: topic, Partition: 0, Value: bytes.Repeat([]byte("compress-me-"), 64), Timestamp: time.Now()}
+			errCh := make(chan error, 1)
+			c.Produce(ctx, rec, func(_ *kgo.Record, err error) { errCh <- err })
+
+			// Let the batch flush and reach the broker; the produce then blocks in the hook.
+			synctest.Wait()
+
+			// Cancel mid-flight: the promise fires now, before the produce completes.
+			cancel()
+			synctest.Wait()
+			require.ErrorIs(t, <-errCh, context.Canceled)
+
+			// Let the in-flight produce complete successfully in the background.
+			close(release)
+			synctest.Wait()
+
+			assert.Equal(t, kgo.RecordAttrs{}, rec.Attrs, "a canceled produce must not stamp Attrs even if it then succeeds")
+		})
+	})
 }
 
 func TestWarpstreamClient_Produce(t *testing.T) {

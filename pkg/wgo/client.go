@@ -196,9 +196,14 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	}
 
 	routed, err := c.routeRecord(record, func(res ProduceResult) {
+		resErr := recordErrFromResult(res, record.Topic, record.Partition)
+		if resErr == nil {
+			// On success set Attrs from this same completion so the write stays
+			// synchronized with the promise (never on the flush goroutine).
+			record.Attrs = producedRecordAttrs(res, record.Topic, record.Partition)
+		}
 		// Post-dispatch failure counts on any non-nil error; the pre-dispatch
 		// rejections are counted by produceRecordsRejectedTotal.
-		resErr := recordErrFromResult(res, record.Topic, record.Partition)
 		if resErr != nil {
 			c.metrics.produceRecordsFailedTotal.Inc()
 		}
@@ -283,7 +288,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	}
 
 	routed, err := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
-		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, func(err error) {
+		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, groupRecords, func(err error) {
 			if err != nil {
 				// Post-dispatch failure, resolved uniformly for the whole
 				// partition group; pre-dispatch rejections never reach here.
@@ -341,12 +346,19 @@ func (c *WarpstreamClient) flushBatch(ctx context.Context, nodeID int32, partiti
 	defer cancel()
 	res := c.hedger.ProduceSync(flushCtx, nodeID, encoded)
 
-	// Set Attrs here because the compression type is known only after encoding and the
-	// result only after the Hedger returns.
+	// Attach each partition's compression type so the completion path can set
+	// Record.Attrs.
 	//
-	// This is race-free even against a still-draining hedge leg: each record is
-	// flushed exactly once, so no second flush touches it concurrently.
-	setProducedRecordAttrs(partitions, encoded, res)
+	// Attrs are set there, not here, so the write stays synchronized with the
+	// promise: a ctx-cancel fires the promise from another goroutine while this
+	// flush goroutine is still running, so writing the record here would race
+	// the caller.
+	if len(encoded) > 0 {
+		res.compressionTypes = make(map[topicPartition]uint8, len(encoded))
+		for _, e := range encoded {
+			res.compressionTypes[topicPartition{topic: e.topic, partition: e.partition}] = e.compressionType
+		}
+	}
 
 	return res
 }
@@ -471,10 +483,19 @@ func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResu
 }
 
 // perPartitionDone adapts a batch-wide ProduceResult callback to a
-// per-partition outcome for one (topic, partition).
-func perPartitionDone(topic string, partition int32, user func(error)) func(ProduceResult) {
+// per-partition outcome for one (topic, partition). On success it sets Attrs on
+// records, from this same completion so the write stays synchronized with the
+// promise (never on the flush goroutine).
+func perPartitionDone(topic string, partition int32, records []*kgo.Record, user func(error)) func(ProduceResult) {
 	return func(res ProduceResult) {
-		user(recordErrFromResult(res, topic, partition))
+		err := recordErrFromResult(res, topic, partition)
+		if err == nil {
+			attrs := producedRecordAttrs(res, topic, partition)
+			for _, r := range records {
+				r.Attrs = attrs
+			}
+		}
+		user(err)
 	}
 }
 

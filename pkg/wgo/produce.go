@@ -85,34 +85,12 @@ func setProducedRecordFields(r *kgo.Record) {
 	r.ProducerEpoch = -1
 }
 
-// setProducedRecordAttrs sets Record.Attrs on the caller's records for every
-// partition that succeeded, mirroring franz-go, which sets Attrs only on a
-// successful produce.
-//
-// A transport error (nil resp) or a per-partition error leaves Attrs unset.
-func setProducedRecordAttrs(partitions []routedTopicPartitionRecords, encoded []routedEncodedTopicPartitionRecords, res ProduceResult) {
-	if res.resp == nil {
-		return
-	}
-
-	compressionTypeByTP := make(map[topicPartition]uint8, len(encoded))
-	for _, e := range encoded {
-		compressionTypeByTP[topicPartition{topic: e.topic, partition: e.partition}] = e.compressionType
-	}
-
-	for _, p := range partitions {
-		if len(p.records) == 0 {
-			continue
-		}
-		if partitionErrorFromResp(res.resp, p.topic, p.partition) != nil {
-			continue
-		}
-
-		attrs := kgo.NewRecordAttrs(compressionTypeByTP[topicPartition{topic: p.topic, partition: p.partition}], 0, false, false)
-		for _, r := range p.records {
-			r.Attrs = attrs
-		}
-	}
+// producedRecordAttrs returns the Attrs to set on a record of a successfully
+// produced (topic, partition).
+func producedRecordAttrs(res ProduceResult, topic string, partition int32) kgo.RecordAttrs {
+	// The timestamp type is always CreateTime here: this client never sets the
+	// LogAppendTime bit when encoding, so the type is 0 by construction.
+	return kgo.NewRecordAttrs(res.compressionTypes[topicPartition{topic: topic, partition: partition}], 0, false, false)
 }
 
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
