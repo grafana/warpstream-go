@@ -116,6 +116,33 @@ func TestClusterBuffer_Add(t *testing.T) {
 				assert.Equal(t, int64(0), c.BufferedRecords())
 			})
 
+			t.Run("non-cancelable ctx: cancelling the parent does not detach", func(t *testing.T) {
+				flush := newRecordingFlush()
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				c := NewClusterBuffer[routedTopicPartitionRecords](20*time.Millisecond, 1<<20, flush.Func(), m, nil)
+				t.Cleanup(c.Close)
+
+				// A non-cancelable ctx (Done() == nil) whose cancelable parent is then
+				// canceled: the buffer must not detach the caller — done resolves with
+				// the flush outcome, never ctx.Err().
+				parent, cancel := context.WithCancel(context.Background())
+				ctx := context.WithoutCancel(parent)
+
+				p, done := singleRouted(1, []*kgo.Record{makeRecord("t", 0, "v")})
+				adder.add(c, ctx, p)
+				cancel()
+
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("done did not fire")
+				}
+				require.Equal(t, 1, flush.callCount())
+				assert.Equal(t, int64(0), c.BufferedBytes())
+				assert.Equal(t, int64(0), c.BufferedRecords())
+			})
+
 			t.Run("add after close fails fast", func(t *testing.T) {
 				flush := newRecordingFlush()
 				m := newMetrics(prometheus.NewPedanticRegistry())
