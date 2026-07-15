@@ -120,7 +120,7 @@ known behaviours differ:
 | --- | --- |
 | Produce hooks | `HookProduceBatchWritten` and `HookProduceRecordPartitioned` are never invoked. |
 | `Record.Offset` | Not populated on the returned record (left `0`); franz-go stamps the assigned offset on a successful produce. |
-| `Record.Attrs` on split batches | When a single `ProduceSync` call carries more than `BatchMaxBytes` of records for one partition, they are split across batches that can compress differently. Every record of that call is stamped with a single batch's compression type, so `Record.Attrs.CompressionType()` can differ from the batch a given record actually landed in. |
+| `Record.Attrs` compression type | `Record.Attrs.CompressionType()` reflects the compression chosen when the record was first encoded, which can differ from the batch it was actually written in: batches are split when a single `ProduceSync` call exceeds `BatchMaxBytes` for one partition, and a hedge attempt can re-merge concurrent same-partition batches and re-encode. The timestamp type is always accurate. |
 
 ## FAQ
 
