@@ -198,14 +198,10 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	routed, err := c.routeRecord(record, func(res ProduceResult) {
 		resErr := recordErrFromResult(res, record.Topic, record.Partition)
 		if resErr == nil {
-			// Set Attrs from the completion, which fires exactly once and before
-			// the promise. Doing it in flushBatch would race a ctx-cancel that
-			// fires the promise on another goroutine.
 			record.Attrs = producedRecordAttrs(res, record.Topic, record.Partition)
-		}
-		// Post-dispatch failure counts on any non-nil error; the pre-dispatch
-		// rejections are counted by produceRecordsRejectedTotal.
-		if resErr != nil {
+		} else {
+			// Post-dispatch failure counts on any non-nil error; the pre-dispatch
+			// rejections are counted by produceRecordsRejectedTotal.
 			c.metrics.produceRecordsFailedTotal.Inc()
 		}
 		promise(record, resErr)
@@ -250,11 +246,12 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 
 	results := make(kgo.ProduceResults, len(records))
 
-	// Stamp the produce-result fields on every record and fire the unbuffered hook
-	// (when set) from this goroutine, in input order, just before returning. Every
-	// return path below fully populates results first (wg.Wait blocks until the
-	// async completions have run), so the terminal error is final here. Mirrors
-	// franz-go's "set fields, then unbuffered hook, then the record's outcome".
+	// Set the produce-result fields on every record and fire the unbuffered hook
+	// (when set) from this goroutine, in input order, just before returning.
+	//
+	// Every return path below fully populates results first, so there's no race
+	// accessing the "results" slice, and the error set for each record is a terminal
+	// one.
 	defer func() {
 		for i, r := range records {
 			setProducedRecordFields(r)
@@ -350,10 +347,9 @@ func (c *WarpstreamClient) flushBatch(ctx context.Context, nodeID int32, partiti
 	// Attach each partition's compression type so the completion path can set
 	// Record.Attrs.
 	//
-	// Attrs are set there, not here, so the write stays synchronized with the
-	// promise: a ctx-cancel fires the promise from another goroutine while this
-	// flush goroutine is still running, so writing the record here would race
-	// the caller.
+	// Record.Attrs are NOT here to avoid a race condition: a ctx-cancel fires
+	// the Produce promise from another goroutine while this flush goroutine could
+	// still run, so writing the record here would race.
 	if len(encoded) > 0 {
 		res.compressionTypes = make(map[topicPartition]uint8, len(encoded))
 		for _, e := range encoded {
@@ -485,17 +481,16 @@ func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResu
 
 // perPartitionDone adapts a batch-wide ProduceResult callback to a
 // per-partition outcome for one (topic, partition). On success it sets Attrs on
-// records from this completion, which fires exactly once and before the promise;
-// doing it in flushBatch would race a ctx-cancel that fires the promise on
-// another goroutine.
+// records.
 func perPartitionDone(topic string, partition int32, records []*kgo.Record, user func(error)) func(ProduceResult) {
 	return func(res ProduceResult) {
 		err := recordErrFromResult(res, topic, partition)
 		if err == nil {
-			// One compression type for the whole group. A group split across
+			// We set one compression type for the whole group. A group split across
 			// batches (a single call's records for one partition exceeding
 			// BatchMaxBytes) may span batches that compressed differently; that
-			// mismatch is an accepted difference (see README "Known differences").
+			// mismatch is an accepted difference compared to franz-go (see README
+			// "Known differences").
 			attrs := producedRecordAttrs(res, topic, partition)
 			for _, r := range records {
 				r.Attrs = attrs
