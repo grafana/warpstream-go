@@ -98,10 +98,8 @@ The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequ
 
 The client accepts [franz-go hooks](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Hook)
 via `WithHooks`, so you can attach your own metrics, tracing, or connection
-instrumentation. However, the following hooks are currently **not supported**:
-
-- `HookProduceBatchWritten`
-- `HookProduceRecordPartitioned`
+instrumentation. Some produce hooks are intentionally not invoked — see
+[Known differences from franz-go](#known-differences-from-franz-go).
 
 ### Tracing
 
@@ -112,6 +110,17 @@ tracer starts a producer span and injects the trace-context header into the reco
 record carries the trace to downstream consumers; the span ends when the produce is
 acknowledged or fails. Consume-side tracing works through the embedded client with no extra
 wiring. See [`docs/internal/tracing.md`](docs/internal/tracing.md) for the design.
+
+## Known differences from franz-go
+
+`wgo` aims to be a drop-in for a franz-go producer on the produce path, but currently a few
+known behaviours differ:
+
+| Area | Difference |
+| --- | --- |
+| Produce hooks | `HookProduceBatchWritten` and `HookProduceRecordPartitioned` are never invoked. |
+| `Record.Offset` | Not populated on the returned record (left `0`); franz-go stamps the assigned offset on a successful produce. |
+| `Record.Attrs` compression type | `Record.Attrs.CompressionType()` reflects the compression chosen when the record was first encoded, which can differ from the batch it was actually written in: batches are split when a single `ProduceSync` call exceeds `BatchMaxBytes` for one partition, and a hedge attempt can re-merge concurrent same-partition batches and re-encode. The timestamp type is always accurate. |
 
 ## FAQ
 
