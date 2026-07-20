@@ -4,7 +4,7 @@ go 1.25.10
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/klauspost/compress v1.18.6
+	github.com/klauspost/compress v1.19.0
 	github.com/prometheus/client_golang v1.23.3-0.20260305100053-48a6770e980b
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
