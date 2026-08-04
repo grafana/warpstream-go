@@ -71,9 +71,9 @@ func (p routedEncodedTopicPartitionRecords) uncompressedWireBytes() int64 {
 	return recordBatchHeaderBytes + p.encodedStats.uncompressedBytes
 }
 
-// splitByMaxBytes returns the item unchanged: an encoded batch is already sized
-// to fit batchMaxBytes.
-func (p routedEncodedTopicPartitionRecords) splitByMaxBytes(int32) []routedEncodedTopicPartitionRecords {
+// splitKnownOversizedByMaxBytes returns the item unchanged: encoded batches are
+// sized before routing, so splitting remains a no-op for this representation.
+func (p routedEncodedTopicPartitionRecords) splitKnownOversizedByMaxBytes(int32) []routedEncodedTopicPartitionRecords {
 	return []routedEncodedTopicPartitionRecords{p}
 }
 

@@ -375,6 +375,45 @@ func TestAgentBuffer_Add(t *testing.T) {
 	}
 }
 
+type multiAddTestBatch struct {
+	id        string
+	wireBytes int64
+	chunks    []multiAddTestBatch
+}
+
+var _ routedBatch[multiAddTestBatch] = multiAddTestBatch{}
+
+func (b multiAddTestBatch) getTopicPartition() topicPartition {
+	return topicPartition{topic: b.id}
+}
+
+func (multiAddTestBatch) getNodeID() int32 {
+	return 1
+}
+
+func (multiAddTestBatch) recordCount() int {
+	return 1
+}
+
+func (multiAddTestBatch) payloadBytes() int64 {
+	return 0
+}
+
+func (b multiAddTestBatch) uncompressedWireBytes() int64 {
+	return b.wireBytes
+}
+
+func (b multiAddTestBatch) splitKnownOversizedByMaxBytes(int32) []multiAddTestBatch {
+	if len(b.chunks) > 0 {
+		return b.chunks
+	}
+	return []multiAddTestBatch{b}
+}
+
+func (b multiAddTestBatch) mergeWith([]multiAddTestBatch) multiAddTestBatch {
+	return b
+}
+
 // TestAgentBuffer_MultiAdd covers behavior specific to the multi-item entry
 // point; the single-item cases it shares with Add live in TestAgentBuffer_Add.
 func TestAgentBuffer_MultiAdd(t *testing.T) {
@@ -395,6 +434,53 @@ func TestAgentBuffer_MultiAdd(t *testing.T) {
 		}
 		assert.Equal(t, 0, flush.callCount())
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.lingerFlushesTotal))
+	})
+
+	t.Run("fitting oversized fitting preserves order and completion", func(t *testing.T) {
+		timer := time.NewTimer(time.Hour)
+		defer timer.Stop()
+
+		var completed []string
+		done := func(id string) func(ProduceResult) {
+			return func(ProduceResult) {
+				completed = append(completed, id)
+			}
+		}
+		a := &AgentBuffer[multiAddTestBatch]{
+			batchMaxBytes:         10,
+			nextProduceFlushTimer: timer,
+		}
+		a.MultiAdd([]promised[multiAddTestBatch]{
+			{item: multiAddTestBatch{id: "prefix", wireBytes: 1}, done: done("prefix")},
+			{
+				item: multiAddTestBatch{
+					id:        "oversized",
+					wireBytes: 11,
+					chunks: []multiAddTestBatch{
+						{id: "middle-1", wireBytes: 1},
+						{id: "middle-2", wireBytes: 1},
+					},
+				},
+				done: done("oversized"),
+			},
+			{item: multiAddTestBatch{id: "suffix", wireBytes: 1}, done: done("suffix")},
+		})
+
+		require.Len(t, a.nextProduceItems, 4)
+		assert.Equal(t, []string{"prefix", "middle-1", "middle-2", "suffix"}, []string{
+			a.nextProduceItems[0].item.id,
+			a.nextProduceItems[1].item.id,
+			a.nextProduceItems[2].item.id,
+			a.nextProduceItems[3].item.id,
+		})
+
+		success := ProduceResult{}
+		a.nextProduceItems[0].done(success)
+		a.nextProduceItems[1].done(success)
+		assert.Equal(t, []string{"prefix"}, completed)
+		a.nextProduceItems[2].done(success)
+		a.nextProduceItems[3].done(success)
+		assert.Equal(t, []string{"prefix", "oversized", "suffix"}, completed)
 	})
 }
 

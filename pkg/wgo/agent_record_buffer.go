@@ -117,14 +117,28 @@ func (a *AgentBuffer[W]) MultiAdd(items []promised[W]) {
 		return
 	}
 
-	// Split any item whose own RecordBatch would exceed batchMaxBytes into
-	// chunks that each fit, so no single flushed per-partition batch can be
-	// rejected MessageTooLarge. Chunks are added one at a time below, and
-	// because each is <= batchMaxBytes the overflow check keeps
-	// nextProduceWireBytes (and therefore every per-partition batch) within the cap.
-	chunks := make([]promised[W], 0, len(items))
-	for _, p := range items {
-		chunks = append(chunks, splitPromisedRoutedBatchByBatchMaxBytes(p, a.batchMaxBytes)...)
+	var chunks []promised[W]
+	for i, p := range items {
+		if p.item.uncompressedWireBytes() <= int64(a.batchMaxBytes) {
+			if chunks != nil {
+				chunks = append(chunks, p)
+			}
+			continue
+		}
+
+		// Split any item whose own RecordBatch would exceed batchMaxBytes into
+		// chunks that each fit, so no single flushed per-partition batch can be
+		// rejected MessageTooLarge. Chunks are added one at a time below, and
+		// because each is <= batchMaxBytes the overflow check keeps
+		// nextProduceWireBytes (and therefore every per-partition batch) within the cap.
+		if chunks == nil {
+			chunks = make([]promised[W], 0, len(items))
+			chunks = append(chunks, items[:i]...)
+		}
+		chunks = appendSplitOversizedPromisedRoutedBatch(chunks, p, a.batchMaxBytes)
+	}
+	if chunks == nil {
+		chunks = items
 	}
 
 	a.mu.Lock()

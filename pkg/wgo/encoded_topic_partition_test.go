@@ -94,7 +94,7 @@ func TestRoutedEncodedTopicPartitionRecords_UncompressedWireBytes(t *testing.T) 
 	})
 }
 
-func TestRoutedEncodedTopicPartitionRecords_SplitByMaxBytes(t *testing.T) {
+func TestRoutedEncodedTopicPartitionRecords_SplitKnownOversizedByMaxBytes(t *testing.T) {
 	p := routedEncodedTopicPartitionRecords{
 		encodedTopicPartitionRecords: encodedTopicPartitionRecords{topic: "t", partition: 3, encoded: []byte("batch-bytes"), encodedStats: produceRequestStats{records: 4}},
 		nodeID:                       7,
@@ -104,7 +104,7 @@ func TestRoutedEncodedTopicPartitionRecords_SplitByMaxBytes(t *testing.T) {
 	// Encoded batches are pre-sized upstream, so split is always a no-op that
 	// returns the item unchanged — even when max is smaller than the batch.
 	for _, max := range []int32{1, int32(len(p.encoded)), 1 << 20} {
-		out := p.splitByMaxBytes(max)
+		out := p.splitKnownOversizedByMaxBytes(max)
 		require.Len(t, out, 1)
 		assert.Equal(t, p, out[0])
 	}

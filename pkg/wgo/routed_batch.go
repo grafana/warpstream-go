@@ -11,7 +11,7 @@ type routedBatch[W any] interface {
 	recordCount() int
 	payloadBytes() int64
 	uncompressedWireBytes() int64
-	splitByMaxBytes(max int32) []W
+	splitKnownOversizedByMaxBytes(max int32) []W
 
 	// mergeWith folds the receiver and others (all sharing the receiver's topic,
 	// partition, and nodeID) into one item. Empty others returns the receiver
@@ -45,14 +45,14 @@ func unpromise[W routedBatch[W]](parts []promised[W]) []W {
 	return out
 }
 
-// splitPromisedRoutedBatchByBatchMaxBytes splits in's item so each returned chunk's
-// standalone wire batch fits within batchMaxBytes, returning in unchanged when
-// it already fits. When split, the chunks share a fan-in done that fires in's
-// done once, after all chunks have resolved.
-func splitPromisedRoutedBatchByBatchMaxBytes[W routedBatch[W]](in promised[W], batchMaxBytes int32) []promised[W] {
-	chunks := in.item.splitByMaxBytes(batchMaxBytes)
+// appendSplitOversizedPromisedRoutedBatch appends in split into chunks whose
+// standalone wire batches fit within batchMaxBytes. The caller must have
+// established that in exceeds batchMaxBytes. The chunks share a fan-in done
+// that fires in's done once, after all chunks have resolved.
+func appendSplitOversizedPromisedRoutedBatch[W routedBatch[W]](out []promised[W], in promised[W], batchMaxBytes int32) []promised[W] {
+	chunks := in.item.splitKnownOversizedByMaxBytes(batchMaxBytes)
 	if len(chunks) <= 1 {
-		return []promised[W]{in}
+		return append(out, in)
 	}
 
 	// Capture the done func, not in itself: referencing in.done directly would
@@ -88,9 +88,8 @@ func splitPromisedRoutedBatchByBatchMaxBytes[W routedBatch[W]](in promised[W], b
 		}
 	}
 
-	out := make([]promised[W], len(chunks))
-	for i, c := range chunks {
-		out[i] = promised[W]{item: c, done: done}
+	for _, c := range chunks {
+		out = append(out, promised[W]{item: c, done: done})
 	}
 	return out
 }

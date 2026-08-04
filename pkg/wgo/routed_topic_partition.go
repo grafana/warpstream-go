@@ -59,16 +59,11 @@ func (p routedTopicPartitionRecords) uncompressedWireBytes() int64 {
 	return multiRecordBatchEstimateBytes(p.records)
 }
 
-// splitByMaxBytes splits the records so each returned chunk's standalone
-// RecordBatch fits within batchMaxBytes, returning the group unchanged when it
-// already fits. Each record's own batch is <= batchMaxBytes (the per-record
-// gate enforces this), so every chunk carries at least one record and the split
-// terminates.
-func (p routedTopicPartitionRecords) splitByMaxBytes(batchMaxBytes int32) []routedTopicPartitionRecords {
-	if multiRecordBatchEstimateBytes(p.records) <= int64(batchMaxBytes) {
-		return []routedTopicPartitionRecords{p}
-	}
-
+// splitKnownOversizedByMaxBytes splits a group already known to exceed
+// batchMaxBytes so each returned chunk's standalone RecordBatch fits. Each
+// record's own batch is <= batchMaxBytes, so every chunk carries at least one
+// record and the split terminates.
+func (p routedTopicPartitionRecords) splitKnownOversizedByMaxBytes(batchMaxBytes int32) []routedTopicPartitionRecords {
 	var (
 		chunks      [][]*kgo.Record
 		currRecords []*kgo.Record
