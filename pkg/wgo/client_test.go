@@ -847,6 +847,16 @@ func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int3
 	return wsc
 }
 
+func seedBenchmarkAgentStats(wsc *WarpstreamClient, numBrokers int) {
+	now := time.Now()
+	for nodeID := range numBrokers {
+		// Agent stats require activity in two time buckets; seed both so the
+		// benchmark measures routing with an active healthy cluster view.
+		wsc.tracker.TrackAgentRequest(now.Add(-bucketDuration), int32(nodeID), time.Millisecond, nil)
+		wsc.tracker.TrackAgentRequest(now, int32(nodeID), time.Millisecond, nil)
+	}
+}
+
 // BenchmarkClient_Produce stresses Produce() throughput for both backends against
 // the same kfake cluster (multi-broker, multi-partition), with many concurrent
 // goroutines fanning small records across partitions. To keep the comparison
@@ -855,14 +865,22 @@ func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int3
 // custom records/sec metric reports post-completion throughput; combined
 // with -benchmem it gives a per-record CPU and allocation profile.
 func BenchmarkClient_Produce(b *testing.B) {
-	benchmarkClientProduce(b, 1024)
+	benchmarkClientProduce(b, 1024, false)
 }
 
 func BenchmarkClient_ProduceSmallPayload(b *testing.B) {
-	benchmarkClientProduce(b, 16)
+	benchmarkClientProduce(b, 16, false)
 }
 
-func benchmarkClientProduce(b *testing.B, valueLen int) {
+func BenchmarkClient_ProduceSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 16, true)
+}
+
+func benchmarkClientProduce(b *testing.B, valueLen int, steadyState bool) {
 	const (
 		topic         = "bench-topic"
 		numPartitions = int32(500)
@@ -871,6 +889,9 @@ func benchmarkClientProduce(b *testing.B, valueLen int) {
 	)
 
 	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 50*time.Millisecond)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
 
 	// The franz-go leg reuses the kgo.Client embedded in the WarpstreamClient
 	// (its produce path is unaffected by the wrapping logic), so both legs
@@ -938,14 +959,22 @@ func benchmarkClientProduce(b *testing.B, valueLen int) {
 // BenchmarkClient_ProduceSync exercises the complete batched produce path,
 // including routing, per-agent buffering, encoding, and the Kafka round trip.
 func BenchmarkClient_ProduceSync(b *testing.B) {
-	benchmarkClientProduceSync(b, 1024)
+	benchmarkClientProduceSync(b, 1024, false)
 }
 
 func BenchmarkClient_ProduceSyncSmallPayload(b *testing.B) {
-	benchmarkClientProduceSync(b, 16)
+	benchmarkClientProduceSync(b, 16, false)
 }
 
-func benchmarkClientProduceSync(b *testing.B, valueLen int) {
+func BenchmarkClient_ProduceSyncSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 16, true)
+}
+
+func benchmarkClientProduceSync(b *testing.B, valueLen int, steadyState bool) {
 	const (
 		topic           = "bench-topic"
 		numPartitions   = int32(100)
@@ -954,6 +983,9 @@ func benchmarkClientProduceSync(b *testing.B, valueLen int) {
 	)
 
 	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 0)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
 	value := make([]byte, valueLen)
 	records := make([]*kgo.Record, recordsPerBatch)
 	for i := range records {
