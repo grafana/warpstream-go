@@ -332,6 +332,7 @@ func TestDemoter_Candidates(t *testing.T) {
 		require.Len(t, cands, 2)
 		assert.Equal(t, slowID, cands[0].NodeID)
 		assert.Equal(t, AgentStateHealthy, cands[0].State)
+		assert.Equal(t, 2, inner.lastMaxCandidates(topic, part))
 
 		// No cluster stats yet → nothing demoted, and suppression reads 1
 		// with reason no_cluster_stats.
