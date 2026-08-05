@@ -855,11 +855,18 @@ func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int3
 // custom records/sec metric reports post-completion throughput; combined
 // with -benchmem it gives a per-record CPU and allocation profile.
 func BenchmarkClient_Produce(b *testing.B) {
+	benchmarkClientProduce(b, 1024)
+}
+
+func BenchmarkClient_ProduceSmallPayload(b *testing.B) {
+	benchmarkClientProduce(b, 16)
+}
+
+func benchmarkClientProduce(b *testing.B, valueLen int) {
 	const (
 		topic         = "bench-topic"
 		numPartitions = int32(500)
 		numBrokers    = 100
-		valueLen      = 1024
 		recordsPerOp  = 100
 	)
 
@@ -931,11 +938,18 @@ func BenchmarkClient_Produce(b *testing.B) {
 // BenchmarkClient_ProduceSync exercises the complete batched produce path,
 // including routing, per-agent buffering, encoding, and the Kafka round trip.
 func BenchmarkClient_ProduceSync(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayload(b *testing.B) {
+	benchmarkClientProduceSync(b, 16)
+}
+
+func benchmarkClientProduceSync(b *testing.B, valueLen int) {
 	const (
 		topic           = "bench-topic"
 		numPartitions   = int32(100)
 		numBrokers      = 10
-		valueLen        = 1024
 		recordsPerBatch = 100
 	)
 
