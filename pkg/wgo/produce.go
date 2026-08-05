@@ -369,6 +369,179 @@ func decodeBatch(encoded []byte) []*kgo.Record {
 	return records
 }
 
+func mergeEncodedBatches(batches [][]byte) (buf []byte, recordCount, uncompressedBytes, compressedBytes int) {
+	rawPtr := encBufPool.Get().(*[]byte)
+	raw := (*rawPtr)[:0]
+	decodedPtr := encBufPool.Get().(*[]byte)
+	decoded := (*decodedPtr)[:0]
+	defer func() {
+		putBuf(rawPtr, raw)
+		putBuf(decodedPtr, decoded)
+	}()
+
+	var firstTimestamp, maxTimestamp int64
+	for _, encoded := range batches {
+		var rb kmsg.RecordBatch
+		if err := rb.ReadFrom(encoded); err != nil {
+			panic(fmt.Sprintf("wgo: mergeEncodedBatches: read RecordBatch: %v", err))
+		}
+		if rb.NumRecords < 0 {
+			panic("wgo: mergeEncodedBatches: negative record count")
+		}
+
+		payload := rb.Records
+		if rb.Attributes&0x7 == 2 {
+			var err error
+			decoded, err = s2.Decode(decoded[:0], payload)
+			if err != nil {
+				panic(fmt.Sprintf("wgo: mergeEncodedBatches: snappy decode: %v", err))
+			}
+			payload = decoded
+		}
+
+		for len(payload) > 0 {
+			record, ok := parseRecordForMerge(payload)
+			if !ok {
+				panic("wgo: mergeEncodedBatches: invalid Record")
+			}
+
+			timestamp := rb.FirstTimestamp + record.timestampDelta
+			if recordCount == 0 {
+				firstTimestamp = timestamp
+				maxTimestamp = timestamp
+			} else if timestamp > maxTimestamp {
+				maxTimestamp = timestamp
+			}
+			newTimestampDelta := timestamp - firstTimestamp
+			newLength := 1 + kbin.VarlongLen(newTimestampDelta) + kbin.VarintLen(int32(recordCount)) + record.normalizedSuffixBytes
+
+			raw = kbin.AppendVarint(raw, int32(newLength))
+			raw = append(raw, 0)
+			raw = kbin.AppendVarlong(raw, newTimestampDelta)
+			raw = kbin.AppendVarint(raw, int32(recordCount))
+			raw = appendNormalizedRecordSuffix(raw, record.suffix)
+
+			recordCount++
+			payload = payload[kbin.VarintLen(record.length)+int(record.length):]
+		}
+	}
+
+	if recordCount == 0 {
+		panic("wgo: mergeEncodedBatches: no records")
+	}
+
+	compPtr := encBufPool.Get().(*[]byte)
+	comp := (*compPtr)[:0]
+	defer func() {
+		putBuf(compPtr, comp)
+	}()
+	comp = s2.EncodeSnappy(comp, raw)
+	payload := raw
+	var attributes int16
+	if len(comp) < len(raw) {
+		payload = comp
+		attributes = 2
+	}
+
+	uncompressedBytes = len(raw)
+	compressedBytes = len(payload)
+	batch := kmsg.RecordBatch{
+		PartitionLeaderEpoch: -1,
+		Magic:                2,
+		Attributes:           attributes,
+		LastOffsetDelta:      int32(recordCount - 1),
+		FirstTimestamp:       firstTimestamp,
+		MaxTimestamp:         maxTimestamp,
+		ProducerID:           -1,
+		ProducerEpoch:        -1,
+		FirstSequence:        -1,
+		NumRecords:           int32(recordCount),
+		Records:              payload,
+	}
+	batch.Length = batchFixedFieldsAfterLength + int32(len(payload))
+
+	buf = make([]byte, 0, 8+4+int(batch.Length))
+	buf = batch.AppendTo(buf)
+	checksum := crc32.Checksum(buf[crcOffset+4:], crc32cTable)
+	binary.BigEndian.PutUint32(buf[crcOffset:], checksum)
+
+	return buf, recordCount, uncompressedBytes, compressedBytes
+}
+
+type recordForMerge struct {
+	length                int32
+	timestampDelta        int64
+	suffix                []byte
+	normalizedSuffixBytes int
+}
+
+func parseRecordForMerge(payload []byte) (recordForMerge, bool) {
+	// Mirror kmsg.Record.ReadFrom: fields may extend past Length, and every
+	// negative varint byte length becomes nil rather than an error.
+	reader := kbin.Reader{Src: payload}
+	length := reader.Varint()
+	reader.Int8()
+	timestampDelta := reader.Varlong()
+	reader.Varint()
+	suffix := reader.Src
+
+	key := reader.VarintBytes()
+	value := reader.VarintBytes()
+	headerCount := reader.VarintArrayLen()
+	if !reader.Ok() {
+		return recordForMerge{}, false
+	}
+
+	normalizedHeaderCount := headerCount
+	if normalizedHeaderCount < 0 {
+		normalizedHeaderCount = 0
+	}
+	normalizedBytes := nullableVarintBytesLen(key) +
+		nullableVarintBytesLen(value) +
+		kbin.VarintLen(normalizedHeaderCount)
+	for range headerCount {
+		headerKey := reader.VarintBytes()
+		headerValue := reader.VarintBytes()
+		normalizedBytes += kbin.VarintLen(int32(len(headerKey))) + len(headerKey) +
+			nullableVarintBytesLen(headerValue)
+	}
+	if !reader.Ok() {
+		return recordForMerge{}, false
+	}
+
+	return recordForMerge{
+		length:                length,
+		timestampDelta:        timestampDelta,
+		suffix:                suffix,
+		normalizedSuffixBytes: normalizedBytes,
+	}, true
+}
+
+func appendNormalizedRecordSuffix(dst, suffix []byte) []byte {
+	reader := kbin.Reader{Src: suffix}
+	dst = kbin.AppendVarintBytes(dst, reader.VarintBytes())
+	dst = kbin.AppendVarintBytes(dst, reader.VarintBytes())
+	headerCount := reader.VarintArrayLen()
+	if headerCount < 0 {
+		headerCount = 0
+	}
+	dst = kbin.AppendVarint(dst, headerCount)
+	for range headerCount {
+		headerKey := reader.VarintBytes()
+		dst = kbin.AppendVarint(dst, int32(len(headerKey)))
+		dst = append(dst, headerKey...)
+		dst = kbin.AppendVarintBytes(dst, reader.VarintBytes())
+	}
+	return dst
+}
+
+func nullableVarintBytesLen(value []byte) int {
+	if value == nil {
+		return kbin.VarintLen(-1)
+	}
+	return kbin.VarintLen(int32(len(value))) + len(value)
+}
+
 // putBuf returns a buffer to the pool, dropping it if it grew too large.
 func putBuf(ptr *[]byte, buf []byte) {
 	if cap(buf) <= maxPooledBufCap {

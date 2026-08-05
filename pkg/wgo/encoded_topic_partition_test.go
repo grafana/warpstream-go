@@ -3,11 +3,13 @@ package wgo
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -204,6 +206,23 @@ func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
 		assert.Equal(t, []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-trace-b-01")}}, got[1].Headers)
 	})
 
+	t.Run("accepts nullable key, value, and header value", func(t *testing.T) {
+		a := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+				Headers:   []kgo.RecordHeader{{Key: "nullable"}},
+				Timestamp: time.UnixMilli(1_700_000_000_000),
+			}}),
+			nodeID: 5,
+		}
+		b := mk("t", 0, 5, AgentStateHealthy, "b")
+
+		got := decodeBatch(a.mergeWith([]routedEncodedTopicPartitionRecords{b}).encoded)
+		require.Len(t, got, 2)
+		assert.Nil(t, got[0].Key)
+		assert.Nil(t, got[0].Value)
+		assert.Equal(t, []kgo.RecordHeader{{Key: "nullable"}}, got[0].Headers)
+	})
+
 	t.Run("merges every item in the group in one shot", func(t *testing.T) {
 		a := mk("t", 0, 5, AgentStateHealthy, "a")
 		b := mk("t", 0, 5, AgentStateHealthy, "b")
@@ -212,6 +231,38 @@ func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
 		merged := a.mergeWith([]routedEncodedTopicPartitionRecords{b, c})
 		assert.Equal(t, int64(1), merged.encodedStats.batches)
 		assert.Equal(t, []string{"a", "b", "c"}, values(decodeBatch(merged.encoded)))
+	})
+
+	t.Run("matches decode and re-encode across varint boundaries", func(t *testing.T) {
+		makeBatch := func(batch int) routedEncodedTopicPartitionRecords {
+			records := make([]*kgo.Record, 70)
+			for i := range records {
+				records[i] = &kgo.Record{
+					Key:       []byte{byte(batch), byte(i)},
+					Value:     bytes.Repeat([]byte{byte(batch*70 + i)}, 200),
+					Headers:   []kgo.RecordHeader{{Key: "header", Value: []byte{byte(i)}}},
+					Timestamp: time.UnixMilli(1_700_000_000_000 + int64(batch*10_000-i*200)),
+				}
+			}
+			return routedEncodedTopicPartitionRecords{
+				encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, records),
+				nodeID:                       5,
+			}
+		}
+		a, b, c := makeBatch(0), makeBatch(1), makeBatch(2)
+
+		referenceRecords := append(decodeBatch(a.encoded), decodeBatch(b.encoded)...)
+		referenceRecords = append(referenceRecords, decodeBatch(c.encoded)...)
+		wantEncoded, wantUncompressed, wantCompressed := encodeBatch(referenceRecords)
+
+		merged := a.mergeWith([]routedEncodedTopicPartitionRecords{b, c})
+		assert.Equal(t, wantEncoded, merged.encoded)
+		assert.Equal(t, produceRequestStats{
+			records:           int64(len(referenceRecords)),
+			batches:           1,
+			uncompressedBytes: int64(wantUncompressed),
+			compressedBytes:   int64(wantCompressed),
+		}, merged.encodedStats)
 	})
 
 	t.Run("returns the receiver unchanged when there is nothing to merge", func(t *testing.T) {
@@ -244,6 +295,276 @@ func TestRoutedEncodedTopicPartitionRecords_MergeWith(t *testing.T) {
 		assert.Equal(t, bEncoded, b.encoded)
 		assert.Equal(t, bStats, b.encodedStats)
 	})
+}
+
+func TestRoutedEncodedTopicPartitionRecords_MergeWithReferenceParity(t *testing.T) {
+	overflowVarint := []byte{0x80, 0x80, 0x80, 0x80, 0x10}
+	truncatedVarint := []byte{0x80}
+	truncatedLength := append(kbin.AppendVarint(nil, 2), 0x01)
+	validKey := kbin.AppendVarintBytes(nil, []byte("k"))
+	validValue := kbin.AppendVarintBytes(nil, []byte("v"))
+	validHeaderKey := kbin.AppendVarintString(nil, "h")
+	validHeaderValue := kbin.AppendVarintBytes(nil, []byte("hv"))
+	noHeaders := kbin.AppendVarint(nil, 0)
+
+	recordWithSuffix := func(suffix []byte) []byte {
+		body := []byte{0}
+		body = kbin.AppendVarlong(body, 0)
+		body = kbin.AppendVarint(body, 0)
+		body = append(body, suffix...)
+		return append(kbin.AppendVarint(nil, int32(len(body))), body...)
+	}
+	withValidKey := func(value []byte) []byte {
+		return append(append([]byte(nil), validKey...), value...)
+	}
+	withValidKeyValue := func(headers []byte) []byte {
+		suffix := append(append([]byte(nil), validKey...), validValue...)
+		return append(suffix, headers...)
+	}
+	withOneHeader := func(key, value []byte) []byte {
+		headers := kbin.AppendVarint(nil, 1)
+		headers = append(headers, key...)
+		headers = append(headers, value...)
+		return withValidKeyValue(headers)
+	}
+
+	validSuffix := withValidKeyValue(noHeaders)
+	recordCases := map[string][]byte{
+		"negative record length":     kbin.AppendVarint(nil, -1),
+		"overflowed record length":   overflowVarint,
+		"truncated record body":      append(kbin.AppendVarint(nil, 10), 0),
+		"empty record body":          kbin.AppendVarint(nil, 0),
+		"overflowed timestamp delta": append(kbin.AppendVarint(nil, 6), append([]byte{0}, overflowVarint...)...),
+		"truncated timestamp delta":  append(kbin.AppendVarint(nil, 2), 0, 0x80),
+		"overflowed offset delta":    append(kbin.AppendVarint(nil, 7), append([]byte{0, 0}, overflowVarint...)...),
+		"truncated offset delta":     append(kbin.AppendVarint(nil, 3), 0, 0, 0x80),
+		"overflowed key length":      recordWithSuffix(overflowVarint),
+		"truncated key":              recordWithSuffix(truncatedLength),
+		"overflowed value length":    recordWithSuffix(withValidKey(overflowVarint)),
+		"truncated value":            recordWithSuffix(withValidKey(truncatedLength)),
+		"overflowed header count":    recordWithSuffix(withValidKeyValue(overflowVarint)),
+		"truncated header count":     recordWithSuffix(withValidKeyValue(truncatedVarint)),
+		"overflowed header key length": recordWithSuffix(
+			withOneHeader(overflowVarint, validHeaderValue),
+		),
+		"truncated header key": recordWithSuffix(withValidKeyValue(append(
+			kbin.AppendVarint(nil, 1), truncatedLength...,
+		))),
+		"overflowed header value length": recordWithSuffix(withOneHeader(validHeaderKey, overflowVarint)),
+		"truncated header value":         recordWithSuffix(withOneHeader(validHeaderKey, truncatedLength)),
+		"trailing declared record bytes": recordWithSuffix(append(validSuffix, 0xde, 0xad)),
+	}
+
+	valid := routedEncodedTopicPartitionRecords{
+		encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("t", 0, []*kgo.Record{{
+			Value:     []byte("valid"),
+			Timestamp: time.UnixMilli(1_700_000_000_000),
+		}}),
+		nodeID: 1,
+	}
+	var validBatch kmsg.RecordBatch
+	require.NoError(t, validBatch.ReadFrom(valid.encoded))
+	makeItem := func(records []byte, mutate func(*kmsg.RecordBatch)) routedEncodedTopicPartitionRecords {
+		batch := validBatch
+		batch.Attributes = 0
+		batch.Records = records
+		batch.NumRecords = 1
+		batch.Length = batchFixedFieldsAfterLength + int32(len(records))
+		if mutate != nil {
+			mutate(&batch)
+		}
+		return routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: encodedTopicPartitionRecords{
+				topic:        "t",
+				partition:    0,
+				encoded:      batch.AppendTo(nil),
+				encodedStats: produceRequestStats{records: 1, batches: 1},
+			},
+			nodeID: 1,
+		}
+	}
+
+	type parityCase struct {
+		item                 routedEncodedTopicPartitionRecords
+		referenceMustSucceed bool
+	}
+	cases := make(map[string]parityCase, len(recordCases)+20)
+	for name, records := range recordCases {
+		cases[name] = parityCase{item: makeItem(records, nil)}
+	}
+	for _, negative := range []int32{-1, -2, -1234} {
+		negativeLength := kbin.AppendVarint(nil, negative)
+		cases[fmt.Sprintf("key length %d is null", negative)] = parityCase{
+			item:                 makeItem(recordWithSuffix(append(append(append([]byte(nil), negativeLength...), validValue...), noHeaders...)), nil),
+			referenceMustSucceed: true,
+		}
+		cases[fmt.Sprintf("value length %d is null", negative)] = parityCase{
+			item:                 makeItem(recordWithSuffix(append(append(append([]byte(nil), validKey...), negativeLength...), noHeaders...)), nil),
+			referenceMustSucceed: true,
+		}
+		cases[fmt.Sprintf("header count %d is empty", negative)] = parityCase{
+			item:                 makeItem(recordWithSuffix(withValidKeyValue(negativeLength)), nil),
+			referenceMustSucceed: true,
+		}
+		cases[fmt.Sprintf("header key length %d is empty", negative)] = parityCase{
+			item:                 makeItem(recordWithSuffix(withOneHeader(negativeLength, validHeaderValue)), nil),
+			referenceMustSucceed: true,
+		}
+		cases[fmt.Sprintf("header value length %d is null", negative)] = parityCase{
+			item:                 makeItem(recordWithSuffix(withOneHeader(validHeaderKey, negativeLength)), nil),
+			referenceMustSucceed: true,
+		}
+	}
+
+	cases["nonzero record attributes are dropped"] = parityCase{
+		item: makeItem(func() []byte {
+			records := recordWithSuffix(validSuffix)
+			records[kbin.VarintLen(int32(len(records)-1))] = 7
+			return records
+		}(), nil),
+		referenceMustSucceed: true,
+	}
+	cases["negative NumRecords panics"] = parityCase{
+		item: makeItem(recordWithSuffix(validSuffix), func(batch *kmsg.RecordBatch) {
+			batch.NumRecords = -1
+		}),
+	}
+	for name, mutate := range map[string]func(*kmsg.RecordBatch){
+		"magic is ignored": func(batch *kmsg.RecordBatch) {
+			batch.Magic = 1
+		},
+		"unsupported compression codec is treated as raw": func(batch *kmsg.RecordBatch) {
+			batch.Attributes = 1
+		},
+		"NumRecords mismatch is ignored": func(batch *kmsg.RecordBatch) {
+			batch.NumRecords = 99
+		},
+		"LastOffsetDelta mismatch is ignored": func(batch *kmsg.RecordBatch) {
+			batch.LastOffsetDelta = 99
+		},
+	} {
+		cases[name] = parityCase{
+			item:                 makeItem(recordWithSuffix(validSuffix), mutate),
+			referenceMustSucceed: true,
+		}
+	}
+	badCRC := makeItem(recordWithSuffix(validSuffix), nil)
+	badCRC.encoded[crcOffset] ^= 0xff
+	cases["CRC is ignored"] = parityCase{item: badCRC, referenceMustSucceed: true}
+	trailingBatchBytes := makeItem(recordWithSuffix(validSuffix), nil)
+	trailingBatchBytes.encoded = append(trailingBatchBytes.encoded, 0xde, 0xad)
+	cases["trailing batch bytes are ignored"] = parityCase{item: trailingBatchBytes, referenceMustSucceed: true}
+
+	type outcome struct {
+		encoded  []byte
+		stats    produceRequestStats
+		panicked bool
+	}
+	run := func(fn func() encodedTopicPartitionRecords) (out outcome) {
+		defer func() {
+			out.panicked = recover() != nil
+		}()
+		result := fn()
+		out.encoded = result.encoded
+		out.stats = result.encodedStats
+		return out
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			reference := run(func() encodedTopicPartitionRecords {
+				records := append(decodeBatch(tc.item.encoded), decodeBatch(valid.encoded)...)
+				encoded, uncompressed, compressed := encodeBatch(records)
+				return encodedTopicPartitionRecords{
+					encoded: encoded,
+					encodedStats: produceRequestStats{
+						records:           int64(len(records)),
+						batches:           1,
+						uncompressedBytes: int64(uncompressed),
+						compressedBytes:   int64(compressed),
+					},
+				}
+			})
+			optimized := run(func() encodedTopicPartitionRecords {
+				return tc.item.mergeWith([]routedEncodedTopicPartitionRecords{valid}).encodedTopicPartitionRecords
+			})
+
+			if tc.referenceMustSucceed {
+				require.False(t, reference.panicked)
+			}
+			require.Equal(t, reference.panicked, optimized.panicked)
+			if !reference.panicked {
+				assert.Equal(t, reference.encoded, optimized.encoded)
+				assert.Equal(t, reference.stats, optimized.stats)
+			}
+		})
+	}
+
+	t.Run("all batches decode to zero records", func(t *testing.T) {
+		empty := makeItem(nil, func(batch *kmsg.RecordBatch) {
+			batch.NumRecords = 0
+		})
+		reference := run(func() encodedTopicPartitionRecords {
+			records := append(decodeBatch(empty.encoded), decodeBatch(empty.encoded)...)
+			encoded, uncompressed, compressed := encodeBatch(records)
+			return encodedTopicPartitionRecords{
+				encoded: encoded,
+				encodedStats: produceRequestStats{
+					records:           int64(len(records)),
+					batches:           1,
+					uncompressedBytes: int64(uncompressed),
+					compressedBytes:   int64(compressed),
+				},
+			}
+		})
+		optimized := run(func() encodedTopicPartitionRecords {
+			return empty.mergeWith([]routedEncodedTopicPartitionRecords{empty}).encodedTopicPartitionRecords
+		})
+
+		require.True(t, reference.panicked)
+		assert.Equal(t, reference.panicked, optimized.panicked)
+	})
+}
+
+func BenchmarkRoutedEncodedTopicPartitionRecords_MergeWith(b *testing.B) {
+	const (
+		batchCount      = 8
+		recordsPerBatch = 100
+		valueBytes      = 256
+	)
+
+	batches := make([]routedEncodedTopicPartitionRecords, batchCount)
+	for batch := range batches {
+		records := make([]*kgo.Record, recordsPerBatch)
+		for record := range records {
+			value := make([]byte, valueBytes)
+			for i := range value {
+				value[i] = byte(batch*recordsPerBatch + record + i*31)
+			}
+			records[record] = &kgo.Record{
+				Key:       []byte("benchmark-key"),
+				Value:     value,
+				Headers:   []kgo.RecordHeader{{Key: "traceparent", Value: []byte("00-benchmark-trace-01")}},
+				Timestamp: time.UnixMilli(1_700_000_000_000 + int64(batch*recordsPerBatch+record)),
+			}
+		}
+		batches[batch] = routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords("benchmark-topic", 0, records),
+			nodeID:                       1,
+			nodeState:                    AgentStateHealthy,
+		}
+	}
+
+	first, others := batches[0], batches[1:]
+	b.ReportAllocs()
+	b.SetBytes(batchCount * recordsPerBatch * valueBytes)
+	b.ResetTimer()
+	for range b.N {
+		merged := first.mergeWith(others)
+		if merged.recordCount() != batchCount*recordsPerBatch {
+			b.Fatal(merged.recordCount())
+		}
+	}
 }
 
 func TestUnrouteEncodedTopicPartitionRecords(t *testing.T) {

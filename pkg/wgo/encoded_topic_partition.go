@@ -77,13 +77,11 @@ func (p routedEncodedTopicPartitionRecords) splitByMaxBytes(int32) []routedEncod
 	return []routedEncodedTopicPartitionRecords{p}
 }
 
-// mergeWith combines p and others into a single RecordBatch for the partition by
-// decoding every batch, concatenating the records in arrival order, and
-// re-encoding once.
+// mergeWith combines p and others into a single RecordBatch for the partition.
 //
-// Returns p unchanged when others is empty, so non-merged partitions never decode.
-// Decoding operates on bytes this client encoded, never the caller's records, so it
-// stays race-free.
+// Returns p unchanged when others is empty, so non-merged partitions never parse.
+// Merging operates on bytes this client encoded, never the caller's records, so it
+// stays race-free without materializing kgo.Record values.
 func (p routedEncodedTopicPartitionRecords) mergeWith(others []routedEncodedTopicPartitionRecords) routedEncodedTopicPartitionRecords {
 	if len(others) == 0 {
 		return p
@@ -98,14 +96,26 @@ func (p routedEncodedTopicPartitionRecords) mergeWith(others []routedEncodedTopi
 		}
 	}
 
-	records := decodeBatch(p.encoded)
+	batches := make([][]byte, 1, len(others)+1)
+	batches[0] = p.encoded
 	for _, o := range others {
-		records = append(records, decodeBatch(o.encoded)...)
+		batches = append(batches, o.encoded)
 	}
+	encoded, records, uncompressed, compressed := mergeEncodedBatches(batches)
 
 	return routedEncodedTopicPartitionRecords{
-		encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(p.topic, p.partition, records),
-		nodeID:                       p.nodeID,
+		encodedTopicPartitionRecords: encodedTopicPartitionRecords{
+			topic:     p.topic,
+			partition: p.partition,
+			encoded:   encoded,
+			encodedStats: produceRequestStats{
+				records:           int64(records),
+				batches:           1,
+				uncompressedBytes: int64(uncompressed),
+				compressedBytes:   int64(compressed),
+			},
+		},
+		nodeID: p.nodeID,
 		// Take the latest Add's nodeState: it is the freshest routing-time view of
 		// the agent, which is what the hedger trusts to decide probe (zero-delay)
 		// hedging.
