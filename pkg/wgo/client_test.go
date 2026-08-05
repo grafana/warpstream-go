@@ -484,7 +484,7 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 		WithWriteTimeout(writeTimeout),
 		WithProduceRequestTimeout(produceRequestTimeout),
 		WithProduceRequestTimeoutOverhead(produceTimeoutOverhead),
-		WithHedgerMinHedgeDelay(time.Hour),
+		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
 	}
 
 	// wedgeAgent makes every Produce request to the cluster block until the test
@@ -814,6 +814,39 @@ type produceClient interface {
 	Close()
 }
 
+func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int32, numBrokers int, linger time.Duration) *WarpstreamClient {
+	b.Helper()
+
+	cluster, addr := testkafka.CreateCluster(b, numPartitions, topic, testkafka.WithNumBrokers(numBrokers))
+	b.Cleanup(cluster.Close)
+
+	wsc, err := NewWarpstreamClient(
+		nil,
+		prometheus.NewPedanticRegistry(),
+		WithAddress(addr),
+		WithTopic(topic),
+		WithClientID("warpstream-bench"),
+		WithDialTimeout(2*time.Second),
+		WithWriteTimeout(30*time.Second),
+		WithLinger(linger),
+		WithBatchMaxBytes(16<<20),
+		WithHealthCheckSlowMultiplier(2.0),
+		WithHealthCheckMaxSlowFraction(0.3),
+		WithHealthCheckFaultyThreshold(0.05),
+		WithHealthCheckMaxFaultyFraction(0.3),
+		WithHedgerMinHedgeDelay(time.Hour),
+		WithHedgerMaxHedgeAgents(3),
+		WithDemoterProbeInterval(time.Second),
+		WithClusterStatsTTL(time.Second),
+		WithMetadataRefreshInterval(time.Hour),
+		WithProduceRequestTimeout(10*time.Second),
+		WithProduceRequestTimeoutOverhead(time.Second),
+	)
+	require.NoError(b, err)
+	b.Cleanup(wsc.Close)
+	return wsc
+}
+
 // BenchmarkClient_Produce stresses Produce() throughput for both backends against
 // the same kfake cluster (multi-broker, multi-partition), with many concurrent
 // goroutines fanning small records across partitions. To keep the comparison
@@ -830,33 +863,7 @@ func BenchmarkClient_Produce(b *testing.B) {
 		recordsPerOp  = 100
 	)
 
-	cluster, addr := testkafka.CreateCluster(b, numPartitions, topic, testkafka.WithNumBrokers(numBrokers))
-	b.Cleanup(cluster.Close)
-
-	wsc, err := NewWarpstreamClient(
-		nil,
-		prometheus.NewPedanticRegistry(),
-		WithAddress(addr),
-		WithTopic(topic),
-		WithClientID("warpstream-bench"),
-		WithDialTimeout(2*time.Second),
-		WithWriteTimeout(30*time.Second),
-		WithLinger(50*time.Millisecond),
-		WithBatchMaxBytes(16<<20),
-		WithHealthCheckSlowMultiplier(2.0),
-		WithHealthCheckMaxSlowFraction(0.3),
-		WithHealthCheckFaultyThreshold(0.05),
-		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
-		WithHedgerMaxHedgeAgents(3),
-		WithDemoterProbeInterval(time.Second),
-		WithClusterStatsTTL(time.Second),
-		WithMetadataRefreshInterval(time.Hour),
-		WithProduceRequestTimeout(10*time.Second),
-		WithProduceRequestTimeoutOverhead(time.Second),
-	)
-	require.NoError(b, err)
-	b.Cleanup(wsc.Close)
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 50*time.Millisecond)
 
 	// The franz-go leg reuses the kgo.Client embedded in the WarpstreamClient
 	// (its produce path is unaffected by the wrapping logic), so both legs
@@ -919,6 +926,46 @@ func BenchmarkClient_Produce(b *testing.B) {
 			})
 		}
 	}
+}
+
+// BenchmarkClient_ProduceSync exercises the complete batched produce path,
+// including routing, per-agent buffering, encoding, and the Kafka round trip.
+func BenchmarkClient_ProduceSync(b *testing.B) {
+	const (
+		topic           = "bench-topic"
+		numPartitions   = int32(100)
+		numBrokers      = 10
+		valueLen        = 1024
+		recordsPerBatch = 100
+	)
+
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 0)
+	value := make([]byte, valueLen)
+	records := make([]*kgo.Record, recordsPerBatch)
+	for i := range records {
+		records[i] = &kgo.Record{
+			Topic:     topic,
+			Partition: int32(i) % numPartitions,
+			Value:     value,
+		}
+	}
+
+	results := wsc.ProduceSync(context.Background(), records)
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		results = wsc.ProduceSync(context.Background(), records)
+	}
+	b.StopTimer()
+
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+	b.ReportMetric(float64(b.N*recordsPerBatch)/b.Elapsed().Seconds(), "records/sec")
 }
 
 // TestWarpstreamClient_ReusedPooledRecordsAreRaceFree exercises the produce
