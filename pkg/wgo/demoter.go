@@ -163,8 +163,8 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	// which can flip lastDemotedProbe membership and log a transition.
 	const maxRetries = 6
 	var (
-		agents                   []Agent
-		allCandidatesPassThrough bool
+		agents          []Agent
+		noDemotedAgents bool
 	)
 	for retry, extra := 0, 2; retry < maxRetries; retry, extra = retry+1, extra*2 {
 		var (
@@ -173,13 +173,13 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 		)
 
 		agents = d.inner.Candidates(topic, partition, asked)
-		allCandidatesPassThrough = true
+		noDemotedAgents = true
 
 		for _, c := range agents {
-			if !d.isDemoted(now, c.NodeID, clusterStats) {
+			if !d.isDemoted(now, c.NodeID, clusterStats, hasClusterStats) {
 				nonDemoted++
 			} else {
-				allCandidatesPassThrough = false
+				noDemotedAgents = false
 			}
 		}
 
@@ -195,7 +195,7 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	if len(agents) == 0 {
 		return nil
 	}
-	if allCandidatesPassThrough {
+	if noDemotedAgents {
 		return agents[:min(len(agents), maxCandidates)]
 	}
 
@@ -206,7 +206,7 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 		}
 
 		// Keep any non-demoted agent.
-		if !d.isDemoted(now, agent.NodeID, clusterStats) {
+		if !d.isDemoted(now, agent.NodeID, clusterStats, hasClusterStats) {
 			candidates = append(candidates, agent)
 			continue
 		}
@@ -237,9 +237,13 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 }
 
 // isDemoted reports whether agent nodeID currently meets the demotion criteria.
-// Candidates has already established that demotion is not suppressed. This also
-// applies the demotion/recovery edge transition and logs it once.
-func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterStats) bool {
+// Candidates checks isDemotionSuppressed first; hasClusterStats is re-checked
+// here so a missing cluster view cannot demote if that call is ever skipped.
+// This also applies the demotion/recovery edge transition and logs it once.
+func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterStats, hasClusterStats bool) bool {
+	if !hasClusterStats {
+		return false
+	}
 	stats, ok := d.tracker.AgentStats(now, nodeID)
 	if !ok {
 		return false

@@ -857,13 +857,6 @@ func seedBenchmarkAgentStats(wsc *WarpstreamClient, numBrokers int) {
 	}
 }
 
-// BenchmarkClient_Produce stresses Produce() throughput for both backends against
-// the same kfake cluster (multi-broker, multi-partition), with many concurrent
-// goroutines fanning small records across partitions. To keep the comparison
-// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
-// WarpstreamClient — both legs run with identical kgo configuration. The
-// custom records/sec metric reports post-completion throughput; combined
-// with -benchmem it gives a per-record CPU and allocation profile.
 func BenchmarkClient_Produce(b *testing.B) {
 	benchmarkClientProduce(b, 1024, false)
 }
@@ -880,6 +873,13 @@ func BenchmarkClient_ProduceSmallPayloadSteadyState(b *testing.B) {
 	benchmarkClientProduce(b, 16, true)
 }
 
+// benchmarkClientProduce stresses Produce() throughput for both backends against
+// the same kfake cluster (multi-broker, multi-partition), with many concurrent
+// goroutines fanning small records across partitions. To keep the comparison
+// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
+// WarpstreamClient — both legs run with identical kgo configuration. The
+// custom records/sec metric reports post-completion throughput; combined
+// with -benchmem it gives a per-record CPU and allocation profile.
 func benchmarkClientProduce(b *testing.B, valueLen int, steadyState bool) {
 	const (
 		topic         = "bench-topic"
