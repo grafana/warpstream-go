@@ -484,7 +484,7 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 		WithWriteTimeout(writeTimeout),
 		WithProduceRequestTimeout(produceRequestTimeout),
 		WithProduceRequestTimeoutOverhead(produceTimeoutOverhead),
-		WithHedgerMinHedgeDelay(time.Hour),
+		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
 	}
 
 	// wedgeAgent makes every Produce request to the cluster block until the test
@@ -814,21 +814,8 @@ type produceClient interface {
 	Close()
 }
 
-// BenchmarkClient_Produce stresses Produce() throughput for both backends against
-// the same kfake cluster (multi-broker, multi-partition), with many concurrent
-// goroutines fanning small records across partitions. To keep the comparison
-// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
-// WarpstreamClient — both legs run with identical kgo configuration. The
-// custom records/sec metric reports post-completion throughput; combined
-// with -benchmem it gives a per-record CPU and allocation profile.
-func BenchmarkClient_Produce(b *testing.B) {
-	const (
-		topic         = "bench-topic"
-		numPartitions = int32(500)
-		numBrokers    = 100
-		valueLen      = 1024
-		recordsPerOp  = 100
-	)
+func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int32, numBrokers int, linger time.Duration) *WarpstreamClient {
+	b.Helper()
 
 	cluster, addr := testkafka.CreateCluster(b, numPartitions, topic, testkafka.WithNumBrokers(numBrokers))
 	b.Cleanup(cluster.Close)
@@ -841,13 +828,13 @@ func BenchmarkClient_Produce(b *testing.B) {
 		WithClientID("warpstream-bench"),
 		WithDialTimeout(2*time.Second),
 		WithWriteTimeout(30*time.Second),
-		WithLinger(50*time.Millisecond),
+		WithLinger(linger),
 		WithBatchMaxBytes(16<<20),
 		WithHealthCheckSlowMultiplier(2.0),
 		WithHealthCheckMaxSlowFraction(0.3),
 		WithHealthCheckFaultyThreshold(0.05),
 		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
+		WithHedgerMinHedgeDelay(time.Hour),
 		WithHedgerMaxHedgeAgents(3),
 		WithDemoterProbeInterval(time.Second),
 		WithClusterStatsTTL(time.Second),
@@ -857,6 +844,54 @@ func BenchmarkClient_Produce(b *testing.B) {
 	)
 	require.NoError(b, err)
 	b.Cleanup(wsc.Close)
+	return wsc
+}
+
+func seedBenchmarkAgentStats(wsc *WarpstreamClient, numBrokers int) {
+	now := time.Now()
+	for nodeID := range numBrokers {
+		// Agent stats require activity in two time buckets; seed both so the
+		// benchmark measures routing with an active healthy cluster view.
+		wsc.tracker.TrackAgentRequest(now.Add(-bucketDuration), int32(nodeID), time.Millisecond, nil)
+		wsc.tracker.TrackAgentRequest(now, int32(nodeID), time.Millisecond, nil)
+	}
+}
+
+func BenchmarkClient_Produce(b *testing.B) {
+	benchmarkClientProduce(b, 1024, false)
+}
+
+func BenchmarkClient_ProduceSmallPayload(b *testing.B) {
+	benchmarkClientProduce(b, 16, false)
+}
+
+func BenchmarkClient_ProduceSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 16, true)
+}
+
+// benchmarkClientProduce stresses Produce() throughput for both backends against
+// the same kfake cluster (multi-broker, multi-partition), with many concurrent
+// goroutines fanning small records across partitions. To keep the comparison
+// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
+// WarpstreamClient — both legs run with identical kgo configuration. The
+// custom records/sec metric reports post-completion throughput; combined
+// with -benchmem it gives a per-record CPU and allocation profile.
+func benchmarkClientProduce(b *testing.B, valueLen int, steadyState bool) {
+	const (
+		topic         = "bench-topic"
+		numPartitions = int32(500)
+		numBrokers    = 100
+		recordsPerOp  = 100
+	)
+
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 50*time.Millisecond)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
 
 	// The franz-go leg reuses the kgo.Client embedded in the WarpstreamClient
 	// (its produce path is unaffected by the wrapping logic), so both legs
@@ -919,6 +954,64 @@ func BenchmarkClient_Produce(b *testing.B) {
 			})
 		}
 	}
+}
+
+// BenchmarkClient_ProduceSync exercises the complete batched produce path,
+// including routing, per-agent buffering, encoding, and the Kafka round trip.
+func BenchmarkClient_ProduceSync(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024, false)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayload(b *testing.B) {
+	benchmarkClientProduceSync(b, 16, false)
+}
+
+func BenchmarkClient_ProduceSyncSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 16, true)
+}
+
+func benchmarkClientProduceSync(b *testing.B, valueLen int, steadyState bool) {
+	const (
+		topic           = "bench-topic"
+		numPartitions   = int32(100)
+		numBrokers      = 10
+		recordsPerBatch = 100
+	)
+
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 0)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
+	value := make([]byte, valueLen)
+	records := make([]*kgo.Record, recordsPerBatch)
+	for i := range records {
+		records[i] = &kgo.Record{
+			Topic:     topic,
+			Partition: int32(i) % numPartitions,
+			Value:     value,
+		}
+	}
+
+	results := wsc.ProduceSync(context.Background(), records)
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		results = wsc.ProduceSync(context.Background(), records)
+	}
+	b.StopTimer()
+
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+	b.ReportMetric(float64(b.N*recordsPerBatch)/b.Elapsed().Seconds(), "records/sec")
 }
 
 // TestWarpstreamClient_ReusedPooledRecordsAreRaceFree exercises the produce
