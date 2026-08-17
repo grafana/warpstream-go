@@ -43,8 +43,8 @@ const produceAPIVersion int16 = 11
 //
 //   - An *AgentPool* watches Metadata and exposes the current set of
 //     reachable agents plus the (Kafka-protocol-mandated) leader for each
-//     partition. The pool is kept up to date in the background; the produce
-//     path never blocks on Metadata refreshes.
+//     partition. The pool is refreshed on a timer and on-demand when routing
+//     finds no candidate; the produce path never waits for those fetches.
 //   - A *PartitionAssignmentStrategy* turns the pool into a deterministic
 //     primary/secondary mapping. Every client instance with the same pool
 //     view picks the same secondary for a given partition, which keeps
@@ -89,6 +89,12 @@ type WarpstreamClient struct {
 	refreshCancel context.CancelFunc
 	closeOnce     sync.Once
 	refreshWG     sync.WaitGroup
+
+	// refreshNowCh is a size-1 nudge from the produce path to the refresh
+	// goroutine. Sends never block: while one nudge is pending, additional
+	// nudges coalesce. A nudge arriving during a refresh can queue one
+	// follow-up refresh after the cooldown.
+	refreshNowCh chan struct{}
 }
 
 // NewWarpstreamClient wires every component of the produce path. Config starts
@@ -142,6 +148,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		directProducer: directProducer,
 		refreshCtx:     refreshCtx,
 		refreshCancel:  refreshCancel,
+		refreshNowCh:   make(chan struct{}, 1),
 	}
 	// Demoter sits on top of the lazy pool strategy so refresh-driven
 	// agent-pool changes flow through transparently while the Demoter's
@@ -367,10 +374,12 @@ func (c *WarpstreamClient) Close() {
 	})
 }
 
-// startBackgroundRefresh ticks pool.Refresh and purges the tracker of removed
-// agents. refreshCtx (cancelled by Close) bounds both the loop and any
-// in-flight Refresh; the underlying Metadata fetch is already capped by
-// kgo's RequestTimeoutOverhead, so we don't add a per-call deadline.
+// startBackgroundRefresh owns every post-startup AgentPool.Refresh: the
+// periodic ticker and on-demand nudges from triggerRefresh. One owner means
+// Refresh is never concurrent. refreshCtx (cancelled by Close) stops the loop,
+// interrupts an in-flight Refresh, and aborts the cooldown. We rely on kgo's
+// per-attempt RequestTimeoutOverhead and overall retry policy rather than
+// adding a separate per-refresh deadline.
 func (c *WarpstreamClient) startBackgroundRefresh() {
 	c.refreshWG.Add(1)
 	go func() {
@@ -381,19 +390,60 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 			select {
 			case <-c.refreshCtx.Done():
 				return
+			case <-c.refreshNowCh:
+				startedAt := time.Now()
+				c.refreshPool()
+				ticker.Reset(c.cfg.MetadataRefreshInterval)
+				if !c.waitRefreshCooldown(time.Since(startedAt)) {
+					return
+				}
 			case <-ticker.C:
-				removed, err := c.pool.Refresh(c.refreshCtx)
-				if err != nil {
-					log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
-					continue
-				}
-				if len(removed) > 0 {
-					c.tracker.PurgeAgents(removed)
-				}
-				c.demoter.Refresh(c.pool.Agents())
+				c.refreshPool()
+				ticker.Reset(c.cfg.MetadataRefreshInterval)
 			}
 		}
 	}()
+}
+
+// triggerRefresh asks the refresh goroutine to fetch Metadata soon. Never
+// blocks: if a refresh is already pending the nudge is dropped.
+func (c *WarpstreamClient) triggerRefresh() {
+	select {
+	case c.refreshNowCh <- struct{}{}:
+	default:
+	}
+}
+
+// refreshPool fetches Metadata and applies the snapshot. Failures are logged
+// and leave the previous snapshot in place.
+func (c *WarpstreamClient) refreshPool() {
+	removed, err := c.pool.Refresh(c.refreshCtx)
+	if err != nil {
+		log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
+		return
+	}
+	if len(removed) > 0 {
+		c.tracker.PurgeAgents(removed)
+	}
+	c.demoter.Refresh(c.pool.Agents())
+}
+
+// waitRefreshCooldown enforces the configured minimum between on-demand
+// refresh start times. Time spent fetching already counts toward the interval.
+// Returns false during close so the refresh loop exits without spinning.
+func (c *WarpstreamClient) waitRefreshCooldown(elapsed time.Duration) bool {
+	remaining := c.cfg.OnDemandMetadataRefreshInterval - elapsed
+	if remaining <= 0 {
+		return c.refreshCtx.Err() == nil
+	}
+	t := time.NewTimer(remaining)
+	defer t.Stop()
+	select {
+	case <-c.refreshCtx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // routeRecords groups records by (topic, partition), stamps each group with
@@ -408,6 +458,7 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 		if !ok {
 			cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
 			if len(cands) == 0 {
+				c.triggerRefresh()
 				return nil, fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition)
 			}
 			g = &promised[routedTopicPartitionRecords]{
@@ -440,6 +491,7 @@ func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(grou
 func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResult)) (promised[routedTopicPartitionRecords], error) {
 	cands := c.demoter.Candidates(record.Topic, record.Partition, 1)
 	if len(cands) == 0 {
+		c.triggerRefresh()
 		return promised[routedTopicPartitionRecords]{}, fmt.Errorf("no agent assigned for topic %q partition %d", record.Topic, record.Partition)
 	}
 	return promised[routedTopicPartitionRecords]{

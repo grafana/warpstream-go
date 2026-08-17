@@ -4,7 +4,6 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,16 +88,7 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		var vnet kfake.VirtualNetwork
 		_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicA, testkafka.WithVirtualNetwork(&vnet))
 
-		// Set kgo's metadata cache to its minimum allowed value (10ms; kgo rejects
-		// MetadataMinAge=0) so the test sees CreateTopics / DeleteTopics changes on
-		// the next Refresh without waiting for the default 5-second cache window.
-		// In production the longer default is desirable; the test just needs
-		// deterministic visibility.
-		client, err := kgo.NewClient(
-			kgo.SeedBrokers(clusterAddr),
-			kgo.Dialer(vnet.DialContext),
-			kgo.MetadataMinAge(10*time.Millisecond),
-		)
+		client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr), kgo.Dialer(vnet.DialContext))
 		require.NoError(t, err)
 		t.Cleanup(client.Close)
 
@@ -145,11 +135,6 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		deleteReq.Topics = []kmsg.DeleteTopicsRequestTopic{{Topic: kmsg.StringPtr(topicB)}}
 		_, err = client.Request(t.Context(), deleteReq)
 		require.NoError(t, err)
-
-		// Advance past kgo's metadata cache (MetadataMinAge=10ms above) so the next
-		// Refresh fetches fresh metadata reflecting the deletion. Under the fake
-		// clock this sleep is instant and deterministic.
-		time.Sleep(20 * time.Millisecond)
 
 		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
