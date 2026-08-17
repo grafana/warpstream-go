@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -70,17 +71,12 @@ func NewAgentPool(client *kgo.Client) *AgentPool {
 // (stats, etc.) for those IDs. Not safe for concurrent calls.
 func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, err error) {
 	// Topics=nil requests metadata for every topic in the cluster.
-	// An explicit request guarantees each Refresh reaches a broker; kgo routes
-	// it through fetchMetadata, updating its brokers, controller, and metadata
-	// cache. Post-startup pacing is owned by WarpstreamClient.
+	// A tiny positive cache age keeps production refreshes fresh while using
+	// kgo's bounded internal Metadata retry policy.
 	req := kmsg.NewPtrMetadataRequest()
-	resp, err := p.client.Request(ctx, req)
+	meta, err := p.client.RequestCachedMetadata(ctx, req, time.Nanosecond)
 	if err != nil {
 		return nil, fmt.Errorf("fetching metadata: %w", err)
-	}
-	meta, ok := resp.(*kmsg.MetadataResponse)
-	if !ok {
-		return nil, fmt.Errorf("unexpected metadata response type %T", resp)
 	}
 
 	newAgents := make([]int32, 0, len(meta.Brokers))

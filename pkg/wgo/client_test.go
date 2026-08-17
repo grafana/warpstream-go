@@ -1208,6 +1208,8 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 			_, err := c.Request(t.Context(), createReq)
 			require.NoError(t, err)
 
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
 			first := c.ProduceSync(t.Context(), []*kgo.Record{
 				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
 			})
@@ -1228,6 +1230,8 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
 
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
 			var meta atomic.Int64
 			cluster.ControlKey(int16(kmsg.Metadata), func(kmsg.Request) (kmsg.Response, error, bool) {
 				meta.Add(1)

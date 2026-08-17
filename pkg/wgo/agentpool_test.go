@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,6 +137,8 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		_, err = client.Request(t.Context(), deleteReq)
 		require.NoError(t, err)
 
+		// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+		time.Sleep(time.Nanosecond)
 		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		_, okB = pool.TopicID(topicB)
