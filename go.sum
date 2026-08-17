@@ -26,8 +26,8 @@ github.com/prometheus/procfs v0.21.1 h1:GljZCt+zSTS+NZq88cyQ1LjZ+RCHp3uVuabBWA5+
 github.com/prometheus/procfs v0.21.1/go.mod h1:aB55Cww9pdSJVHk0hUf0inxWyyjPogFIjmHKYgMKmtY=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/twmb/franz-go v1.21.5 h1:cVYI2+JTTKSvohhy8bCOleYrS7G79ZBrLVFIJsoHm8M=
-github.com/twmb/franz-go v1.21.5/go.mod h1:rfoMTnVk7107fhTGxfEKIHP/e7tPe6oyij/ywzO0czk=
+github.com/twmb/franz-go v1.21.6 h1:+v0dQJVIIuw9uPmPWmPrkoUHs1pPeV8MSwA4eU/Y2kY=
+github.com/twmb/franz-go v1.21.6/go.mod h1:wMepkgCatAdV9vCsuwM+wr+C1fl7KV/41+uHGAjt/wc=
 github.com/twmb/franz-go/pkg/kadm v1.18.0 h1:WRf/LZmDdcDXwX7WMbtDU++v+b3NzYh2bCGoPMmzirw=
 github.com/twmb/franz-go/pkg/kadm v1.18.0/go.mod h1:XeLhGoLXLFzK8/ryv5FfpxPxGwj4oFEGpPJMB/x6KDE=
 github.com/twmb/franz-go/pkg/kfake v0.0.0-20260804154521-adb3a18abe14 h1:jomii5kh1cmGaglyoAEZGud71xQU57qqDyCmsYeH8uY=
