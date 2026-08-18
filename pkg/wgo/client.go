@@ -391,15 +391,14 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 			case <-c.refreshCtx.Done():
 				return
 			case <-c.refreshNowCh:
+				ticker.Reset(c.cfg.MetadataRefreshInterval)
 				startedAt := time.Now()
 				c.refreshPool()
-				ticker.Reset(c.cfg.MetadataRefreshInterval)
 				if !c.waitRefreshCooldown(time.Since(startedAt)) {
 					return
 				}
 			case <-ticker.C:
 				c.refreshPool()
-				ticker.Reset(c.cfg.MetadataRefreshInterval)
 			}
 		}
 	}()
