@@ -55,10 +55,12 @@ func testWarpstreamOpts(clusterAddr, topic string) []Opt {
 // Extra opts are appended after the shared defaults, so a test can add options
 // (e.g. WithHooks) or override a default.
 //
-// The background metadata refresh goroutine runs but its ticker
-// (MetadataRefreshInterval) is well above any individual test's virtual runtime,
-// so it never fires; t.Cleanup runs inside the bubble and Close cancels the
-// refresh ctx and joins the goroutine before the bubble ends.
+// The background metadata refresh goroutine runs; its ticker
+// (MetadataRefreshInterval) is well above any individual test's virtual runtime
+// so the timer never fires on its own. Routing a record with no candidate
+// nudges an on-demand refresh, which is expected. t.Cleanup runs inside the
+// bubble and Close cancels the refresh ctx and joins the goroutine before the
+// bubble ends.
 func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32, opts ...Opt) (*WarpstreamClient, *kfake.Cluster, string, *kfake.VirtualNetwork) {
 	t.Helper()
 
@@ -1185,6 +1187,120 @@ func TestWarpstreamClient_ReusedPooledRecordsAreRaceFree(t *testing.T) {
 			require.Zero(t, failures.Load(), "produces must succeed")
 			require.Positive(t, testutil.ToFloat64(c.metrics.produceRequestsHedgeTotal),
 				"expected the hedge path to fire; the test would not cover the regression otherwise")
+		})
+	})
+}
+
+func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
+	const topic = "test-topic"
+
+	t.Run("CreateTopics is visible on the next produce after a routing miss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			const newTopic = "created-after-start"
+
+			createReq := kmsg.NewPtrCreateTopicsRequest()
+			createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
+				Topic:             newTopic,
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+			}}
+			_, err := c.Request(t.Context(), createReq)
+			require.NoError(t, err)
+
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
+			first := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Len(t, first, 1)
+			require.ErrorContains(t, first[0].Err, "no agent assigned")
+
+			synctest.Wait()
+
+			second := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Len(t, second, 1)
+			require.NoError(t, second[0].Err)
+		})
+	})
+
+	t.Run("concurrent unknown-topic produces coalesce to one refresh", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
+			var meta atomic.Int64
+			cluster.ControlKey(int16(kmsg.Metadata), func(kmsg.Request) (kmsg.Response, error, bool) {
+				meta.Add(1)
+				return nil, nil, false
+			})
+
+			const n = 20
+			start := time.Now()
+			var wg sync.WaitGroup
+			wg.Add(n)
+			for range n {
+				go func() {
+					defer wg.Done()
+					done := make(chan struct{})
+					c.Produce(t.Context(), &kgo.Record{
+						Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now(),
+					}, func(*kgo.Record, error) { close(done) })
+					<-done
+				}()
+			}
+			wg.Wait()
+			assert.Zero(t, time.Since(start))
+
+			synctest.Wait()
+			assert.Equal(t, int64(1), meta.Load())
+		})
+	})
+
+	t.Run("Close during refresh cooldown does not deadlock", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Error(t, results[0].Err)
+			synctest.Wait()
+			c.Close()
+		})
+	})
+}
+
+func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {
+	t.Run("fetch time counts toward the interval", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			c := &WarpstreamClient{
+				cfg:        Config{OnDemandMetadataRefreshInterval: time.Second},
+				refreshCtx: ctx,
+			}
+
+			startedAt := time.Now()
+			assert.True(t, c.waitRefreshCooldown(250*time.Millisecond))
+			assert.Equal(t, 750*time.Millisecond, time.Since(startedAt))
+		})
+	})
+
+	t.Run("no additional wait after a slow fetch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			c := &WarpstreamClient{
+				cfg:        Config{OnDemandMetadataRefreshInterval: time.Second},
+				refreshCtx: ctx,
+			}
+
+			startedAt := time.Now()
+			assert.True(t, c.waitRefreshCooldown(2*time.Second))
+			assert.Zero(t, time.Since(startedAt))
 		})
 	})
 }

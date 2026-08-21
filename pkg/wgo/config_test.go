@@ -30,8 +30,9 @@ func TestConfig_Validate(t *testing.T) {
 		Demoter: DemoterConfig{
 			ProbeInterval: time.Second,
 		},
-		ClusterStatsTTL:         time.Second,
-		MetadataRefreshInterval: 10 * time.Second,
+		ClusterStatsTTL:                 time.Second,
+		MetadataRefreshInterval:         10 * time.Second,
+		OnDemandMetadataRefreshInterval: time.Second,
 		DirectProducer: KafkaDirectProducerConfig{
 			ProduceRequestTimeout:         2 * time.Second,
 			ProduceRequestTimeoutOverhead: time.Second,
@@ -134,6 +135,21 @@ func TestConfig_Validate(t *testing.T) {
 		"write timeout equal to produce request timeout plus overhead is valid": {
 			mutate: func(c *Config) { c.WriteTimeout = 3 * time.Second },
 		},
+		"zero on-demand metadata refresh interval is rejected": {
+			mutate:     func(c *Config) { c.OnDemandMetadataRefreshInterval = 0 },
+			wantErrMsg: "on-demand metadata refresh interval must be positive",
+		},
+		"negative on-demand metadata refresh interval is rejected": {
+			mutate:     func(c *Config) { c.OnDemandMetadataRefreshInterval = -1 },
+			wantErrMsg: "on-demand metadata refresh interval must be positive",
+		},
+		"on-demand metadata refresh interval above background interval is rejected": {
+			mutate:     func(c *Config) { c.OnDemandMetadataRefreshInterval = 11 * time.Second },
+			wantErrMsg: "on-demand metadata refresh interval must not exceed metadata refresh interval",
+		},
+		"on-demand metadata refresh interval equal to background interval is valid": {
+			mutate: func(c *Config) { c.OnDemandMetadataRefreshInterval = 10 * time.Second },
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -185,6 +201,7 @@ func TestOptions_ApplyToConfig(t *testing.T) {
 		WithDemoterProbeInterval(11*time.Second),
 		WithClusterStatsTTL(12*time.Second),
 		WithMetadataRefreshInterval(13*time.Second),
+		WithOnDemandMetadataRefreshInterval(7*time.Second),
 	)
 
 	assert.Equal(t, []string{"a:9092", "b:9092"}, cfg.Address)
@@ -208,6 +225,7 @@ func TestOptions_ApplyToConfig(t *testing.T) {
 	assert.Equal(t, 11*time.Second, cfg.Demoter.ProbeInterval)
 	assert.Equal(t, 12*time.Second, cfg.ClusterStatsTTL)
 	assert.Equal(t, 13*time.Second, cfg.MetadataRefreshInterval)
+	assert.Equal(t, 7*time.Second, cfg.OnDemandMetadataRefreshInterval)
 }
 
 func TestOptions_UnsetFieldKeepsDefault(t *testing.T) {
