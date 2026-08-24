@@ -312,3 +312,25 @@ func TestNewMultiRoutedEncodedTopicPartitionRecords(t *testing.T) {
 		}
 	})
 }
+
+func TestAgentFromRouted(t *testing.T) {
+	t.Run("all healthy is healthy", func(t *testing.T) {
+		got := agentFromRouted(5, []routedEncodedTopicPartitionRecords{
+			{nodeID: 5, nodeState: AgentStateHealthy},
+			{nodeID: 5, nodeState: AgentStateHealthy},
+		})
+		assert.Equal(t, Agent{NodeID: 5, State: AgentStateHealthy}, got)
+	})
+
+	t.Run("any demoted contribution is a probe", func(t *testing.T) {
+		got := agentFromRouted(5, []routedEncodedTopicPartitionRecords{
+			{nodeID: 5, nodeState: AgentStateHealthy},
+			{nodeID: 5, nodeState: AgentStateDemoted},
+		})
+		assert.Equal(t, Agent{NodeID: 5, State: AgentStateDemoted}, got)
+	})
+
+	t.Run("empty parts is healthy", func(t *testing.T) {
+		assert.Equal(t, Agent{NodeID: 9}, agentFromRouted(9, nil))
+	})
+}

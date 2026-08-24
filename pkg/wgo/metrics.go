@@ -1,7 +1,10 @@
 package wgo
 
 import (
+	"math"
 	"regexp"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,7 +29,7 @@ type metrics struct {
 
 	lingerFlushesTotal prometheus.Counter
 
-	produceDirectRequestsTotal         prometheus.Counter
+	produceDirectRequestsTotal         *prometheus.CounterVec
 	produceDirectRequestsFailedTotal   *prometheus.CounterVec
 	produceRequestsAttemptsSuccess     prometheus.Observer
 	produceRequestsAttemptsFailure     prometheus.Observer
@@ -41,6 +44,17 @@ type metrics struct {
 	produceRecordsTotal         prometheus.Counter
 	produceRecordsFailedTotal   prometheus.Counter
 	produceRecordsRejectedTotal *prometheus.CounterVec
+
+	metadataRefreshResultsTotal *prometheus.CounterVec
+
+	clusterStatsAvailable      prometheus.Gauge
+	clusterBaselineLatency     prometheus.Gauge
+	clusterSlowFraction        prometheus.Gauge
+	clusterSlowContributors    prometheus.Gauge
+	clusterFaultyFraction      prometheus.Gauge
+	clusterFaultyContributors  prometheus.Gauge
+	clusterAvgRequestsPerAgent prometheus.Gauge
+	clusterStatsLastObserved   prometheus.Gauge
 
 	// Producer-state metrics under franz-go/kprom-compatible names.
 	produceWireRecordsTotal         prometheus.Counter
@@ -65,6 +79,27 @@ const (
 	produceRejectedNoAgentAssigned = "no_agent_assigned"
 )
 
+const (
+	agentStateHealthy = "healthy"
+	agentStateDemoted = "demoted"
+)
+
+const (
+	metadataRefreshTriggerPeriodic = "periodic"
+	metadataRefreshTriggerOnDemand = "on_demand"
+
+	metadataRefreshResultMembershipChanged = "membership_changed"
+	metadataRefreshResultUnchanged         = "unchanged"
+	metadataRefreshResultFailed            = "failed"
+)
+
+func agentStateLabel(state AgentState) string {
+	if state == AgentStateDemoted {
+		return agentStateDemoted
+	}
+	return agentStateHealthy
+}
+
 func newMetrics(reg prometheus.Registerer) *metrics {
 	// On failures the latency carries a "reason" label; on success the
 	// reason is left empty, which Prometheus treats as the label being
@@ -86,7 +121,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"outcome"})
 
-	return &metrics{
+	m := &metrics{
 		hedgeAttemptsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_hedge_attempts_total",
 			Help: "Total number of produce requests for which a fanout to per-partition secondaries was attempted. Includes both latency-triggered hedges (primary still in flight) and primary-failure retries.",
@@ -103,10 +138,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "warpstream_linger_flushes_total",
 			Help: "Total number of partition batch flushes triggered by the linger buffer.",
 		}),
-		produceDirectRequestsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		produceDirectRequestsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_total",
-			Help: "Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.",
-		}),
+			Help: "Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.",
+		}, []string{"agent_state"}),
 		produceRequestsPrimaryTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_requests_primary_total",
 			Help: "Total number of primary Produce wire requests.",
@@ -117,8 +152,8 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		produceDirectRequestsFailedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_failed_total",
-			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.",
-		}, []string{"reason"}),
+			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.",
+		}, []string{"reason", "agent_state"}),
 		produceRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_records_total",
 			Help: "Total number of records submitted to the client via Produce and ProduceSync.",
@@ -131,6 +166,42 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "warpstream_produce_records_rejected_total",
 			Help: "Total number of records rejected by the client before any wire dispatch, by reason (record_too_large, no_agent_assigned).",
 		}, []string{"reason"}),
+		metadataRefreshResultsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "warpstream_metadata_refresh_results_total",
+			Help: "Total number of live AgentPool Metadata refreshes, by trigger (periodic, on_demand) and result (membership_changed, unchanged, failed). membership_changed is the sorted Agent NodeID set only; leader-only or topic-only updates are unchanged. The constructor Refresh is not counted.",
+		}, []string{"trigger", "result"}),
+		clusterStatsAvailable: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_stats_available",
+			Help: "Whether the last Hedger/Demoter ClusterStats read returned a usable cluster view (1) or not (0). 0 also before the first read.",
+		}),
+		clusterBaselineLatency: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_baseline_latency_seconds",
+			Help: "Unweighted mean successful-request latency across qualifying agents from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterSlowFraction: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_slow_fraction",
+			Help: "Fraction of agents classified slow from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterSlowContributors: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_slow_contributors",
+			Help: "Number of agents that contributed to SlowFraction from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterFaultyFraction: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_faulty_fraction",
+			Help: "Fraction of agents classified faulty from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterFaultyContributors: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_faulty_contributors",
+			Help: "Number of agents that contributed to FaultyFraction from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterAvgRequestsPerAgent: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_avg_requests_per_agent",
+			Help: "Average request count per agent from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+		}),
+		clusterStatsLastObserved: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_cluster_stats_last_observed_timestamp_seconds",
+			Help: "Unix timestamp in seconds of the last Hedger/Demoter ClusterStats read. Still set when that read had no view. NaN until the first read.",
+		}),
 		produceWireRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "produce_records_total",
 			Help: "Total number of records written to the wire. Only successful produce requests are counted.",
@@ -152,6 +223,61 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		produceDirectRequestLatencySuccess: produceDirectRequestLatency.WithLabelValues("success", ""),
 		produceDirectRequestLatencyFailure: produceDirectRequestLatency.MustCurryWith(prometheus.Labels{"outcome": "failure"}),
 	}
+	m.resetClusterStats()
+	// lastObserved stays NaN until the first policy read. resetClusterStats
+	// does not touch it: "no view" is still a read.
+	m.clusterStatsLastObserved.Set(math.NaN())
+	return m
+}
+
+// observeMetadataRefresh records one refresh. Membership is the sorted Agent
+// NodeID list; leader-only Metadata changes count as unchanged.
+func (m *metrics) observeMetadataRefresh(trigger string, before, after []int32, err error) {
+	result := metadataRefreshResultUnchanged
+	switch {
+	case err != nil:
+		result = metadataRefreshResultFailed
+	case !slices.Equal(before, after):
+		result = metadataRefreshResultMembershipChanged
+	}
+	m.metadataRefreshResultsTotal.WithLabelValues(trigger, result).Inc()
+}
+
+// observeClusterStats snapshots the ClusterStats value a policy read just
+// used. Written here, not on scrape, so the gauges match Hedger/Demoter.
+func (m *metrics) observeClusterStats(now time.Time, stats ClusterStats, ok bool) {
+	if m == nil {
+		return
+	}
+	if !ok {
+		m.resetClusterStats()
+	} else {
+		m.clusterStatsAvailable.Set(1)
+		m.clusterBaselineLatency.Set(stats.BaselineLatency.Seconds())
+		m.clusterSlowFraction.Set(stats.SlowFraction)
+		m.clusterSlowContributors.Set(float64(stats.SlowContributorsCount))
+		m.clusterFaultyFraction.Set(stats.FaultyFraction)
+		m.clusterFaultyContributors.Set(float64(stats.FaultyContributorsCount))
+		m.clusterAvgRequestsPerAgent.Set(float64(stats.AvgRequestsPerAgent))
+	}
+	m.clusterStatsLastObserved.Set(float64(now.Unix()))
+}
+
+// resetClusterStats marks the cluster view unavailable. Value gauges are NaN
+// so a real 0 baseline/fraction is distinct from "we have no stats".
+// lastObserved is left alone: NaN means never read, not "this read had no view".
+func (m *metrics) resetClusterStats() {
+	m.clusterStatsAvailable.Set(0)
+	m.clusterBaselineLatency.Set(math.NaN())
+	m.clusterSlowFraction.Set(math.NaN())
+	m.clusterSlowContributors.Set(math.NaN())
+	m.clusterFaultyFraction.Set(math.NaN())
+	m.clusterFaultyContributors.Set(math.NaN())
+	m.clusterAvgRequestsPerAgent.Set(math.NaN())
+}
+
+func nodeIDLabel(id int32) string {
+	return strconv.FormatInt(int64(id), 10)
 }
 
 // kpromProducerStateMetricNames are the kprom metric names this client tracks

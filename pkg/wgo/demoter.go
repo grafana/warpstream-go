@@ -11,8 +11,8 @@ import (
 )
 
 // demotionSuppressionReason is why demotion is suppressed. Its string value is
-// the metric label exposed by demotionSuppressedMetric; the empty value means
-// demotion is not suppressed.
+// the metric label exposed by warpstream_demoter_demotion_suppressed; the empty
+// value means demotion is not suppressed.
 type demotionSuppressionReason string
 
 const (
@@ -106,10 +106,14 @@ type Demoter struct {
 	// Refresh prunes entries for agents no longer in the pool.
 	lastDemotedProbeMu sync.Mutex
 	lastDemotedProbe   map[int32]time.Time
+
+	metrics *metrics
+
+	transitionsTotal *prometheus.CounterVec
 }
 
 // NewDemoter wraps inner with the demotion policy described on Demoter.
-func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig, logger kgo.Logger, reg prometheus.Registerer) *Demoter {
+func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig, logger kgo.Logger, reg prometheus.Registerer, m *metrics, agents func() []int32) *Demoter {
 	if logger == nil {
 		logger = nopLogger{}
 	}
@@ -121,13 +125,18 @@ func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, hea
 		logger:           logger,
 		now:              time.Now,
 		lastDemotedProbe: make(map[int32]time.Time),
+		metrics:          m,
+		transitionsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "warpstream_demoter_transitions_total",
+			Help: "Total number of Demoter state edges, by transition (demoted or restored). Dropping a departed agent is not a restore.",
+		}, []string{"transition"}),
 	}
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "warpstream_demoter_demoted_agents",
 		Help: "Number of Warpstream agents currently demoted by the Demoter.",
 	}, d.demotedAgentsCount)
-	newDemotionSuppressedMetric(d, reg)
+	newDemoterCollector(d, reg, agents)
 
 	return d
 }
@@ -148,6 +157,9 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	// SlowMultiplier keeps the cache key aligned with the Hedger.
 	now := d.now()
 	clusterStats, hasClusterStats := d.tracker.ClusterStats(now, d.healthCfg.SlowMultiplier, d.healthCfg.FaultyThreshold)
+	if d.metrics != nil {
+		d.metrics.observeClusterStats(now, clusterStats, hasClusterStats)
+	}
 	if suppressed, _ := d.isDemotionSuppressed(clusterStats, hasClusterStats); suppressed {
 		return d.inner.Candidates(topic, partition, maxCandidates)
 	}
@@ -292,9 +304,11 @@ func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterSta
 
 	switch {
 	case demoted:
+		d.transitionsTotal.WithLabelValues("demoted").Inc()
 		log(d.logger, kgo.LogLevelInfo, "warpstream agent demoted", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
 	case restored:
-		log(d.logger, kgo.LogLevelInfo, "warpstream agent restored", "node_id", nodeID)
+		d.transitionsTotal.WithLabelValues("restored").Inc()
+		log(d.logger, kgo.LogLevelInfo, "warpstream agent restored", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
 	}
 
 	return isFaulty
@@ -365,24 +379,33 @@ func (d *Demoter) shouldProbe(now time.Time, nodeID int32) bool {
 	return true
 }
 
-// demotionSuppressedMetric is a prometheus.Collector that exposes
-// demoter_demotion_suppressed, one series per suppression reason. It takes a
-// single ClusterStats snapshot per scrape and sets at most one series to 1 (the
-// active reason); all others are 0, so the breakdown is always mutually
-// consistent and no series is ever missing. sum() over the series reproduces the
-// plain "is demotion suppressed" 0/1 signal.
-type demotionSuppressedMetric struct {
-	d    *Demoter
-	desc *prometheus.Desc
+// demoterCollector exposes demotion_suppressed (one series per reason; at most
+// one is 1) and agent_demoted (0/1 per current pool Agent) from one
+// ClusterStats snapshot so the two cannot disagree mid-scrape. Collect must
+// not call Candidates, shouldProbe, or observeClusterStats (those are
+// policy-path; observe would stamp the cluster gauges at scrape time).
+// During suppression every agent_demoted series is 0, matching
+// demotedAgentsCount. A nil agents callback emits no agent_demoted series.
+type demoterCollector struct {
+	d                *Demoter
+	agents           func() []int32
+	suppressedDesc   *prometheus.Desc
+	agentDemotedDesc *prometheus.Desc
 }
 
-func newDemotionSuppressedMetric(d *Demoter, reg prometheus.Registerer) *demotionSuppressedMetric {
-	m := &demotionSuppressedMetric{
-		d: d,
-		desc: prometheus.NewDesc(
+func newDemoterCollector(d *Demoter, reg prometheus.Registerer, agents func() []int32) *demoterCollector {
+	m := &demoterCollector{
+		d:      d,
+		agents: agents,
+		suppressedDesc: prometheus.NewDesc(
 			"warpstream_demoter_demotion_suppressed",
 			"Whether the Demoter is currently suppressing all demotions (1) and why, broken down by reason; 0 for inactive reasons.",
 			[]string{"reason"}, nil,
+		),
+		agentDemotedDesc: prometheus.NewDesc(
+			"warpstream_agent_demoted",
+			"Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.",
+			[]string{"node_id"}, nil,
 		),
 	}
 	if reg != nil {
@@ -391,13 +414,14 @@ func newDemotionSuppressedMetric(d *Demoter, reg prometheus.Registerer) *demotio
 	return m
 }
 
-func (m *demotionSuppressedMetric) Describe(ch chan<- *prometheus.Desc) {
-	ch <- m.desc
+func (m *demoterCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- m.suppressedDesc
+	ch <- m.agentDemotedDesc
 }
 
-func (m *demotionSuppressedMetric) Collect(ch chan<- prometheus.Metric) {
+func (m *demoterCollector) Collect(ch chan<- prometheus.Metric) {
 	clusterStats, hasClusterStats := m.d.tracker.ClusterStats(m.d.now(), m.d.healthCfg.SlowMultiplier, m.d.healthCfg.FaultyThreshold)
-	_, actualReason := m.d.isDemotionSuppressed(clusterStats, hasClusterStats)
+	suppressed, actualReason := m.d.isDemotionSuppressed(clusterStats, hasClusterStats)
 
 	for _, reason := range []demotionSuppressionReason{
 		demotionSuppressedNoClusterStats,
@@ -408,6 +432,27 @@ func (m *demotionSuppressedMetric) Collect(ch chan<- prometheus.Metric) {
 		if reason == actualReason {
 			value = 1
 		}
-		ch <- prometheus.MustNewConstMetric(m.desc, prometheus.GaugeValue, value, string(reason))
+		ch <- prometheus.MustNewConstMetric(m.suppressedDesc, prometheus.GaugeValue, value, string(reason))
+	}
+
+	if m.agents == nil {
+		return
+	}
+	agents := m.agents()
+	m.d.lastDemotedProbeMu.Lock()
+	demoted := make(map[int32]struct{}, len(m.d.lastDemotedProbe))
+	for id := range m.d.lastDemotedProbe {
+		demoted[id] = struct{}{}
+	}
+	m.d.lastDemotedProbeMu.Unlock()
+
+	for _, id := range agents {
+		value := 0.0
+		if !suppressed {
+			if _, ok := demoted[id]; ok {
+				value = 1
+			}
+		}
+		ch <- prometheus.MustNewConstMetric(m.agentDemotedDesc, prometheus.GaugeValue, value, nodeIDLabel(id))
 	}
 }

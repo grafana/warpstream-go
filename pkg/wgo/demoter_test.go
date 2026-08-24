@@ -18,7 +18,7 @@ import (
 // be asserted) and a no-op logger.
 func newTestDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig) (*Demoter, *prometheus.Registry) {
 	reg := prometheus.NewPedanticRegistry()
-	return NewDemoter(inner, tracker, health, cfg, nil, reg), reg
+	return NewDemoter(inner, tracker, health, cfg, nil, reg, nil, nil), reg
 }
 
 func TestDemoter_Candidates(t *testing.T) {
@@ -79,7 +79,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 	})
 
 	t.Run("demoted primary is skipped on first call within probe interval and emitted as probe on first call after interval", func(t *testing.T) {
@@ -112,7 +112,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 
 		// Second call inside the probe interval: skip the demoted primary,
 		// surface the healthy secondary as the new primary.
@@ -158,7 +158,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 	})
 
 	t.Run("max faulty fraction guard suppresses demotion when too many agents are faulty", func(t *testing.T) {
@@ -196,7 +196,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 1
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 	})
 
 	t.Run("max faulty fraction guard reports many_faulty_agents in a larger cluster", func(t *testing.T) {
@@ -280,7 +280,9 @@ func TestDemoter_Candidates(t *testing.T) {
 		inner := &mockPartitionAssignmentStrategy{
 			candidates: map[partitionKey][]Agent{{topic, part}: healthyAgents(slowID, healthyID)},
 		}
-		d, reg := newTestDemoter(inner, tr, health, cfg)
+		pool := []int32{healthyID, slowID, extraID, 4, 5}
+		reg := prometheus.NewPedanticRegistry()
+		d := NewDemoter(inner, tr, health, cfg, nil, reg, nil, func() []int32 { return pool })
 		d.now = func() time.Time { return time.Now() }
 
 		// 1 of 5 faulty (0.2) is below the floor (max(0.3, 1/5)=0.3), so slowID
@@ -299,11 +301,19 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+
+			# HELP warpstream_agent_demoted Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.
+			# TYPE warpstream_agent_demoted gauge
+			warpstream_agent_demoted{node_id="1"} 0
+			warpstream_agent_demoted{node_id="2"} 1
+			warpstream_agent_demoted{node_id="3"} 0
+			warpstream_agent_demoted{node_id="4"} 0
+			warpstream_agent_demoted{node_id="5"} 0
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed", "warpstream_agent_demoted"))
 
 		// A second agent turns faulty → 2 of 5 (0.4) exceeds the floor, so
-		// demotion is suppressed. slowID is still in lastDemotedProbe, but the
-		// gauge must read 0 because no demotion is in effect.
+		// demotion is suppressed. slowID is still in lastDemotedProbe, but both
+		// gauges must read 0 because no demotion is in effect.
 		seedFullWindow(tr, 5, nowNs, 10, 10, 10)
 		require.Len(t, d.lastDemotedProbe, 1)
 		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
@@ -316,7 +326,15 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 1
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+
+			# HELP warpstream_agent_demoted Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.
+			# TYPE warpstream_agent_demoted gauge
+			warpstream_agent_demoted{node_id="1"} 0
+			warpstream_agent_demoted{node_id="2"} 0
+			warpstream_agent_demoted{node_id="3"} 0
+			warpstream_agent_demoted{node_id="4"} 0
+			warpstream_agent_demoted{node_id="5"} 0
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed", "warpstream_agent_demoted"))
 	})
 
 	t.Run("cold start (no cluster stats): nothing is demoted", func(t *testing.T) {
@@ -346,7 +364,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 1
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 	})
 
 	t.Run("low cluster volume: faulty agent below base requests is still demoted", func(t *testing.T) {
@@ -381,7 +399,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 	})
 
 	t.Run("high cluster volume: a low-volume faulty agent stays gated", func(t *testing.T) {
@@ -509,7 +527,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 
 		// Recovery: replace the stats with all-successful traffic.
 		// ErrorRate drops to 0 so isDemoted returns false; the recovery
@@ -530,7 +548,7 @@ func TestDemoter_Candidates(t *testing.T) {
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents"} 0
 			warpstream_demoter_demotion_suppressed{reason="many_faulty_agents_small_cluster"} 0
 			warpstream_demoter_demotion_suppressed{reason="no_cluster_stats"} 0
-		`)))
+		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 
 		// Now simulate a fresh sparse-failure window (RequestCount=6).
 		// Because the previous recovery cleared lastDemotedProbe, the
@@ -719,7 +737,7 @@ func TestDemoter_Candidates(t *testing.T) {
 		inner := &mockPartitionAssignmentStrategy{
 			candidates: map[partitionKey][]Agent{{topic, part}: healthyAgents(slowID, healthyID)},
 		}
-		d := NewDemoter(inner, tr, health, cfg, logger, reg)
+		d := NewDemoter(inner, tr, health, cfg, logger, reg, nil, nil)
 		now := time.Now()
 		d.now = func() time.Time { return now }
 
@@ -744,6 +762,10 @@ func TestDemoter_Candidates(t *testing.T) {
 		restoreLog := buf.String()
 		assert.Contains(t, restoreLog, "warpstream agent restored")
 		assert.Contains(t, restoreLog, "node_id: "+strconv.Itoa(int(slowID)))
+		assert.Contains(t, restoreLog, "error_rate: ")
+		assert.Contains(t, restoreLog, "request_count: ")
+		assert.Contains(t, restoreLog, "min_requests: ")
+		assert.Contains(t, restoreLog, "faulty_threshold: ")
 	})
 }
 
@@ -872,6 +894,146 @@ func BenchmarkDemoter_Candidates(b *testing.B) {
 			})
 		})
 	}
+}
+
+func BenchmarkDemoter_Collect(b *testing.B) {
+	health := HealthCheckConfig{
+		SlowMultiplier:    2.0,
+		MaxSlowFraction:   0.3,
+		FaultyThreshold:   0.05,
+		MaxFaultyFraction: 0.3,
+	}
+	cfg := DemoterConfig{ProbeInterval: time.Second}
+
+	for _, n := range []int{10, 100, 1000} {
+		b.Run("agents="+strconv.Itoa(n), func(b *testing.B) {
+			ids := make([]int32, n)
+			for i := range ids {
+				ids[i] = int32(i)
+			}
+			reg := prometheus.NewPedanticRegistry()
+			d := NewDemoter(&mockPartitionAssignmentStrategy{}, NewAverageAgentStatsTracker(), health, cfg, nil, reg, nil, func() []int32 {
+				return ids
+			})
+			now := time.Now()
+			d.now = func() time.Time { return now }
+			d.lastDemotedProbeMu.Lock()
+			for i := 0; i < n; i += 4 {
+				id := int32(i)
+				d.lastDemotedProbe[id] = now
+			}
+			d.lastDemotedProbeMu.Unlock()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := reg.Gather(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestDemoter_AgentDemotedMetric(t *testing.T) {
+	const (
+		healthyID = int32(1)
+		slowID    = int32(2)
+	)
+	topic := "t"
+	part := int32(0)
+	health := HealthCheckConfig{
+		SlowMultiplier:    2.0,
+		MaxSlowFraction:   0.3,
+		FaultyThreshold:   0.05,
+		MaxFaultyFraction: 0.3,
+	}
+	cfg := DemoterConfig{ProbeInterval: time.Second}
+
+	tr := NewAverageAgentStatsTracker()
+	nowNs := time.Now().UnixNano()
+	seedFullWindow(tr, healthyID, nowNs, 20, 10, 0)
+	seedFullWindow(tr, slowID, nowNs, 10, 10, 10)
+
+	inner := &mockPartitionAssignmentStrategy{
+		candidates: map[partitionKey][]Agent{{topic, part}: healthyAgents(slowID, healthyID)},
+	}
+	reg := prometheus.NewPedanticRegistry()
+	d := NewDemoter(inner, tr, health, cfg, nil, reg, nil, func() []int32 {
+		return []int32{healthyID, slowID}
+	})
+	now := time.Now()
+	d.now = func() time.Time { return now }
+
+	d.Candidates(topic, part, 2)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_agent_demoted Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.
+		# TYPE warpstream_agent_demoted gauge
+		warpstream_agent_demoted{node_id="1"} 0
+		warpstream_agent_demoted{node_id="2"} 1
+		# HELP warpstream_demoter_transitions_total Total number of Demoter state edges, by transition (demoted or restored). Dropping a departed agent is not a restore.
+		# TYPE warpstream_demoter_transitions_total counter
+		warpstream_demoter_transitions_total{transition="demoted"} 1
+	`), "warpstream_agent_demoted", "warpstream_demoter_transitions_total"))
+
+	seedFullWindow(tr, slowID, nowNs, 20, 10, 0)
+	now = now.Add(cfg.ProbeInterval + time.Millisecond)
+	d.Candidates(topic, part, 2)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_agent_demoted Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.
+		# TYPE warpstream_agent_demoted gauge
+		warpstream_agent_demoted{node_id="1"} 0
+		warpstream_agent_demoted{node_id="2"} 0
+		# HELP warpstream_demoter_transitions_total Total number of Demoter state edges, by transition (demoted or restored). Dropping a departed agent is not a restore.
+		# TYPE warpstream_demoter_transitions_total counter
+		warpstream_demoter_transitions_total{transition="demoted"} 1
+		warpstream_demoter_transitions_total{transition="restored"} 1
+	`), "warpstream_agent_demoted", "warpstream_demoter_transitions_total"))
+}
+
+func TestDemoter_RefreshDoesNotCountRestored(t *testing.T) {
+	const (
+		healthyID = int32(1)
+		slowID    = int32(2)
+	)
+	topic := "t"
+	part := int32(0)
+	health := HealthCheckConfig{
+		SlowMultiplier:    2.0,
+		MaxSlowFraction:   0.3,
+		FaultyThreshold:   0.05,
+		MaxFaultyFraction: 0.3,
+	}
+	cfg := DemoterConfig{ProbeInterval: time.Second}
+
+	tr := NewAverageAgentStatsTracker()
+	nowNs := time.Now().UnixNano()
+	seedFullWindow(tr, healthyID, nowNs, 20, 10, 0)
+	seedFullWindow(tr, slowID, nowNs, 10, 10, 10)
+
+	inner := &mockPartitionAssignmentStrategy{
+		candidates: map[partitionKey][]Agent{{topic, part}: healthyAgents(slowID, healthyID)},
+	}
+	reg := prometheus.NewPedanticRegistry()
+	d := NewDemoter(inner, tr, health, cfg, nil, reg, nil, func() []int32 {
+		return []int32{healthyID}
+	})
+	now := time.Now()
+	d.now = func() time.Time { return now }
+
+	d.Candidates(topic, part, 2)
+	d.Refresh([]int32{healthyID})
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_agent_demoted Whether this client currently routes around the Agent (1) or treats it as eligible for normal routing (0), by Kafka node_id.
+		# TYPE warpstream_agent_demoted gauge
+		warpstream_agent_demoted{node_id="1"} 0
+		# HELP warpstream_demoter_transitions_total Total number of Demoter state edges, by transition (demoted or restored). Dropping a departed agent is not a restore.
+		# TYPE warpstream_demoter_transitions_total counter
+		warpstream_demoter_transitions_total{transition="demoted"} 1
+	`), "warpstream_agent_demoted", "warpstream_demoter_transitions_total"))
 }
 
 func TestDemoterConfig_Validate(t *testing.T) {

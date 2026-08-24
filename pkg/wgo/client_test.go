@@ -3,6 +3,7 @@ package wgo
 import (
 	"bytes"
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1196,7 +1197,15 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 
 	t.Run("CreateTopics is visible on the next produce after a routing miss", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			reg := prometheus.NewPedanticRegistry()
+			vnet := &kfake.VirtualNetwork{}
+			_, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			assert.Equal(t, 0, testutil.CollectAndCount(reg, "warpstream_metadata_refresh_results_total"))
+
 			const newTopic = "created-after-start"
 
 			createReq := kmsg.NewPtrCreateTopicsRequest()
@@ -1205,7 +1214,7 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 				NumPartitions:     1,
 				ReplicationFactor: 1,
 			}}
-			_, err := c.Request(t.Context(), createReq)
+			_, err = c.Request(t.Context(), createReq)
 			require.NoError(t, err)
 
 			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
@@ -1218,11 +1227,41 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 
 			synctest.Wait()
 
+			// New topic, same Agent NodeIDs: on_demand is unchanged, not
+			// membership_changed. Constructor Refresh is not counted.
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				metadataRefreshTriggerOnDemand, metadataRefreshResultUnchanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				metadataRefreshTriggerOnDemand, metadataRefreshResultMembershipChanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+
 			second := c.ProduceSync(t.Context(), []*kgo.Record{
 				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
 			})
 			require.Len(t, second, 1)
 			require.NoError(t, second[0].Err)
+		})
+	})
+
+	t.Run("periodic refresh records periodic unchanged", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			reg := prometheus.NewPedanticRegistry()
+			vnet := &kfake.VirtualNetwork{}
+			_, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			assert.Equal(t, 0, testutil.CollectAndCount(reg, "warpstream_metadata_refresh_results_total"))
+
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				metadataRefreshTriggerOnDemand, metadataRefreshResultUnchanged)))
 		})
 	})
 
@@ -1270,6 +1309,28 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 			synctest.Wait()
 			c.Close()
 		})
+	})
+}
+
+func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reg := prometheus.NewPedanticRegistry()
+		vnet := &kfake.VirtualNetwork{}
+		_, clusterAddr := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithVirtualNetwork(vnet))
+		c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, "test-topic"), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
+		require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds")))
+
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+
+		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+			metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
+		require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds")))
 	})
 }
 
