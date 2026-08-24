@@ -21,8 +21,8 @@ github.com/pierrec/lz4/v4 v4.1.27 h1:+PhzhWDrjRj89TH2sw43nE3+4+W8lSxIuQadEHZyjUk
 github.com/pierrec/lz4/v4 v4.1.27/go.mod h1:EoQMVJgeeEOMsCqCzqFm2O0cJvljX2nGZjcRIPL34O4=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7 h1:+nEyfIfB52zLe8Zv35Ej6Cz+aEOmf+hjMZ7cnq2T04I=
-github.com/pracucci/franz-go v0.0.0-20260713145905-fb26a76eebf7/go.mod h1:rfoMTnVk7107fhTGxfEKIHP/e7tPe6oyij/ywzO0czk=
+github.com/pracucci/franz-go v0.0.0-20260824143212-8eebda43e6cf h1:uXmy0PuSOGpC6ANLsd4YTIsSsh07m5qQTQdaLwfdTIc=
+github.com/pracucci/franz-go v0.0.0-20260824143212-8eebda43e6cf/go.mod h1:rfoMTnVk7107fhTGxfEKIHP/e7tPe6oyij/ywzO0czk=
 github.com/prometheus/client_golang v1.23.3-0.20260305100053-48a6770e980b h1:NyQNLfZ2oifzWKxeduo+EYnJqJ7OgA57xxpon3+Tj5k=
 github.com/prometheus/client_golang v1.23.3-0.20260305100053-48a6770e980b/go.mod h1:zvD2wRMY/EYjQFDD/6wqMYRKmulpj/3vPQQyKKoDZkM=
 github.com/prometheus/client_model v0.6.2 h1:oBsgwpGs7iVziMvrGhE53c/GrLUsZdHnqNwqPLxwZyk=

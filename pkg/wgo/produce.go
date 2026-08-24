@@ -89,9 +89,12 @@ func setProducedRecordFields(r *kgo.Record) {
 // producedRecordAttrs returns the Attrs to set on a record of a successfully
 // produced (topic, partition).
 func producedRecordAttrs(res ProduceResult, topic string, partition int32) kgo.RecordAttrs {
-	// The timestamp type is always CreateTime here: this client never sets the
-	// LogAppendTime bit when encoding, so the type is 0 by construction.
-	return kgo.NewRecordAttrs(res.compressionTypes[topicPartition{topic: topic, partition: partition}], 0, false, false)
+	// Only the codec varies: this client never sets the LogAppendTime bit when
+	// encoding, so the zero-value TimestampType (CreateTime) is correct, and it
+	// is never transactional or a control record.
+	return kgo.NewRecordAttrs(kgo.RecordAttrsOpts{
+		Codec: kgo.CompressionCodecType(res.compressionTypes[topicPartition{topic: topic, partition: partition}]),
+	})
 }
 
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
