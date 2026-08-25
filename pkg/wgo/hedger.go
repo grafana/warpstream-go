@@ -97,6 +97,8 @@ func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy Partitio
 		// incremented in ProduceSync.
 		m.produceRequestsHedgeTotal.Inc()
 
+		// DirectProducer takes unrouted partitions (the target Agent is specified
+		// separately), so we strip the routing.
 		return inner.ProduceSync(ctx, agentFromRouted(nodeID, parts), unrouteEncodedTopicPartitionRecords(parts))
 	}, m, nil) // nil reg: the client's main buffer owns the buffered-producer gauges.
 	return h
@@ -139,9 +141,9 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	// Check the hedging delay to apply to this request.
 	delay, shouldHedge := h.shouldHedge(time.Now(), primaryID, routedPartitions)
 
-	// Strip nodeID/nodeState from the batches. ProduceSync takes destination
-	// as Agent; these same bytes may later go to a different agent on hedge
-	// or retry, so they must not keep the primary's routing.
+	// The rest of the Hedger works with unrouted partitions, because it will be
+	// responsible to route partitions to other candidate agents during hedging
+	// and retries.
 	partitions := unrouteEncodedTopicPartitionRecords(routedPartitions)
 
 	// workCtx scopes both the primary and any hedge waves to this single
@@ -403,7 +405,6 @@ func (h *Hedger) shouldHedge(now time.Time, primaryID int32, partitions []routed
 	}
 
 	clusterStats, hasClusterStats := h.tracker.ClusterStats(now, h.health.SlowMultiplier, h.health.FaultyThreshold)
-	h.metrics.observeClusterStats(now, clusterStats, hasClusterStats)
 	if !hasClusterStats {
 		h.metrics.hedgeAttemptsSuppressedTotal.WithLabelValues(hedgeSuppressedNoClusterStats).Inc()
 		return 0, false

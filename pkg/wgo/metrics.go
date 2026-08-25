@@ -1,10 +1,8 @@
 package wgo
 
 import (
-	"math"
 	"regexp"
 	"slices"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,14 +45,11 @@ type metrics struct {
 
 	metadataRefreshResultsTotal *prometheus.CounterVec
 
-	clusterStatsAvailable      prometheus.Gauge
-	clusterBaselineLatency     prometheus.Gauge
-	clusterSlowFraction        prometheus.Gauge
-	clusterSlowContributors    prometheus.Gauge
-	clusterFaultyFraction      prometheus.Gauge
-	clusterFaultyContributors  prometheus.Gauge
-	clusterAvgRequestsPerAgent prometheus.Gauge
-	clusterStatsLastObserved   prometheus.Gauge
+	clusterStatsAvailable     prometheus.Gauge
+	clusterSlowFraction       prometheus.Gauge
+	clusterSlowContributors   prometheus.Gauge
+	clusterFaultyFraction     prometheus.Gauge
+	clusterFaultyContributors prometheus.Gauge
 
 	// Producer-state metrics under franz-go/kprom-compatible names.
 	produceWireRecordsTotal         prometheus.Counter
@@ -121,7 +116,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"outcome"})
 
-	m := &metrics{
+	return &metrics{
 		hedgeAttemptsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_hedge_attempts_total",
 			Help: "Total number of produce requests for which a fanout to per-partition secondaries was attempted. Includes both latency-triggered hedges (primary still in flight) and primary-failure retries.",
@@ -172,35 +167,23 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}, []string{"trigger", "result"}),
 		clusterStatsAvailable: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_cluster_stats_available",
-			Help: "Whether the last Hedger/Demoter ClusterStats read returned a usable cluster view (1) or not (0). 0 also before the first read.",
-		}),
-		clusterBaselineLatency: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "warpstream_cluster_baseline_latency_seconds",
-			Help: "Unweighted mean successful-request latency across qualifying agents from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+			Help: "Whether the last ClusterStats compute returned a usable cluster view (1) or not (0). 0 until the first compute. While this is 0 the other warpstream_cluster_ gauges hold their last successful values.",
 		}),
 		clusterSlowFraction: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_cluster_slow_fraction",
-			Help: "Fraction of agents classified slow from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+			Help: "Fraction of agents classified slow from the last successful ClusterStats compute, the value the Hedger's slow-fraction suppression gate is tested against. Held when a later compute has no view (see warpstream_cluster_stats_available). 0 until the first successful compute.",
 		}),
 		clusterSlowContributors: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_cluster_slow_contributors",
-			Help: "Number of agents that contributed to SlowFraction from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+			Help: "Denominator of warpstream_cluster_slow_fraction: agents with a measurable latency in the stats window. Held when a later compute has no view (see warpstream_cluster_stats_available). 0 until the first successful compute.",
 		}),
 		clusterFaultyFraction: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_cluster_faulty_fraction",
-			Help: "Fraction of agents classified faulty from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
+			Help: "Fraction of agents classified faulty from the last successful ClusterStats compute, the value the Demoter's suppression gate and the Hedger's faulty-fraction gate are tested against. Held when a later compute has no view (see warpstream_cluster_stats_available). 0 until the first successful compute.",
 		}),
 		clusterFaultyContributors: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_cluster_faulty_contributors",
-			Help: "Number of agents that contributed to FaultyFraction from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
-		}),
-		clusterAvgRequestsPerAgent: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "warpstream_cluster_avg_requests_per_agent",
-			Help: "Average request count per agent from the last Hedger/Demoter ClusterStats read. NaN when stats are unavailable.",
-		}),
-		clusterStatsLastObserved: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-			Name: "warpstream_cluster_stats_last_observed_timestamp_seconds",
-			Help: "Unix timestamp in seconds of the last Hedger/Demoter ClusterStats read. Still set when that read had no view. NaN until the first read.",
+			Help: "Denominator of warpstream_cluster_faulty_fraction: agents with any request tracked by this client in the stats window. Held when a later compute has no view (see warpstream_cluster_stats_available). 0 until the first successful compute.",
 		}),
 		produceWireRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "produce_records_total",
@@ -223,11 +206,6 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		produceDirectRequestLatencySuccess: produceDirectRequestLatency.WithLabelValues("success", ""),
 		produceDirectRequestLatencyFailure: produceDirectRequestLatency.MustCurryWith(prometheus.Labels{"outcome": "failure"}),
 	}
-	m.resetClusterStats()
-	// lastObserved stays NaN until the first policy read. resetClusterStats
-	// does not touch it: "no view" is still a read.
-	m.clusterStatsLastObserved.Set(math.NaN())
-	return m
 }
 
 // observeMetadataRefresh records one refresh. Membership is the sorted Agent
@@ -243,41 +221,22 @@ func (m *metrics) observeMetadataRefresh(trigger string, before, after []int32, 
 	m.metadataRefreshResultsTotal.WithLabelValues(trigger, result).Inc()
 }
 
-// observeClusterStats snapshots the ClusterStats value a policy read just
-// used. Written here, not on scrape, so the gauges match Hedger/Demoter.
-func (m *metrics) observeClusterStats(now time.Time, stats ClusterStats, ok bool) {
+// observeClusterStats records one ClusterStats compute. Without a view the
+// value gauges keep their last successful reading rather than a fake 0;
+// clusterStatsAvailable is what marks them stale.
+func (m *metrics) observeClusterStats(stats ClusterStats, ok bool) {
 	if m == nil {
 		return
 	}
 	if !ok {
-		m.resetClusterStats()
-	} else {
-		m.clusterStatsAvailable.Set(1)
-		m.clusterBaselineLatency.Set(stats.BaselineLatency.Seconds())
-		m.clusterSlowFraction.Set(stats.SlowFraction)
-		m.clusterSlowContributors.Set(float64(stats.SlowContributorsCount))
-		m.clusterFaultyFraction.Set(stats.FaultyFraction)
-		m.clusterFaultyContributors.Set(float64(stats.FaultyContributorsCount))
-		m.clusterAvgRequestsPerAgent.Set(float64(stats.AvgRequestsPerAgent))
+		m.clusterStatsAvailable.Set(0)
+		return
 	}
-	m.clusterStatsLastObserved.Set(float64(now.Unix()))
-}
-
-// resetClusterStats marks the cluster view unavailable. Value gauges are NaN
-// so a real 0 baseline/fraction is distinct from "we have no stats".
-// lastObserved is left alone: NaN means never read, not "this read had no view".
-func (m *metrics) resetClusterStats() {
-	m.clusterStatsAvailable.Set(0)
-	m.clusterBaselineLatency.Set(math.NaN())
-	m.clusterSlowFraction.Set(math.NaN())
-	m.clusterSlowContributors.Set(math.NaN())
-	m.clusterFaultyFraction.Set(math.NaN())
-	m.clusterFaultyContributors.Set(math.NaN())
-	m.clusterAvgRequestsPerAgent.Set(math.NaN())
-}
-
-func nodeIDLabel(id int32) string {
-	return strconv.FormatInt(int64(id), 10)
+	m.clusterStatsAvailable.Set(1)
+	m.clusterSlowFraction.Set(stats.SlowFraction)
+	m.clusterSlowContributors.Set(float64(stats.SlowContributorsCount))
+	m.clusterFaultyFraction.Set(stats.FaultyFraction)
+	m.clusterFaultyContributors.Set(float64(stats.FaultyContributorsCount))
 }
 
 // kpromProducerStateMetricNames are the kprom metric names this client tracks

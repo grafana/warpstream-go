@@ -3,7 +3,6 @@ package wgo
 import (
 	"bytes"
 	"context"
-	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1094,7 +1093,7 @@ func TestWarpstreamClient_ReusedPooledRecordsAreRaceFree(t *testing.T) {
 		// shouldHedge is not suppressed (no cold-start, no dependence on crossing a
 		// 10s bucket boundary). 1ms baseline keeps the hedge delay well below the
 		// slow agent's injected 10ms latency.
-		inner := c.tracker.inner.(*AverageAgentStatsTracker)
+		inner := c.tracker.inner.(*ObservedAgentStatsTracker).inner.(*AverageAgentStatsTracker)
 		nowNs := time.Now().UnixNano()
 		for _, nodeID := range c.pool.Agents() {
 			seedFullWindow(inner, nodeID, nowNs, 50, 1, 0)
@@ -1321,8 +1320,14 @@ func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(c.Close)
 
+		_, err = reg.Gather()
+		require.NoError(t, err)
+
 		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
-		require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds")))
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_fraction"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
 
 		time.Sleep(10 * time.Second)
 		synctest.Wait()
@@ -1330,7 +1335,6 @@ func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
 			metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
 		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
-		require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds")))
 	})
 }
 

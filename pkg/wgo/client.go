@@ -127,7 +127,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	}
 
 	innerTracker := NewAverageAgentStatsTracker()
-	tracker := NewCachedAgentStatsTracker(innerTracker, cfg.ClusterStatsTTL)
+	tracker := NewCachedAgentStatsTracker(NewObservedAgentStatsTracker(innerTracker, m), cfg.ClusterStatsTTL)
 
 	directProducer := NewKafkaDirectProducer(kgoClient, pool.TopicID, produceAPIVersion, cfg.DirectProducer, m)
 	// Tracker observes each per-attempt outcome directly. Cross-agent
@@ -154,7 +154,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	// agent-pool changes flow through transparently while the Demoter's
 	// per-agent probe-timing state persists across refreshes.
 	lazy := NewLazyPartitionAssignmentStrategy(pool.Strategy)
-	c.demoter = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg, m, pool.Agents)
+	c.demoter = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg)
 	c.hedger = NewHedger(trackingProducer, tracker, c.demoter, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.BatchMaxBytes, m)
 	// The cluster buffer's AgentFlushFunc is the Hedger, wrapped only to
 	// bound each flush by WriteTimeout. Hedger.ProduceSync still takes a

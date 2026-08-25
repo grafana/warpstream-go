@@ -1,10 +1,8 @@
 package wgo
 
 import (
-	"math"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -131,33 +129,32 @@ func TestMetrics_ObserveMetadataRefresh(t *testing.T) {
 func TestMetrics_ObserveClusterStats(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)
-	now := time.Unix(1_700_000_000, 0)
 
 	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
-	require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds")))
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_fraction"), 0)
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 0)
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
 
-	m.observeClusterStats(now, ClusterStats{
-		BaselineLatency:         1500 * time.Millisecond,
+	m.observeClusterStats(ClusterStats{
 		SlowFraction:            0.1,
 		SlowContributorsCount:   10,
 		FaultyFraction:          0.2,
 		FaultyContributorsCount: 5,
-		AvgRequestsPerAgent:     12,
 	}, true)
 
 	require.InDelta(t, 1.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
-	require.InDelta(t, 1.5, gaugeValue(t, reg, "warpstream_cluster_baseline_latency_seconds"), 1e-9)
 	require.InDelta(t, 0.1, gaugeValue(t, reg, "warpstream_cluster_slow_fraction"), 1e-9)
 	require.InDelta(t, 10, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
 	require.InDelta(t, 0.2, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 1e-9)
 	require.InDelta(t, 5, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
-	require.InDelta(t, 12, gaugeValue(t, reg, "warpstream_cluster_avg_requests_per_agent"), 0)
-	require.InDelta(t, float64(now.Unix()), gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds"), 0)
 
-	m.observeClusterStats(now.Add(time.Second), ClusterStats{}, false)
+	m.observeClusterStats(ClusterStats{}, false)
 	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
-	require.True(t, math.IsNaN(gaugeValue(t, reg, "warpstream_cluster_baseline_latency_seconds")))
-	require.InDelta(t, float64(now.Add(time.Second).Unix()), gaugeValue(t, reg, "warpstream_cluster_stats_last_observed_timestamp_seconds"), 0)
+	require.InDelta(t, 0.1, gaugeValue(t, reg, "warpstream_cluster_slow_fraction"), 1e-9)
+	require.InDelta(t, 10, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
+	require.InDelta(t, 0.2, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 1e-9)
+	require.InDelta(t, 5, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
 }
 
 func BenchmarkMetrics_DirectRequestAccounting(b *testing.B) {
@@ -178,28 +175,27 @@ func BenchmarkMetrics_DirectRequestAccounting(b *testing.B) {
 
 func BenchmarkMetrics_ObserveClusterStats(b *testing.B) {
 	m := newMetrics(prometheus.NewRegistry())
-	now := time.Now()
 	stats := ClusterStats{
-		BaselineLatency:         time.Millisecond,
 		SlowFraction:            0.1,
 		SlowContributorsCount:   10,
 		FaultyFraction:          0.05,
 		FaultyContributorsCount: 2,
-		AvgRequestsPerAgent:     20,
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.observeClusterStats(now, stats, i%8 != 0)
+		m.observeClusterStats(stats, i%8 != 0)
 	}
 }
 
 func BenchmarkMetrics_ClusterStatsCollect(b *testing.B) {
 	reg := prometheus.NewRegistry()
 	m := newMetrics(reg)
-	m.observeClusterStats(time.Now(), ClusterStats{
-		BaselineLatency:     time.Millisecond,
-		AvgRequestsPerAgent: 1,
+	m.observeClusterStats(ClusterStats{
+		SlowFraction:            0.1,
+		SlowContributorsCount:   10,
+		FaultyFraction:          0.05,
+		FaultyContributorsCount: 2,
 	}, true)
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -16,10 +16,11 @@ import (
 // already-encoded batches; upper layers just shuffle partition groups around.
 //
 // The signature takes bare encodedTopicPartitionRecords (without nodeID, done,
-// or nodeState) so the destination lives in exactly one place — target — and
-// the function cannot be called with a mismatched per-partition nodeID. target
-// is an Agent rather than a bare NodeID so routing-time State travels with the
-// attempt; State is not sent on the wire.
+// or nodeState) so the "which agent does this batch go to" decision lives
+// in exactly one place — the target parameter — and the function cannot
+// be called with a mismatched per-partition nodeID. target is an Agent rather
+// than a bare NodeID so routing-time State travels with the attempt; State is
+// not sent on the wire.
 type DirectProducer interface {
 	ProduceSync(ctx context.Context, target Agent, partitions []encodedTopicPartitionRecords) ProduceResult
 }

@@ -114,7 +114,7 @@ func (p routedEncodedTopicPartitionRecords) mergeWith(others []routedEncodedTopi
 }
 
 // unrouteEncodedTopicPartitionRecords returns the routing-less encodedTopicPartitionRecords view for
-// the DirectProducer chain, which takes the destination separately.
+// the DirectProducer chain, which takes the destination agent separately.
 func unrouteEncodedTopicPartitionRecords(parts []routedEncodedTopicPartitionRecords) []encodedTopicPartitionRecords {
 	out := make([]encodedTopicPartitionRecords, len(parts))
 	for i, p := range parts {
