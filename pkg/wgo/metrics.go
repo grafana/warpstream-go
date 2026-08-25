@@ -225,9 +225,6 @@ func (m *metrics) observeMetadataRefresh(trigger string, before, after []int32, 
 // value gauges keep their last successful reading rather than a fake 0;
 // clusterStatsAvailable is what marks them stale.
 func (m *metrics) observeClusterStats(stats ClusterStats, ok bool) {
-	if m == nil {
-		return
-	}
 	if !ok {
 		m.clusterStatsAvailable.Set(0)
 		return
