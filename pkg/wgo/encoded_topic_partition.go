@@ -123,11 +123,10 @@ func unrouteEncodedTopicPartitionRecords(parts []routedEncodedTopicPartitionReco
 	return out
 }
 
-// One Produce RPC gets one agent_state. A mix (probe + healthy) only happens
-// if this nodeID's demotion flipped during linger — while demoted, other
-// partitions are not routed here. If any remaining partition is a probe,
-// count the request demoted so probes are not hidden in healthy. demoted
-// is not a failure; success/failure are separate counters.
+// agentFromRouted resolves the destination Agent for one wire attempt: nodeID,
+// plus AgentStateDemoted if any partition was routed there as a probe. A mixed
+// group only arises when demotion flipped mid-linger, and demoted wins so a
+// probe is never reported as ordinary traffic.
 func agentFromRouted(nodeID int32, parts []routedEncodedTopicPartitionRecords) Agent {
 	a := Agent{NodeID: nodeID}
 	for _, p := range parts {

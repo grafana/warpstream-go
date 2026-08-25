@@ -119,8 +119,8 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
 
-			// Both successful calls share the unlabeled success series.
-			// The latency histogram has no agent_state label.
+			// The latency histogram carries no agent_state label, so both
+			// successful calls land on the one success series.
 			successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
 			assert.Equal(t, uint64(2), successCount)
 			assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_direct_request_latency_seconds"))

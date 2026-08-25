@@ -302,8 +302,8 @@ func TestDemoter_Candidates(t *testing.T) {
 		`), "warpstream_demoter_demoted_agents", "warpstream_demoter_demotion_suppressed"))
 
 		// A second agent turns faulty → 2 of 5 (0.4) exceeds the floor, so
-		// demotion is suppressed. slowID is still in lastDemotedProbe, but both
-		// gauges must read 0 because no demotion is in effect.
+		// demotion is suppressed. slowID is still in lastDemotedProbe, but the
+		// gauge must read 0 because no demotion is in effect.
 		seedFullWindow(tr, 5, nowNs, 10, 10, 10)
 		require.Len(t, d.lastDemotedProbe, 1)
 		require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`

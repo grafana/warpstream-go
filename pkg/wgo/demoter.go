@@ -11,8 +11,8 @@ import (
 )
 
 // demotionSuppressionReason is why demotion is suppressed. Its string value is
-// the metric label exposed by warpstream_demoter_demotion_suppressed; the empty
-// value means demotion is not suppressed.
+// the metric label exposed by demotionSuppressedMetric; the empty value means
+// demotion is not suppressed.
 type demotionSuppressionReason string
 
 const (

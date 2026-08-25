@@ -2,9 +2,9 @@ package wgo
 
 import "time"
 
-// ObservedAgentStatsTracker records cluster-stat gauges on ClusterStats.
-// It is meant to sit under CachedAgentStatsTracker so gauges update only
-// on cache miss, not on every Hedger/Demoter call.
+// ObservedAgentStatsTracker decorates an AgentStatsTracker, recording the
+// cluster-view gauges on each ClusterStats it forwards. Every other method is
+// a plain passthrough.
 type ObservedAgentStatsTracker struct {
 	inner   AgentStatsTracker
 	metrics *metrics
