@@ -333,3 +333,41 @@ func selectProduceResult(primary, fallback ProduceResult) ProduceResult {
 	}
 	return primary
 }
+
+// produceResponseCoversAll reports whether resp carries an entry for every
+// requested topic-partition. A response that silently omits a partition must
+// not be treated as a full success: with no entry, downstream per-record
+// resolution cannot distinguish "not reported" from "acked", and the records
+// would be dropped instead of retried.
+func produceResponseCoversAll(resp *kmsg.ProduceResponse, requested []encodedTopicPartitionRecords) bool {
+	if resp == nil {
+		return len(requested) == 0
+	}
+	seen := make(map[topicPartition]struct{})
+	for _, t := range resp.Topics {
+		for _, p := range t.Partitions {
+			seen[topicPartition{topic: t.Topic, partition: p.Partition}] = struct{}{}
+		}
+	}
+	for _, r := range requested {
+		if _, ok := seen[topicPartition{topic: r.topic, partition: r.partition}]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// errIncompleteProduceResponse marks a response that omitted requested
+// partitions. Retriable: the omission is indistinguishable from a lost
+// response, and re-producing is safe under the at-least-once contract.
+var errIncompleteProduceResponse = errors.New("produce response omits requested partitions")
+
+// withCoverageCheck downgrades an apparently-successful result whose response
+// does not cover every requested partition, so the omission is retried rather
+// than silently reported as produced.
+func withCoverageCheck(res ProduceResult, requested []encodedTopicPartitionRecords) ProduceResult {
+	if res.err == nil && !produceResponseCoversAll(res.resp, requested) {
+		return ProduceResult{resp: res.resp, err: errIncompleteProduceResponse}
+	}
+	return res
+}

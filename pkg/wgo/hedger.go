@@ -159,7 +159,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	primaryCh := make(chan ProduceResult, 1)
 	go func() {
 		h.metrics.produceRequestsPrimaryTotal.Inc()
-		primaryCh <- h.inner.ProduceSync(workCtx, primaryID, partitions)
+		primaryCh <- withCoverageCheck(h.inner.ProduceSync(workCtx, primaryID, partitions), partitions)
 	}()
 
 	candidates := newHedgerCandidates(h.strategy, h.cfg.MaxHedgeAgents)
