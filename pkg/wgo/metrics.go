@@ -2,6 +2,7 @@ package wgo
 
 import (
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -107,6 +108,54 @@ func agentStateLabel(state AgentState) string {
 	return agentStateHealthy
 }
 
+const (
+	warpstreamGoModulePath = "github.com/grafana/warpstream-go"
+	franzGoModulePath      = "github.com/twmb/franz-go"
+)
+
+// reModuleVersion matches a well-formed Go module version or pseudo-version,
+// same as franz-go's own reVersion in config.go.
+var reModuleVersion = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$`)
+
+// clientBuildInfo mirrors franz-go's own version-format check, but also
+// prefers dep.Replace so a replace directive reports the version actually
+// running, not the pre-replace requirement.
+func clientBuildInfo() (version, franzGoVersion string) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown", "unknown"
+	}
+	return buildInfoVersions(info)
+}
+
+func buildInfoVersions(info *debug.BuildInfo) (version, franzGoVersion string) {
+	version, franzGoVersion = "unknown", "unknown"
+
+	// Only set when warpstream-go is the main module (e.g. its own tests);
+	// otherwise it's a dependency and picked up from Deps below.
+	if info.Main.Path == warpstreamGoModulePath {
+		version = info.Main.Version
+	}
+
+	for _, dep := range info.Deps {
+		v := dep.Version
+		if dep.Replace != nil {
+			v = dep.Replace.Version
+		}
+		if !reModuleVersion.MatchString(v) {
+			continue
+		}
+		switch dep.Path {
+		case warpstreamGoModulePath:
+			version = v
+		case franzGoModulePath:
+			franzGoVersion = v
+		}
+	}
+
+	return version, franzGoVersion
+}
+
 func newMetrics(reg prometheus.Registerer) *metrics {
 	// On failures the latency carries a "reason" label; on success the
 	// reason is left empty, which Prometheus treats as the label being
@@ -127,6 +176,13 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		NativeHistogramMaxBucketNumber:  100,
 		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"outcome"})
+
+	version, franzGoVersion := clientBuildInfo()
+	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name:        "warpstream_client_build_info",
+		Help:        "Build information about this client and the underlying franz-go client it wraps. Always 1.",
+		ConstLabels: prometheus.Labels{"version": version, "franz_go_version": franzGoVersion},
+	}).Set(1)
 
 	return &metrics{
 		hedgeAttemptsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{

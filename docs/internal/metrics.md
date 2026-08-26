@@ -5,7 +5,7 @@ metrics standpoint: a dashboard or alert written against a standard franz-go
 client (instrumented with [`kprom`](https://pkg.go.dev/github.com/twmb/franz-go/plugin/kprom))
 should keep working when the producer is swapped for this client.
 
-To make that possible, the client's metrics fall into three groups.
+To make that possible, the client's metrics fall into four groups.
 
 ## 1. Transport metrics — from kprom
 
@@ -50,3 +50,10 @@ Metrics with no franz-go counterpart describe behaviour unique to this client:
 hedging, agent demotion, direct-request and attempt accounting, and
 client-boundary record counters. They carry a `warpstream_` prefix so they never
 collide with franz-go/kprom names and are unambiguously backend-specific.
+
+## 4. Build info — `warpstream_client_build_info`
+
+One gauge, `warpstream_client_build_info`, is not behavioural. It is always
+set to 1, and carries this client's version and the underlying franz-go
+version as labels. This follows the standard Prometheus build-info pattern,
+so a query can filter or join on a specific build across a fleet.
