@@ -19,7 +19,7 @@ func TestBuildScenarioEvents_EventCountAndShape(t *testing.T) {
 	for i, ev := range events {
 		assert.Equal(t, time.Duration(i)*time.Second, ev.at, "event %d", i)
 		assert.Len(t, ev.records, int(partitions), "event %d records", i)
-		for p := int32(0); p < partitions; p++ {
+		for p := range partitions {
 			assert.Equal(t, topic, ev.records[p].Topic)
 			assert.Equal(t, p, ev.records[p].Partition)
 			assert.Equal(t, []byte("event"), ev.records[p].Value)

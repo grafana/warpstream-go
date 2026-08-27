@@ -1,7 +1,7 @@
 package main
 
 import (
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -58,7 +58,7 @@ func (s observationsSnapshot) latencyQuantile(q float64) time.Duration {
 	for i, ob := range s.list {
 		latencies[i] = ob.latency
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	slices.Sort(latencies)
 	idx := int(float64(len(latencies)) * q)
 	if idx >= len(latencies) {
 		idx = len(latencies) - 1

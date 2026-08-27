@@ -129,7 +129,7 @@ func scenarios() []scenario {
 		func() scenario {
 			// Every agent: 1% random hard-failure on top of healthy latency.
 			bh := healthyBehaviours()
-			for i := int32(0); i < clusterSize; i++ {
+			for i := range clusterSize {
 				b := bh.byBroker[i]
 				b.failRate = 0.01
 				bh.byBroker[i] = b
@@ -177,7 +177,7 @@ func scenarios() []scenario {
 			// 25% of agents permanently slow.
 			bh := healthyBehaviours()
 			slowCount := agentCount("25% slow", 1, 4)
-			for i := int32(0); i < slowCount; i++ {
+			for i := range slowCount {
 				bh.byBroker[i] = brokerBehaviour{latencyFn: highLatency}
 			}
 			return scenario{
@@ -217,7 +217,7 @@ func scenarios() []scenario {
 			if badCount+modCount >= clusterSize {
 				panic(fmt.Sprintf("simulation: GCS bad+moderate (%d) leaves no healthy agents (clusterSize=%d)", badCount+modCount, clusterSize))
 			}
-			for i := int32(0); i < badCount; i++ {
+			for i := range badCount {
 				bh.byBroker[i] = brokerBehaviour{latencyFn: gcsBad}
 			}
 			for i := badCount; i < badCount+modCount; i++ {

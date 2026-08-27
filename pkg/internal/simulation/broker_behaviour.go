@@ -45,7 +45,7 @@ func (b brokersBehaviour) forBroker(nodeID int32) (brokerBehaviour, bool) {
 // healthy latency. Scenarios mutate a copy.
 func healthyBehaviours() brokersBehaviour {
 	byBroker := map[int32]brokerBehaviour{}
-	for i := int32(0); i < clusterSize; i++ {
+	for i := range clusterSize {
 		byBroker[i] = brokerBehaviour{latencyFn: normalLatency}
 	}
 	return brokersBehaviour{byBroker: byBroker}
@@ -75,7 +75,7 @@ func highLatencyBehavioursFor(nodeIDs ...int32) brokersBehaviour {
 // latency with a burstRate chance of an extra burst per request.
 func burstyLatencyBehaviours(burstRate float64, burst time.Duration) brokersBehaviour {
 	bh := healthyBehaviours()
-	for i := int32(0); i < clusterSize; i++ {
+	for i := range clusterSize {
 		bh.byBroker[i] = brokerBehaviour{latencyFn: burstyLatency(normalLatency, burstRate, burst)}
 	}
 	return bh

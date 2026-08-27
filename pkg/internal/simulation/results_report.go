@@ -89,10 +89,7 @@ func (rr *resultsReport) writeErrorTable(b *strings.Builder, res scenarioResult)
 func (rr *resultsReport) writeBucketTable(b *strings.Builder, res scenarioResult) {
 	wgoBuckets := res.wgoBuckets
 	kgoBuckets := res.kgoBuckets
-	n := len(wgoBuckets)
-	if len(kgoBuckets) > n {
-		n = len(kgoBuckets)
-	}
+	n := max(len(kgoBuckets), len(wgoBuckets))
 	if n == 0 && len(res.produceDeltas) == 0 {
 		b.WriteString("(no observations)\n")
 		return
@@ -101,7 +98,7 @@ func (rr *resultsReport) writeBucketTable(b *strings.Builder, res scenarioResult
 	b.WriteString("| bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |\n")
 	b.WriteString("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	secs := int(reportBucket / time.Second)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		var wgo, kgo observationsSummary
 		if i < len(wgoBuckets) {
 			wgo = wgoBuckets[i]

@@ -13,7 +13,7 @@ func TestHealthyBehaviours_OneEntryPerBroker(t *testing.T) {
 	t.Parallel()
 	b := healthyBehaviours()
 	require.Equal(t, int(clusterSize), len(b.byBroker))
-	for i := int32(0); i < clusterSize; i++ {
+	for i := range clusterSize {
 		got, ok := b.forBroker(i)
 		require.True(t, ok, "broker %d missing", i)
 		require.NotNil(t, got.latencyFn, "broker %d has nil latencyFn", i)
@@ -42,14 +42,14 @@ func TestBrokersBehaviourProvider_NextFailureFor(t *testing.T) {
 
 	t.Run("never fails with zero failRate", func(t *testing.T) {
 		p := newBrokersBehaviourProvider(brokersBehaviour{byBroker: map[int32]brokerBehaviour{0: {}}})
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			assert.False(t, p.nextFailureFor(clientTypeWgo, 0))
 		}
 	})
 
 	t.Run("always fails with failRate one", func(t *testing.T) {
 		p := newBrokersBehaviourProvider(brokersBehaviour{byBroker: map[int32]brokerBehaviour{0: {failRate: 1.0}}})
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			assert.True(t, p.nextFailureFor(clientTypeWgo, 0))
 		}
 	})
@@ -99,7 +99,7 @@ func TestTriangular(t *testing.T) {
 			rng := rand.New(rand.NewPCG(1, 2))
 			const n = 100_000
 			var sum time.Duration
-			for i := 0; i < n; i++ {
+			for i := range n {
 				d := triangular(rng, tc.min, tc.mode, tc.max)
 				require.GreaterOrEqualf(t, d, tc.min, "draw below min (i=%d)", i)
 				require.LessOrEqualf(t, d, tc.max, "draw above max (i=%d)", i)
@@ -107,10 +107,7 @@ func TestTriangular(t *testing.T) {
 			}
 			mean := sum / n
 			expected := (tc.min + tc.mode + tc.max) / 3
-			tolerance := time.Duration(0.05 * float64(tc.max-tc.min))
-			if tolerance < time.Millisecond {
-				tolerance = time.Millisecond
-			}
+			tolerance := max(time.Duration(0.05*float64(tc.max-tc.min)), time.Millisecond)
 			require.InDeltaf(t, float64(expected), float64(mean), float64(tolerance),
 				"empirical mean %v outside %v±%v", mean, expected, tolerance)
 		})
@@ -125,7 +122,7 @@ func TestBurstyLatency_AddsExpectedExtraLatency(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 9))
 	const n = 20_000
 	var sum, bursts time.Duration
-	for i := 0; i < n; i++ {
+	for range n {
 		d := burst(rng)
 		sum += d
 		if d > 100*time.Millisecond {
@@ -155,7 +152,7 @@ func TestLatencyModels_AverageLatency(t *testing.T) {
 			rng := rand.New(rand.NewPCG(1, 2))
 			const n = 100_000
 			var sum time.Duration
-			for i := 0; i < n; i++ {
+			for range n {
 				sum += tc.fn(rng)
 			}
 			mean := sum / n

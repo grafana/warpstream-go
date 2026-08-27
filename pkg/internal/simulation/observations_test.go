@@ -17,10 +17,10 @@ func TestObservations_RecordIsThreadSafe(t *testing.T) {
 	const perGoroutine = 200
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < perGoroutine; i++ {
+			for range perGoroutine {
 				obs.record(time.Now(), 10*time.Millisecond, nil)
 			}
 		}()

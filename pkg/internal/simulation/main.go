@@ -53,11 +53,9 @@ func run(ctx context.Context) (scenarioResults, error) {
 
 	var wg sync.WaitGroup
 	for i, sc := range scs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			out[i], errs[i] = runScenario(ctx, sc)
-		}()
+		})
 	}
 	wg.Wait()
 

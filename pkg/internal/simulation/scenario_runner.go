@@ -111,7 +111,7 @@ func buildScenarioEvents(topic string, numPartitions int32, duration, spacing ti
 	var events []scenarioEvent
 	for at := time.Duration(0); at < duration; at += spacing {
 		recs := make([]*kgo.Record, 0, numPartitions)
-		for p := int32(0); p < numPartitions; p++ {
+		for p := range numPartitions {
 			recs = append(recs, &kgo.Record{Topic: topic, Partition: p, Value: []byte("event")})
 		}
 		events = append(events, scenarioEvent{at: at, records: recs})
@@ -126,11 +126,9 @@ func runScenarioEvents(ctx context.Context, client produceClient, events []scena
 	start := time.Now()
 	var wg sync.WaitGroup
 	for _, ev := range events {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			runScenarioEvent(ctx, client, start, ev, obs)
-		}()
+		})
 	}
 	wg.Wait()
 	return obs
