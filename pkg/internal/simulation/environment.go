@@ -237,17 +237,88 @@ type latencyDelayedKgoClient struct {
 func (c *latencyDelayedKgoClient) Produce(ctx context.Context, r *kgo.Record, promise func(*kgo.Record, error)) {
 	c.Client.Produce(ctx, r, func(rec *kgo.Record, err error) {
 		go func() {
-			c.behaviours.nextLatencySleepFor(ctx, c.client, rec.Partition)
-			// If the simulated latency was cut short because the caller's ctx
-			// (e.g. app-request timeout) fired, surface that as the record's
-			// outcome — kgo itself would have observed the broker not respond
-			// in time.
-			if err == nil && ctx.Err() != nil {
-				err = ctx.Err()
+			if err != nil {
+				// kgo's own machinery already resolved this record against the
+				// real (instant) cluster — e.g. it retried a dead leader until
+				// RecordDeliveryTimeout. That time was really spent, so the
+				// latency model has nothing to add. Still draw, so the failure
+				// scenarios consume the same RNG stream as before.
+				c.behaviours.nextLatencyFor(c.client, rec.Partition)
+				promise(rec, err)
+				return
 			}
-			promise(rec, err)
+			promise(rec, c.awaitSimulatedLatency(ctx, rec.Partition))
 		}()
 	})
+}
+
+// kgoAttemptDeadline is the per-attempt budget kgo enforces on a produce
+// request: the timeout written into the request plus the read overhead. Mirrors
+// what newKgoClient passes kgo, and equals wgo's own attemptCtx budget in
+// KafkaDirectProducer.ProduceSync, so both clients abandon a stalled attempt at
+// the same point.
+const kgoAttemptDeadline = clientProduceRequestTimeout + clientRequestTimeoutOverhead
+
+// awaitSimulatedLatency replays kgo's own attempt loop against the simulated
+// latency and returns the record's outcome.
+//
+// Why this exists: kfake answers instantly and the draw is applied client-side
+// (see the type comment), so kgo's real retry machinery never observes the
+// simulated latency. wgo's does — its hook runs on attemptCtx inside
+// KafkaDirectProducer.ProduceSync, which converts an overrunning draw into a
+// failed attempt the Hedger can route around. Replaying the loop here restores
+// the one recovery path that asymmetry removed: because the model redraws
+// latency per request, an attempt abandoned at the deadline is retried against
+// the same leader with a fresh draw — the same "the tail is per-request, not
+// per-broker" property wgo's hedge exploits. Without it the baseline is
+// handicapped in a way wgo is not, which matters now that minSuccessDeltaVsKgo
+// gates the run on kgo's measured rate.
+func (c *latencyDelayedKgoClient) awaitSimulatedLatency(ctx context.Context, partition int32) error {
+	// RecordDeliveryTimeout caps the record across every attempt, so the budget
+	// starts now rather than per attempt.
+	deliveryDeadline := time.Now().Add(clientWriteTimeout)
+
+	for {
+		draw := c.behaviours.nextLatencyFor(c.client, partition)
+		if draw <= 0 {
+			return nil
+		}
+
+		// The attempt resolves when the broker answers, or is abandoned at the
+		// per-attempt deadline, whichever comes first.
+		attempt := min(draw, kgoAttemptDeadline)
+
+		// Either way it can't outlive the record's remaining delivery budget.
+		if remaining := time.Until(deliveryDeadline); attempt >= remaining {
+			if err := sleepCtx(ctx, remaining); err != nil {
+				return err
+			}
+			return kgo.ErrRecordTimeout
+		}
+		if err := sleepCtx(ctx, attempt); err != nil {
+			return err
+		}
+		if draw <= kgoAttemptDeadline {
+			return nil
+		}
+		// Attempt abandoned mid-flight. ManualPartitioner pins the record to the
+		// same leader, so the retry is another draw against the same broker.
+	}
+}
+
+// sleepCtx sleeps for d, returning ctx.Err() if ctx fires first. A non-positive
+// d still reports a already-cancelled ctx, so callers can treat the returned
+// error as the record's outcome unconditionally.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Registry, error) {
