@@ -1,6 +1,7 @@
 package testkafka
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -33,13 +34,13 @@ func WithVirtualNetwork(vnet *kfake.VirtualNetwork) Opt {
 	return func(o *options) { o.vnet = vnet }
 }
 
-// CreateCluster returns a fake Kafka cluster for unit testing.
+// NewCluster creates a fake Kafka cluster and returns it plus the address of its
+// first broker. The caller owns the cluster and must Close it.
 //
-// When multiple brokers are configured (via WithNumBrokers), partition leaders are assigned
-// in a round-robin fashion: partition 0 → broker 0, partition 1 → broker 1, etc.
-// This means that if the number of brokers is >= the number of partitions, each partition
-// is guaranteed to be on a different broker.
-func CreateCluster(t testing.TB, numPartitions int32, topicName string, opts ...Opt) (*kfake.Cluster, string) {
+// When multiple brokers are configured (via WithNumBrokers), partition leaders are
+// assigned round-robin: partition 0 → broker 0, partition 1 → broker 1, etc. So if
+// brokers >= partitions, each partition is guaranteed to be on a different broker.
+func NewCluster(numPartitions int32, topicName string, opts ...Opt) (*kfake.Cluster, string, error) {
 	o := options{numBrokers: 1}
 	for _, opt := range opts {
 		opt(&o)
@@ -60,19 +61,36 @@ func CreateCluster(t testing.TB, numPartitions int32, topicName string, opts ...
 	}
 
 	cluster, err := kfake.NewCluster(cfg...)
-	require.NoError(t, err)
-	t.Cleanup(cluster.Close)
+	if err != nil {
+		return nil, "", err
+	}
 
 	addrs := cluster.ListenAddrs()
-	require.NotEmpty(t, addrs)
+	if len(addrs) == 0 {
+		cluster.Close()
+		return nil, "", errors.New("testkafka: fake cluster has no listen addresses")
+	}
 
 	// Assign partition leaders in a round-robin fashion across brokers.
 	// kfake assigns leaders randomly by default, so we override it here.
 	if numBrokers := int32(len(addrs)); numBrokers > 1 {
 		for i := int32(0); i < numPartitions; i++ {
-			require.NoError(t, cluster.MoveTopicPartition(topicName, i, i%numBrokers))
+			if err := cluster.MoveTopicPartition(topicName, i, i%numBrokers); err != nil {
+				cluster.Close()
+				return nil, "", err
+			}
 		}
 	}
 
-	return cluster, addrs[0]
+	return cluster, addrs[0], nil
+}
+
+// CreateCluster returns a fake Kafka cluster for unit testing, registering its
+// Close with t.Cleanup.
+func CreateCluster(t testing.TB, numPartitions int32, topicName string, opts ...Opt) (*kfake.Cluster, string) {
+	t.Helper()
+	cluster, addr, err := NewCluster(numPartitions, topicName, opts...)
+	require.NoError(t, err)
+	t.Cleanup(cluster.Close)
+	return cluster, addr
 }
