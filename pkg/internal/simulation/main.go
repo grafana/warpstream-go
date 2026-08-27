@@ -35,13 +35,13 @@ func main() {
 	printSummary(os.Stdout, res)
 
 	if failures := res.check(); len(failures) > 0 {
-		fmt.Fprintf(os.Stderr, "\nFAIL: %d scenario(s) below expected minimum success rate:\n", len(failures))
+		fmt.Fprintf(os.Stderr, "\nFAIL: %d scenario expectation(s) not met:\n", len(failures))
 		for _, f := range failures {
-			fmt.Fprintf(os.Stderr, "  - %s: got %.1f%%, want >= %.1f%%\n", f.name, 100*f.got, 100*f.want)
+			fmt.Fprintf(os.Stderr, "  - %s\n", f)
 		}
 		os.Exit(1)
 	}
-	fmt.Println("\nPASS: all scenarios met their expected minimum success rate.")
+	fmt.Println("\nPASS: all scenarios met their expectations.")
 }
 
 // run executes every scenario concurrently (each in its own environment) and
@@ -74,10 +74,10 @@ func printSummary(w io.Writer, r scenarioResults) {
 	fmt.Fprintln(w, "scenario summary (wgo app-level success):")
 	for _, res := range r.entries {
 		status := "PASS"
-		if res.successRate() < res.sc.expectedMinSuccessRate {
+		if len(checkResult(res)) > 0 {
 			status = "FAIL"
 		}
 		fmt.Fprintf(w, "  [%s] %-42s %.1f%% (want >= %.1f%%)\n",
-			status, res.sc.name, 100*res.successRate(), 100*res.sc.expectedMinSuccessRate)
+			status, res.sc.name, 100*res.successRate(), 100*res.sc.expect.minWgoSuccessRate)
 	}
 }

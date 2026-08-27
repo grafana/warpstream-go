@@ -63,6 +63,10 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 		res.totalPrimary = last.primary - first.primary
 		res.totalHedge = last.hedge - first.hedge
 	}
+	if sc.expect.slowBudget != nil {
+		f := wgoSnapshot.slowFraction(*sc.expect.slowBudget)
+		res.wgoSlowFraction = &f
+	}
 	return res, nil
 }
 

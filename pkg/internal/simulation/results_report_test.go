@@ -63,7 +63,7 @@ func TestResultsReport_GenerateMarkdown(t *testing.T) {
 	t.Parallel()
 	rr := newResultsReport(scenarioResults{entries: []scenarioResult{
 		{
-			sc:           scenario{name: "all healthy", description: "everything fine", expectedMinSuccessRate: 1.0},
+			sc:           scenario{name: "all healthy", description: "everything fine", expect: scenarioExpectations{minWgoSuccessRate: 1.0}},
 			wgoSummary:   observationsSummary{total: 10, successes: 10, p99Latency: 900 * time.Millisecond},
 			kgoSummary:   observationsSummary{total: 10, successes: 10, p99Latency: 900 * time.Millisecond},
 			totalPrimary: 100,

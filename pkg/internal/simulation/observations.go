@@ -66,6 +66,23 @@ func (s observationsSnapshot) latencyQuantile(q float64) time.Duration {
 	return latencies[idx]
 }
 
+// slowFraction returns the fraction of observations (successes and failures
+// alike — a failure's latency is always at least the caller's own deadline,
+// so it counts as slow too) whose latency exceeds budget. Returns 0 when
+// there are no observations.
+func (s observationsSnapshot) slowFraction(budget time.Duration) float64 {
+	if len(s.list) == 0 {
+		return 0
+	}
+	var slow int
+	for _, ob := range s.list {
+		if ob.latency > budget {
+			slow++
+		}
+	}
+	return float64(slow) / float64(len(s.list))
+}
+
 // errorCounts groups failed observations by error string, returning error → count.
 // Successful observations (nil error) are ignored.
 func (s observationsSnapshot) errorCounts() map[string]int {
