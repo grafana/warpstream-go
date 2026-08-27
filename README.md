@@ -1,5 +1,8 @@
 # wgo – A Warpstream-aware Kafka client
 
+> [!WARNING]
+> **Experimental.** This client is not battle tested yet. Use it at your own risk, and please don't run it in production unless you've extensively tested it first. Testing and feedback are very welcome!
+
 A Kafka client tailored to [Warpstream](https://www.warpstream.com/)'s stateless-agent architecture.
 
 ## What it is
@@ -23,7 +26,7 @@ This client has been designed around the following non-negotiable assumptions:
 1. **Warpstream-specific.** Hedging the same batch across agents only works because any agent can serve any partition. Pointed at vanilla Kafka, the secondary leg would fail with `NotLeaderForPartition`.
 2. **At-least-once delivery only.** Duplicates are tolerable. Any code that assumes exactly-once or in-partition record ordering must stay on franz-go.
 3. **No transactional or idempotent producer support.** `DisableIdempotentWrite()` semantics are baked in — no `producerId`/`producerEpoch`/`baseSequence` handshake.
-4. **Background-only Metadata refresh.** Produce requests never block on Metadata; an out-of-date pool view is preferred to an in-flight stall.
+4. **Produce never blocks on Metadata.** The agent pool is refreshed on a timer and also on-demand when routing finds no candidate. The current Produce call still fails immediately rather than waiting for the fetch; a later Produce can use the updated pool. On-demand refreshes are coalesced and paced by `OnDemandMetadataRefreshInterval` (default 1s) to avoid request storms.
 
 ## How it works
 
@@ -90,3 +93,38 @@ Every produce attempt (primary or hedge wave) feeds latency and error data into 
 ### Wire layer: franz-go, used as a transport
 
 The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequest` to `kgo.Client.Broker().Request()`. We do not use `kgo.Client.Produce()` because that's where franz-go's leader-pinning lives. By dropping into the raw `Broker.Request` path we keep all of franz-go's connection pooling, TLS/SASL, and wire encoding while taking complete control of which broker each request actually goes to.
+
+### Hooks
+
+The client accepts [franz-go hooks](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Hook)
+via `WithHooks`, so you can attach your own metrics, tracing, or connection
+instrumentation. However, the following hooks are currently **not supported**:
+
+- `HookProduceBatchWritten`
+- `HookProduceRecordPartitioned`
+
+### Tracing
+
+The client is a drop-in for a franz-go producer traced with
+[`kotel`](https://pkg.go.dev/github.com/twmb/franz-go/plugin/kotel): pass your kotel hooks
+(or any hook implementing the produce-record hooks) via `WithHooks`. On each produce your
+tracer starts a producer span and injects the trace-context header into the record, so the
+record carries the trace to downstream consumers; the span ends when the produce is
+acknowledged or fails. Consume-side tracing works through the embedded client with no extra
+wiring. See [`docs/internal/tracing.md`](docs/internal/tracing.md) for the design.
+
+## FAQ
+
+### Is this a replacement for franz-go?
+
+No. [franz-go](https://github.com/twmb/franz-go) is an excellent, full-featured Kafka client, and we recommend it for the vast majority of use cases. This client is not a general-purpose client and it is not trying to compete with franz-go — in fact it is built *on top of* franz-go, which it relies on for connection management, Metadata, TLS/SASL, and wire encoding.
+
+### When should I use this client instead?
+
+Only when **all** of the following hold:
+
+- You're producing to a [Warpstream](https://www.warpstream.com/) cluster (or another backend with fully stateless, any-agent-serves-any-partition brokers).
+- You want better tail-latency and resilience on Produce requests via hedging and routing around sick agents.
+- Your workload tolerates at-least-once delivery and does not need ordering, idempotent, or transactional producers.
+
+If any of these don't apply, use franz-go. See [Non-negotiable principles](#non-negotiable-principles) for the full list of assumptions.

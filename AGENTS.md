@@ -10,6 +10,16 @@ changes — its "How it works" section describes the routing/buffering/hedging/
 demotion design and must stay accurate. If a change alters that behaviour, update
 the README in the same change.
 
+Design notes that aren't user-facing live under [`docs/internal/`](docs/internal/) —
+read it when planning changes to the areas it covers, and keep it current:
+
+- [`docs/internal/metrics.md`](docs/internal/metrics.md) — how metrics are split
+  (transport vs producer-state vs warpstream-specific) and the franz-go/`kprom`
+  drop-in-compatibility contract. Update it when changing metrics.
+- [`docs/internal/tracing.md`](docs/internal/tracing.md) — how the client drives
+  franz-go's produce-record hooks on its own produce path to support tracing (e.g.
+  `kotel`) as a drop-in. Update it when changing hook or tracing behaviour.
+
 This file holds repo-wide conventions. More specific instructions live in nested
 `AGENTS.md` files — read the one closest to the files you're editing:
 

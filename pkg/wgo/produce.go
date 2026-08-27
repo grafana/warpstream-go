@@ -1,10 +1,12 @@
 package wgo
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/twmb/franz-go/pkg/kbin"
@@ -48,10 +50,27 @@ const crcOffset = 17
 // batchFixedFieldsAfterLength.
 const recordBatchHeaderBytes = 4 + 8 + 4 + batchFixedFieldsAfterLength
 
-// maxBatchBytesCeiling is a sanity cap on Config.MaxBatchBytes. A value above
+// batchMaxBytesCeiling is a sanity cap on Config.BatchMaxBytes. A value above
 // this is almost certainly misconfiguration — the broker would reject such a
 // request anyway — so we fail validation early rather than buffer toward it.
-const maxBatchBytesCeiling int32 = 1 << 30 // 1 GiB
+const batchMaxBytesCeiling int32 = 1 << 30 // 1 GiB
+
+// ensureRecordTimestamp defaults an unset record timestamp to now (truncated to
+// the millisecond resolution Kafka stores), mirroring franz-go's bufferRecord.
+// An already-set timestamp is left untouched.
+func ensureRecordTimestamp(record *kgo.Record, now time.Time) {
+	if record.Timestamp.IsZero() {
+		record.Timestamp = now.Truncate(time.Millisecond)
+	}
+}
+
+// ensureRecordContext defaults an unset record context to ctx, mirroring
+// franz-go, which seeds Record.Context from the Produce ctx.
+func ensureRecordContext(record *kgo.Record, ctx context.Context) {
+	if record.Context == nil {
+		record.Context = ctx
+	}
+}
 
 // recordEstimateBytes returns the on-wire byte size of r encoded at the
 // given offsetDelta and tsDelta — the length-prefix varint plus the
@@ -75,7 +94,7 @@ func recordEstimateBytes(r *kgo.Record, offsetDelta int32, tsDelta int64) int64 
 
 // singleRecordBatchEstimateBytes returns the wire-byte size of a fresh single-
 // record batch carrying r. Used as the per-record rejection gate: a record
-// whose batch alone exceeds MaxBatchBytes can never be produced, so we fail
+// whose batch alone exceeds BatchMaxBytes can never be produced, so we fail
 // it synchronously instead of letting the broker reject the eventual
 // request. The estimate is on the uncompressed payload — Snappy can only
 // shrink it, so the gate stays sound under compression.
@@ -99,49 +118,88 @@ func multiRecordBatchEstimateBytes(records []*kgo.Record) int64 {
 	return bytes
 }
 
-// buildMultiTopicProduceRequest builds a ProduceRequest covering records that
-// may span multiple topics. topicID maps a topic name to its UUID, returning
-// ok=false when the topic is unknown to the caller; an unknown topic fails
-// the build with an error. Both topic name and UUID are populated per topic
-// so the request is valid across the v0-v12 / v13+ API divide.
-func buildMultiTopicProduceRequest(version int16, topicID func(string) ([16]byte, bool), records []*kgo.Record) (*kmsg.ProduceRequest, error) {
-	byTopic := make(map[string][]*kgo.Record)
-	for _, r := range records {
-		byTopic[r.Topic] = append(byTopic[r.Topic], r)
+// produceRequestStats holds the aggregate producer-state counts for one
+// ProduceRequest.
+type produceRequestStats struct {
+	records           int64
+	batches           int64
+	uncompressedBytes int64
+	compressedBytes   int64
+}
+
+// add returns the element-wise sum of two stats.
+func (s produceRequestStats) add(o produceRequestStats) produceRequestStats {
+	return produceRequestStats{
+		records:           s.records + o.records,
+		batches:           s.batches + o.batches,
+		uncompressedBytes: s.uncompressedBytes + o.uncompressedBytes,
+		compressedBytes:   s.compressedBytes + o.compressedBytes,
+	}
+}
+
+// buildMultiTopicProduceRequestFromEncoded builds a ProduceRequest covering pre-encoded
+// partitions that may span multiple topics. topicID maps a topic name to its
+// UUID, returning ok=false when the topic is unknown to the caller; an unknown
+// topic fails the build with an error. Both topic name and UUID are populated
+// per topic so the request is valid across the v0-v12 / v13+ API divide.
+//
+// Each partition contributes its pre-encoded RecordBatch. The returned stats
+// feed the producer-state metrics.
+//
+// partitions must hold at most one entry per (topic, partition); duplicates are
+// rejected with an error rather than merged.
+func buildMultiTopicProduceRequestFromEncoded(version int16, topicID func(string) ([16]byte, bool), partitions []encodedTopicPartitionRecords) (*kmsg.ProduceRequest, produceRequestStats, error) {
+	// Track first-seen topic order and iterate it rather than ranging byTopic
+	// directly: Go randomises map iteration, so ranging the map would emit the
+	// request's topics in a different order on every call. Kafka doesn't care
+	// about topic order, but a stable layout keeps the output deterministic
+	// (reproducible requests, non-flaky tests).
+	byTopic := make(map[string][]encodedTopicPartitionRecords)
+	topicOrder := make([]string, 0)
+	for _, p := range partitions {
+		if _, ok := byTopic[p.topic]; !ok {
+			topicOrder = append(topicOrder, p.topic)
+		}
+		byTopic[p.topic] = append(byTopic[p.topic], p)
 	}
 
+	var stats produceRequestStats
 	req := kmsg.NewProduceRequest()
 	req.Version = version
 	req.Acks = -1 // all ISR
-	for topic, topicRecords := range byTopic {
+	for _, topic := range topicOrder {
 		id, ok := topicID(topic)
 		if !ok {
-			return nil, fmt.Errorf("topic %q not known", topic)
+			return nil, produceRequestStats{}, fmt.Errorf("topic %q not known", topic)
 		}
-		byPartition := groupByPartition(topicRecords)
-		partitions := make([]kmsg.ProduceRequestTopicPartition, 0, len(byPartition))
-		for partition, recs := range byPartition {
-			partitions = append(partitions, kmsg.ProduceRequestTopicPartition{
-				Partition: partition,
-				Records:   encodeBatch(recs),
+		topicPartitions := byTopic[topic]
+		reqPartitions := make([]kmsg.ProduceRequestTopicPartition, 0, len(topicPartitions))
+		seen := make(map[int32]struct{}, len(topicPartitions))
+		for _, p := range topicPartitions {
+			// Merging batches for the same partition is not supported: a duplicate
+			// would emit two entries for one partition — a malformed request — so
+			// fail loud instead.
+			if _, dup := seen[p.partition]; dup {
+				return nil, produceRequestStats{}, fmt.Errorf("duplicate partition %d for topic %q", p.partition, topic)
+			}
+			seen[p.partition] = struct{}{}
+
+			if len(p.encoded) == 0 {
+				continue
+			}
+			reqPartitions = append(reqPartitions, kmsg.ProduceRequestTopicPartition{
+				Partition: p.partition,
+				Records:   p.encoded,
 			})
+			stats = stats.add(p.encodedStats)
 		}
 		req.Topics = append(req.Topics, kmsg.ProduceRequestTopic{
 			Topic:      topic,
 			TopicID:    id,
-			Partitions: partitions,
+			Partitions: reqPartitions,
 		})
 	}
-	return &req, nil
-}
-
-// groupByPartition groups records by their partition field.
-func groupByPartition(records []*kgo.Record) map[int32][]*kgo.Record {
-	m := make(map[int32][]*kgo.Record)
-	for _, r := range records {
-		m[r.Partition] = append(m[r.Partition], r)
-	}
-	return m
+	return &req, stats, nil
 }
 
 // parseProduceResponse returns the first per-partition error, or nil on no error.
@@ -199,8 +257,11 @@ func partitionErrorFromResp(resp *kmsg.ProduceResponse, topic string, partition 
 	return nil
 }
 
-// encodeBatch serialises records into a Kafka RecordBatch (magic=2) with Snappy compression.
-func encodeBatch(records []*kgo.Record) []byte {
+// encodeBatch serialises records into a Kafka RecordBatch (magic=2) with Snappy
+// compression. It also returns the uncompressed and compressed record-payload
+// sizes (excluding the batch wrapper); the two are equal when compression does
+// not shrink the payload.
+func encodeBatch(records []*kgo.Record) (buf []byte, uncompressedBytes, compressedBytes int) {
 	firstTS := records[0].Timestamp.UnixMilli()
 	maxTS := firstTS
 	for _, r := range records[1:] {
@@ -229,6 +290,9 @@ func encodeBatch(records []*kgo.Record) []byte {
 		payload = raw
 	}
 
+	uncompressedBytes = len(raw)
+	compressedBytes = len(payload)
+
 	batch := kmsg.RecordBatch{
 		PartitionLeaderEpoch: -1,
 		Magic:                2,
@@ -244,7 +308,7 @@ func encodeBatch(records []*kgo.Record) []byte {
 	}
 	batch.Length = batchFixedFieldsAfterLength + int32(len(payload))
 
-	buf := make([]byte, 0, 8+4+int(batch.Length))
+	buf = make([]byte, 0, 8+4+int(batch.Length))
 	buf = batch.AppendTo(buf)
 
 	// The CRC range is defined by the Kafka protocol; it covers all bytes after the CRC field.
@@ -255,7 +319,54 @@ func encodeBatch(records []*kgo.Record) []byte {
 	putBuf(rawPtr, raw)
 	putBuf(compPtr, comp)
 
-	return buf
+	return buf, uncompressedBytes, compressedBytes
+}
+
+// decodeBatch parses a serialised RecordBatch back into records, inverting
+// encodeBatch for the fields this client sets (key, value, headers, timestamp).
+// It is used to re-merge several pre-encoded batches for one partition into a
+// single batch. It expects exactly one complete batch; any bytes trailing the
+// first batch are ignored. The input is always bytes this client encoded, so a
+// decode failure is a bug and panics.
+func decodeBatch(encoded []byte) []*kgo.Record {
+	var rb kmsg.RecordBatch
+	if err := rb.ReadFrom(encoded); err != nil {
+		panic(fmt.Sprintf("wgo: decodeBatch: read RecordBatch: %v", err))
+	}
+
+	payload := rb.Records
+	if rb.Attributes&0x7 == 2 { // CodecSnappy
+		dec, err := s2.Decode(nil, payload)
+		if err != nil {
+			panic(fmt.Sprintf("wgo: decodeBatch: snappy decode: %v", err))
+		}
+		payload = dec
+	}
+
+	records := make([]*kgo.Record, 0, rb.NumRecords)
+	for len(payload) > 0 {
+		var rec kmsg.Record
+		if err := rec.ReadFrom(payload); err != nil {
+			panic(fmt.Sprintf("wgo: decodeBatch: read Record: %v", err))
+		}
+
+		var headers []kgo.RecordHeader
+		if len(rec.Headers) > 0 {
+			headers = make([]kgo.RecordHeader, len(rec.Headers))
+			for i, h := range rec.Headers {
+				headers[i] = kgo.RecordHeader{Key: h.Key, Value: h.Value}
+			}
+		}
+		records = append(records, &kgo.Record{
+			Key:       rec.Key,
+			Value:     rec.Value,
+			Headers:   headers,
+			Timestamp: time.UnixMilli(rb.FirstTimestamp + rec.TimestampDelta64),
+		})
+
+		payload = payload[kbin.VarintLen(rec.Length)+int(rec.Length):]
+	}
+	return records
 }
 
 // putBuf returns a buffer to the pool, dropping it if it grew too large.

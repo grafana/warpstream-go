@@ -6,7 +6,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
@@ -17,6 +16,14 @@ import (
 	"github.com/grafana/warpstream-go/pkg/internal/testkafka"
 	"github.com/grafana/warpstream-go/pkg/wgo"
 )
+
+// produceAPIVersion mirrors the unexported produceAPIVersion pinned in
+// pkg/wgo/client.go, so the kgo baseline negotiates the same wire format wgo
+// itself emits and parses. Kept as a local literal rather than an exported
+// wgo symbol: this simulation is the only external consumer that would ever
+// need it, and duplicating one constant is cheaper than growing wgo's public
+// surface for it.
+const produceAPIVersion int16 = 11
 
 const (
 	// topicName is the single topic every scenario produces to.
@@ -244,36 +251,27 @@ func (c *latencyDelayedKgoClient) Produce(ctx context.Context, r *kgo.Record, pr
 }
 
 func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Registry, error) {
-	cfg := wgo.Config{
-		Address:       []string{addr},
-		Topic:         topicName,
-		ClientID:      "ws-simulation",
-		DialTimeout:   clientDialTimeout,
-		WriteTimeout:  clientWriteTimeout,
-		Linger:        clientLinger,
-		MaxBatchBytes: clientBatchMaxBytes,
-		HealthCheck: wgo.HealthCheckConfig{
-			SlowMultiplier:    2.0,
-			MaxSlowFraction:   0.3,
-			FaultyThreshold:   0.05,
-			MaxFaultyFraction: 0.3,
-		},
-		Hedger: wgo.HedgerConfig{
-			MinHedgeDelay:  time.Second,
-			MaxHedgeAgents: 3,
-		},
-		Demoter: wgo.DemoterConfig{
-			ProbeInterval: time.Second,
-		},
-		ClusterStatsTTL:         time.Second,
-		MetadataRefreshInterval: clientMetadataRefresh,
-		DirectProducer: wgo.KafkaDirectProducerConfig{
-			ProduceRequestTimeout:         clientProduceRequestTimeout,
-			ProduceRequestTimeoutOverhead: clientRequestTimeoutOverhead,
-		},
-	}
 	reg := prometheus.NewPedanticRegistry()
-	c, err := wgo.NewWarpstreamClient(cfg, log.NewNopLogger(), reg)
+	c, err := wgo.NewWarpstreamClient(nil, reg,
+		wgo.WithAddress(addr),
+		wgo.WithTopic(topicName),
+		wgo.WithClientID("ws-simulation"),
+		wgo.WithDialTimeout(clientDialTimeout),
+		wgo.WithWriteTimeout(clientWriteTimeout),
+		wgo.WithLinger(clientLinger),
+		wgo.WithBatchMaxBytes(clientBatchMaxBytes),
+		wgo.WithHealthCheckSlowMultiplier(2.0),
+		wgo.WithHealthCheckMaxSlowFraction(0.3),
+		wgo.WithHealthCheckFaultyThreshold(0.05),
+		wgo.WithHealthCheckMaxFaultyFraction(0.3),
+		wgo.WithHedgerMinHedgeDelay(time.Second),
+		wgo.WithHedgerMaxHedgeAgents(3),
+		wgo.WithDemoterProbeInterval(time.Second),
+		wgo.WithClusterStatsTTL(time.Second),
+		wgo.WithMetadataRefreshInterval(clientMetadataRefresh),
+		wgo.WithProduceRequestTimeout(clientProduceRequestTimeout),
+		wgo.WithProduceRequestTimeoutOverhead(clientRequestTimeoutOverhead),
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -287,7 +285,7 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 	// Cap Produce at the version wgo pins so request and response payloads carry
 	// the topic name on the wire, matching what the client emits.
 	v := kversion.Stable()
-	v.SetMaxKeyVersion(kmsg.Produce.Int16(), wgo.ProduceAPIVersion)
+	v.SetMaxKeyVersion(kmsg.Produce.Int16(), produceAPIVersion)
 
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(addr),

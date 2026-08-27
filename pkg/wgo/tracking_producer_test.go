@@ -83,7 +83,7 @@ func TestTrackingProducer_Produce(t *testing.T) {
 				{Partition: 0, ErrorCode: kerr.NotLeaderForPartition.Code},
 			},
 		}}
-		inner.respFn = func(int32, []topicPartitionRecords) (*kmsg.ProduceResponse, error) { return resp, nil }
+		inner.respFn = func(int32, []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) { return resp, nil }
 		tr := &recordingTracker{}
 		tp := NewTrackingProducer(inner, tr)
 
@@ -97,7 +97,7 @@ func TestTrackingProducer_Produce(t *testing.T) {
 	t.Run("forwards inner response unchanged", func(t *testing.T) {
 		inner := newMockDirectProducer()
 		want := kmsg.NewPtrProduceResponse()
-		inner.respFn = func(int32, []topicPartitionRecords) (*kmsg.ProduceResponse, error) { return want, nil }
+		inner.respFn = func(int32, []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) { return want, nil }
 		tp := NewTrackingProducer(inner, &recordingTracker{})
 
 		res := tp.ProduceSync(context.Background(), 1, nil)

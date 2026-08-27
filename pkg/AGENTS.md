@@ -8,6 +8,21 @@ When you change the client's logic or behaviour, update
 documents the routing, buffering, hedging, and demotion design, and must not
 drift from the code.
 
+## Configuration
+
+`Config` (in `config.go`) and its functional options live together. Each `Config`
+field has a matching `With…` option in the same file. When you add, remove, or
+rename a `Config` field, make the same change to its `With…` option, and keep the
+option's doc comment aligned with the field's documentation. A defaulted field
+also needs its `Default…` constant and a line in `DefaultConfig`.
+
+## Naming
+
+When two functions do the same thing but one takes a single input and the other
+takes many, name the single-input one plainly and give the multi-input one a
+`Multi` prefix — e.g. `Add` (one record) / `MultiAdd` (many). The plain name is
+the single-item case; the `Multi` prefix signals "same operation, batched".
+
 ## Comments
 
 Default to writing **no** comment. Add one only when the *why* is non-obvious: a
@@ -39,3 +54,10 @@ behaviour that would surprise a reader.
   invariant — and prefer a leading `// comment` for that. Format-style diagnostic
   args that surface values at failure time are fine; the required-substring arg of
   `assert.ErrorContains` is not a message, don't strip it.
+- `kfake` tests run under `testing/synctest`: wrap the body in `synctest.Test`,
+  create the cluster with `testkafka.WithVirtualNetwork(&vnet)`, and give every
+  client `vnet.DialContext` (`WithDialer` / `kgo.Dialer`) — a real socket blocks a
+  goroutine on network I/O and deadlocks the bubble. Never poll with
+  `require.Eventually`; use `synctest.Wait()` to settle goroutines and `time.Sleep`
+  only to advance the fake clock past a timer. No `t.Run` inside a bubble (wrap each
+  subtest in its own `synctest.Test`).

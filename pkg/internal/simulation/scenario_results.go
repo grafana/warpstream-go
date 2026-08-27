@@ -74,7 +74,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{
 				scenario: res.sc.name,
 				detail: fmt.Sprintf("wgo fraction of requests slower than %s is %.1f%%, above the %.1f%% ceiling",
-					*exp.slowBudget, 100*got, 100* *exp.maxWgoSlowFraction),
+					*exp.slowBudget, 100*got, 100**exp.maxWgoSlowFraction),
 			})
 		}
 	}
@@ -85,7 +85,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{
 				scenario: res.sc.name,
 				detail: fmt.Sprintf("wgo beat kgo's success rate by %.1f pts, below the required %.1f pts (wgo %.1f%%, kgo %.1f%%)",
-					100*delta, 100* *exp.minSuccessDeltaVsKgo, 100*res.successRate(), 100*res.kgoSuccessRate()),
+					100*delta, 100**exp.minSuccessDeltaVsKgo, 100*res.successRate(), 100*res.kgoSuccessRate()),
 			})
 		}
 	}

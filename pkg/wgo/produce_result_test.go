@@ -14,16 +14,18 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func makeTopicPartitionRecords(topic string, partition int32, payloads ...string) topicPartitionRecords {
+// makeTopicPartitionRecords builds the encoded partition input the accumulator
+// takes, encoding the payloads into a RecordBatch (empty payloads leave the
+// batch unencoded — the accumulator only keys by topic/partition).
+func makeTopicPartitionRecords(topic string, partition int32, payloads ...string) encodedTopicPartitionRecords {
+	if len(payloads) == 0 {
+		return encodedTopicPartitionRecords{topic: topic, partition: partition}
+	}
 	records := make([]*kgo.Record, len(payloads))
 	for i, payload := range payloads {
 		records[i] = &kgo.Record{Topic: topic, Partition: partition, Value: []byte(payload)}
 	}
-	return topicPartitionRecords{
-		topic:     topic,
-		partition: partition,
-		records:   records,
-	}
+	return newEncodedTopicPartitionRecords(topic, partition, records)
 }
 
 func partitionEntries(resp *kmsg.ProduceResponse, topic string) map[int32]kmsg.ProduceResponseTopicPartition {
@@ -41,7 +43,7 @@ func partitionEntries(resp *kmsg.ProduceResponse, topic string) map[int32]kmsg.P
 
 // mustNewProduceResultAccumulator builds an accumulator and fails the
 // test if the input has duplicate (topic, partition) pairs.
-func mustNewProduceResultAccumulator(t *testing.T, partitions []topicPartitionRecords) *produceResultAccumulator {
+func mustNewProduceResultAccumulator(t *testing.T, partitions []encodedTopicPartitionRecords) *produceResultAccumulator {
 	t.Helper()
 	a, err := newProduceResultAccumulator(partitions)
 	require.NoError(t, err)
@@ -161,7 +163,7 @@ func TestGetProduceResultErr(t *testing.T) {
 
 func TestNewProduceResultAccumulator(t *testing.T) {
 	t.Run("rejects duplicate topic-partition pairs", func(t *testing.T) {
-		_, err := newProduceResultAccumulator([]topicPartitionRecords{
+		_, err := newProduceResultAccumulator([]encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 			makeTopicPartitionRecords("t", 0),
@@ -172,7 +174,7 @@ func TestNewProduceResultAccumulator(t *testing.T) {
 	})
 
 	t.Run("same partition in different topics is not a duplicate", func(t *testing.T) {
-		_, err := newProduceResultAccumulator([]topicPartitionRecords{
+		_, err := newProduceResultAccumulator([]encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("u", 0),
 		})
@@ -180,7 +182,7 @@ func TestNewProduceResultAccumulator(t *testing.T) {
 	})
 
 	t.Run("initial state: nothing resolved, all pending", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -196,11 +198,26 @@ func TestNewProduceResultAccumulator(t *testing.T) {
 		assert.NoError(t, r.err)
 		assert.Empty(t, r.resp.Topics)
 	})
+
+	t.Run("remaining preserves a pending partition's pre-encoded batch", func(t *testing.T) {
+		enc := encodedTopicPartitionRecords{
+			topic:        "t",
+			partition:    0,
+			encoded:      []byte("ENCODED-BATCH"),
+			encodedStats: produceRequestStats{records: 2, batches: 1},
+		}
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{enc})
+
+		rem := a.remaining()
+		require.Len(t, rem, 1)
+		assert.Equal(t, []byte("ENCODED-BATCH"), rem[0].encoded)
+		assert.Equal(t, produceRequestStats{records: 2, batches: 1}, rem[0].encodedStats)
+	})
 }
 
 func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	t.Run("full success: every partition resolved", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -226,7 +243,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	})
 
 	t.Run("transport retriable err: not aborted, pending unchanged", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		a.accumulate(ProduceResult{err: kerr.LeaderNotAvailable})
 
@@ -236,7 +253,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	})
 
 	t.Run("transport non-retriable err: aborted", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		a.accumulate(ProduceResult{err: context.Canceled})
 
@@ -252,7 +269,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	})
 
 	t.Run("per-partition mixed retriable: whole leg treated as failed, partial successes dropped", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -268,7 +285,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	})
 
 	t.Run("per-partition mixed non-retriable: aborted and pending synthesized with the aborted kerr code", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -289,7 +306,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 	})
 
 	t.Run("partial response coverage: only the included partitions resolve", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -309,7 +326,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 
 	t.Run("multiple successful calls together resolve everything and capture metadata", func(t *testing.T) {
 		tid := [16]byte{1, 2, 3}
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -349,7 +366,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		// skips it), so this case shouldn't fire in practice. If it ever
 		// does — e.g. a buggy agent echoing a partition we didn't ask
 		// about, or a future caller mistake — the last accumulate wins.
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		a.accumulate(ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
 			kmsg.ProduceResponseTopicPartition{Partition: 0, ErrorCode: kerrNoError, BaseOffset: 1},
@@ -369,7 +386,7 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 
 func TestProduceResultAccumulator_Response(t *testing.T) {
 	t.Run("exhausted retriable: pending entries inherit the leg's kerr code", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("u", 7),
 		})
@@ -385,7 +402,7 @@ func TestProduceResultAccumulator_Response(t *testing.T) {
 	})
 
 	t.Run("aborted on non-kerr err: pending entries fall back to UNKNOWN_SERVER_ERROR", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		a.accumulate(ProduceResult{err: errors.New("some non-retriable transport boom")})
 
@@ -399,7 +416,7 @@ func TestProduceResultAccumulator_Response(t *testing.T) {
 		// One mixed-failure leg; the partition that failed retriably
 		// has its actual entry recorded so response() can surface it
 		// instead of a synthesized REQUEST_TIMED_OUT.
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -421,7 +438,7 @@ func TestProduceResultAccumulator_Response(t *testing.T) {
 	})
 
 	t.Run("failed entry is cleared once the partition later resolves", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		// First leg: partition fails retriably (recorded in failed map).
 		a.accumulate(ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
@@ -440,7 +457,7 @@ func TestProduceResultAccumulator_Response(t *testing.T) {
 	})
 
 	t.Run("partial resolved plus pending: resolved entry preserved, pending synthesized", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -463,7 +480,7 @@ func TestProduceResultAccumulator_Response(t *testing.T) {
 
 func TestProduceResultAccumulator_Result(t *testing.T) {
 	t.Run("all partitions resolved: no err, response carries every entry", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -482,7 +499,7 @@ func TestProduceResultAccumulator_Result(t *testing.T) {
 	})
 
 	t.Run("partially resolved, no err observed: bare ErrRecordTimeout, pending entries synthesized in response", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -500,7 +517,7 @@ func TestProduceResultAccumulator_Result(t *testing.T) {
 	})
 
 	t.Run("partially resolved with failed leg: lastErr wins, wrapped in ErrRecordTimeout", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
 			makeTopicPartitionRecords("t", 0),
 			makeTopicPartitionRecords("t", 1),
 		})
@@ -518,7 +535,7 @@ func TestProduceResultAccumulator_Result(t *testing.T) {
 	})
 
 	t.Run("nothing resolved, no err observed: bare kgo.ErrRecordTimeout", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		r := a.result()
 		require.Error(t, r.err)
@@ -527,7 +544,7 @@ func TestProduceResultAccumulator_Result(t *testing.T) {
 	})
 
 	t.Run("nothing resolved, retriable err observed: kgo.ErrRecordTimeout wraps the kerr", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 		a.accumulate(ProduceResult{err: kerr.LeaderNotAvailable})
 
 		r := a.result()
@@ -537,7 +554,7 @@ func TestProduceResultAccumulator_Result(t *testing.T) {
 	})
 
 	t.Run("nothing resolved, non-retriable err observed: kgo.ErrRecordTimeout wraps the kerr", func(t *testing.T) {
-		a := mustNewProduceResultAccumulator(t, []topicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 		a.accumulate(ProduceResult{err: kerr.MessageTooLarge})
 
 		r := a.result()

@@ -5,10 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // demotionSuppressionReason is why demotion is suppressed. Its string value is
@@ -93,7 +92,7 @@ type Demoter struct {
 	tracker    AgentStatsReader
 	healthCfg  HealthCheckConfig
 	demoterCfg DemoterConfig
-	logger     log.Logger
+	logger     kgo.Logger
 
 	// now is injectable for testing; defaults to time.Now.
 	now func() time.Time
@@ -110,9 +109,9 @@ type Demoter struct {
 }
 
 // NewDemoter wraps inner with the demotion policy described on Demoter.
-func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig, logger log.Logger, reg prometheus.Registerer) *Demoter {
+func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, health HealthCheckConfig, cfg DemoterConfig, logger kgo.Logger, reg prometheus.Registerer) *Demoter {
 	if logger == nil {
-		logger = log.NewNopLogger()
+		logger = nopLogger{}
 	}
 	d := &Demoter{
 		inner:            inner,
@@ -125,7 +124,7 @@ func NewDemoter(inner PartitionAssignmentStrategy, tracker AgentStatsReader, hea
 	}
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "demoter_demoted_agents",
+		Name: "warpstream_demoter_demoted_agents",
 		Help: "Number of Warpstream agents currently demoted by the Demoter.",
 	}, d.demotedAgentsCount)
 	newDemotionSuppressedMetric(d, reg)
@@ -149,6 +148,9 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	// SlowMultiplier keeps the cache key aligned with the Hedger.
 	now := d.now()
 	clusterStats, hasClusterStats := d.tracker.ClusterStats(now, d.healthCfg.SlowMultiplier, d.healthCfg.FaultyThreshold)
+	if suppressed, _ := d.isDemotionSuppressed(clusterStats, hasClusterStats); suppressed {
+		return d.inner.Candidates(topic, partition, maxCandidates)
+	}
 
 	// The returned list holds up to maxCandidates entries total
 	// (non-demoted alternates plus at most one demoted probe in the
@@ -160,7 +162,10 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	// is deferred to the build pass below; this loop still calls isDemoted,
 	// which can flip lastDemotedProbe membership and log a transition.
 	const maxRetries = 6
-	var agents []Agent
+	var (
+		agents          []Agent
+		noDemotedAgents bool
+	)
 	for retry, extra := 0, 2; retry < maxRetries; retry, extra = retry+1, extra*2 {
 		var (
 			asked      = maxCandidates + extra
@@ -168,10 +173,13 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 		)
 
 		agents = d.inner.Candidates(topic, partition, asked)
+		noDemotedAgents = true
 
 		for _, c := range agents {
 			if !d.isDemoted(now, c.NodeID, clusterStats, hasClusterStats) {
 				nonDemoted++
+			} else {
+				noDemotedAgents = false
 			}
 		}
 
@@ -186,6 +194,9 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	}
 	if len(agents) == 0 {
 		return nil
+	}
+	if noDemotedAgents {
+		return agents[:min(len(agents), maxCandidates)]
 	}
 
 	candidates := make([]Agent, 0, maxCandidates)
@@ -225,16 +236,12 @@ func (d *Demoter) Candidates(topic string, partition int32, maxCandidates int) [
 	return candidates
 }
 
-// isDemoted reports whether agent nodeID currently meets the demotion
-// criteria. It also applies the demotion/recovery edge transition: it
-// updates lastDemotedProbe (inserting on demote, deleting on recovery) and
-// logs the transition once.
+// isDemoted reports whether agent nodeID currently meets the demotion criteria.
+// Candidates checks isDemotionSuppressed first; hasClusterStats is re-checked
+// here so a missing cluster view cannot demote if that call is ever skipped.
+// This also applies the demotion/recovery edge transition and logs it once.
 func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterStats, hasClusterStats bool) bool {
-	// Suppression guard, which also covers cold-start (no cluster view): we'd
-	// rather route fresh traffic to an unknown agent than declare the cluster
-	// unusable, and when too many agents are already faulty, demoting more would
-	// just dump load onto the survivors.
-	if suppressed, _ := d.isDemotionSuppressed(clusterStats, hasClusterStats); suppressed {
+	if !hasClusterStats {
 		return false
 	}
 	stats, ok := d.tracker.AgentStats(now, nodeID)
@@ -285,9 +292,9 @@ func (d *Demoter) isDemoted(now time.Time, nodeID int32, clusterStats ClusterSta
 
 	switch {
 	case demoted:
-		level.Info(d.logger).Log("msg", "warpstream agent demoted", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
+		log(d.logger, kgo.LogLevelInfo, "warpstream agent demoted", "node_id", nodeID, "error_rate", stats.ErrorRate, "request_count", stats.RequestCount, "min_requests", minRequests, "faulty_threshold", clusterStats.FaultyThreshold)
 	case restored:
-		level.Info(d.logger).Log("msg", "warpstream agent restored", "node_id", nodeID)
+		log(d.logger, kgo.LogLevelInfo, "warpstream agent restored", "node_id", nodeID)
 	}
 
 	return isFaulty
@@ -332,6 +339,14 @@ func (d *Demoter) Refresh(currentAgents []int32) {
 }
 
 func (d *Demoter) demotedAgentsCount() float64 {
+	// While demotion is suppressed isDemoted treats every agent as non-demoted,
+	// so no agent is actually being routed around: report 0 rather than the
+	// stale lastDemotedProbe entries left from before suppression tripped, which
+	// would otherwise contradict demoter_demotion_suppressed.
+	clusterStats, hasClusterStats := d.tracker.ClusterStats(d.now(), d.healthCfg.SlowMultiplier, d.healthCfg.FaultyThreshold)
+	if suppressed, _ := d.isDemotionSuppressed(clusterStats, hasClusterStats); suppressed {
+		return 0
+	}
 	d.lastDemotedProbeMu.Lock()
 	defer d.lastDemotedProbeMu.Unlock()
 	return float64(len(d.lastDemotedProbe))
@@ -365,7 +380,7 @@ func newDemotionSuppressedMetric(d *Demoter, reg prometheus.Registerer) *demotio
 	m := &demotionSuppressedMetric{
 		d: d,
 		desc: prometheus.NewDesc(
-			"demoter_demotion_suppressed",
+			"warpstream_demoter_demotion_suppressed",
 			"Whether the Demoter is currently suppressing all demotions (1) and why, broken down by reason; 0 for inactive reasons.",
 			[]string{"reason"}, nil,
 		),

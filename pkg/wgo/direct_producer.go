@@ -10,17 +10,17 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// DirectProducer produces partitions to a specific Warpstream agent by its
-// Kafka NodeID. Implementations must be safe for concurrent use. The wire
-// encoding of partitions into a ProduceRequest happens at the lowest layer
-// (KafkaDirectProducer); upper layers just shuffle partition groups around.
+// DirectProducer produces pre-encoded partitions to a specific Warpstream agent
+// by its Kafka NodeID. Implementations must be safe for concurrent use. The wire
+// request is assembled at the lowest layer (KafkaDirectProducer) from the
+// already-encoded batches; upper layers just shuffle partition groups around.
 //
-// The signature takes bare topicPartitionRecords (without nodeID, done,
+// The signature takes bare encodedTopicPartitionRecords (without nodeID, done,
 // or nodeState) so the "which agent does this batch go to" decision lives
 // in exactly one place — the nodeID parameter — and the function cannot
-// be called with a mismatched per-RTP nodeID.
+// be called with a mismatched per-partition nodeID.
 type DirectProducer interface {
-	ProduceSync(ctx context.Context, nodeID int32, partitions []topicPartitionRecords) ProduceResult
+	ProduceSync(ctx context.Context, nodeID int32, partitions []encodedTopicPartitionRecords) ProduceResult
 }
 
 // KafkaDirectProducerConfig holds the per-request timings for
@@ -49,9 +49,8 @@ func (c *KafkaDirectProducerConfig) Validate() error {
 	return nil
 }
 
-// KafkaDirectProducer implements DirectProducer using kgo.Client. Wire
-// encoding (buildMultiTopicProduceRequest) and per-request timing are
-// enforced here, not at a higher layer.
+// KafkaDirectProducer implements DirectProducer using kgo.Client. Wire request
+// assembly and per-request timing are enforced here, not at a higher layer.
 //
 // This is the only type in this package that depends on kgo.Client directly.
 type KafkaDirectProducer struct {
@@ -76,12 +75,8 @@ func NewKafkaDirectProducer(client *kgo.Client, topicID func(string) ([16]byte, 
 }
 
 // ProduceSync implements DirectProducer.
-func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, nodeID int32, partitions []topicPartitionRecords) (retResult ProduceResult) {
-	var records []*kgo.Record
-	for _, p := range partitions {
-		records = append(records, p.records...)
-	}
-	req, err := buildMultiTopicProduceRequest(s.version, s.topicID, records)
+func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, nodeID int32, partitions []encodedTopicPartitionRecords) (retResult ProduceResult) {
+	req, reqStats, err := buildMultiTopicProduceRequestFromEncoded(s.version, s.topicID, partitions)
 	if err != nil {
 		return ProduceResult{err: err}
 	}
@@ -101,6 +96,16 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, nodeID int32, par
 		latencySeconds := time.Since(reqStart).Seconds()
 		if retResult.succeeded() {
 			s.metrics.produceDirectRequestLatencySuccess.Observe(latencySeconds)
+
+			// Producer-state counters: count the request's batches once, only
+			// when the whole request is acked. The request is all-or-nothing
+			// (see produceResultAccumulator), so a failed attempt counts
+			// nothing and is retried; this mirrors franz-go, which counts each
+			// batch once on success.
+			s.metrics.produceWireRecordsTotal.Add(float64(reqStats.records))
+			s.metrics.produceWireBatchesTotal.Add(float64(reqStats.batches))
+			s.metrics.produceWireBytesTotal.Add(float64(reqStats.uncompressedBytes))
+			s.metrics.produceWireCompressedBytesTotal.Add(float64(reqStats.compressedBytes))
 		} else {
 			reason := getProduceResultErr(retResult.error()).reason
 			s.metrics.produceDirectRequestLatencyFailure.WithLabelValues(reason).Observe(latencySeconds)

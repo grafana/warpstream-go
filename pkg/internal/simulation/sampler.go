@@ -128,8 +128,8 @@ func bucketDeltas(samples []counterSample) []counterBucketDelta {
 // from a wgo registry. Lookup is by metric name, which is the public Prometheus
 // contract.
 func readProduceCounters(reg *prometheus.Registry) (primary, hedge int64) {
-	return gatherCounter(reg, "produce_requests_primary_total"),
-		gatherCounter(reg, "produce_requests_hedge_total")
+	return gatherCounter(reg, "warpstream_produce_requests_primary_total"),
+		gatherCounter(reg, "warpstream_produce_requests_hedge_total")
 }
 
 // gatherCounter returns the value of the named counter from reg. It panics if the
