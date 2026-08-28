@@ -65,6 +65,19 @@ const (
 	// derive the per-attempt produce timeout from the write budget rather than
 	// reusing WriteTimeout (which would leave no room for the overhead).
 	clientProduceRequestTimeout = clientWriteTimeout - clientRequestTimeoutOverhead
+
+	// wgo-only configuration: the Hedger/Demoter/health-check knobs that have no
+	// kgo equivalent. Named (rather than left as inline literals in
+	// newWarpstreamClient) so the report can print the exact values the
+	// simulation ran with alongside the shared client config above.
+	wgoHealthCheckSlowMultiplier    = 2.0
+	wgoHealthCheckMaxSlowFraction   = 0.3
+	wgoHealthCheckFaultyThreshold   = 0.05
+	wgoHealthCheckMaxFaultyFraction = 0.3
+	wgoHedgerMinHedgeDelay          = time.Second
+	wgoHedgerMaxHedgeAgents         = 3
+	wgoDemoterProbeInterval         = time.Second
+	wgoClusterStatsTTL              = time.Second
 )
 
 // produceClient is the minimum clients surface the simulation exercises.
@@ -260,14 +273,14 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 		wgo.WithWriteTimeout(clientWriteTimeout),
 		wgo.WithLinger(clientLinger),
 		wgo.WithBatchMaxBytes(clientBatchMaxBytes),
-		wgo.WithHealthCheckSlowMultiplier(2.0),
-		wgo.WithHealthCheckMaxSlowFraction(0.3),
-		wgo.WithHealthCheckFaultyThreshold(0.05),
-		wgo.WithHealthCheckMaxFaultyFraction(0.3),
-		wgo.WithHedgerMinHedgeDelay(time.Second),
-		wgo.WithHedgerMaxHedgeAgents(3),
-		wgo.WithDemoterProbeInterval(time.Second),
-		wgo.WithClusterStatsTTL(time.Second),
+		wgo.WithHealthCheckSlowMultiplier(wgoHealthCheckSlowMultiplier),
+		wgo.WithHealthCheckMaxSlowFraction(wgoHealthCheckMaxSlowFraction),
+		wgo.WithHealthCheckFaultyThreshold(wgoHealthCheckFaultyThreshold),
+		wgo.WithHealthCheckMaxFaultyFraction(wgoHealthCheckMaxFaultyFraction),
+		wgo.WithHedgerMinHedgeDelay(wgoHedgerMinHedgeDelay),
+		wgo.WithHedgerMaxHedgeAgents(wgoHedgerMaxHedgeAgents),
+		wgo.WithDemoterProbeInterval(wgoDemoterProbeInterval),
+		wgo.WithClusterStatsTTL(wgoClusterStatsTTL),
 		wgo.WithMetadataRefreshInterval(clientMetadataRefresh),
 		wgo.WithProduceRequestTimeout(clientProduceRequestTimeout),
 		wgo.WithProduceRequestTimeoutOverhead(clientRequestTimeoutOverhead),

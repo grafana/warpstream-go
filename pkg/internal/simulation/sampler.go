@@ -132,9 +132,11 @@ func readProduceCounters(reg *prometheus.Registry) (primary, hedge int64) {
 		gatherCounter(reg, "warpstream_produce_requests_hedge_total")
 }
 
-// gatherCounter returns the value of the named counter from reg. It panics if the
-// metric is not registered — that's a contract bug the simulation should fail
-// fast on.
+// gatherCounter returns the value of the named counter from reg. It panics if
+// the metric is not registered — that's a contract bug the simulation should
+// fail fast on. The panic names the coupling: this package looks up Prometheus
+// names as exported by github.com/grafana/warpstream-go/pkg/wgo, so a rename
+// there must be mirrored here (see readProduceCounters).
 func gatherCounter(reg *prometheus.Registry, name string) int64 {
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -152,5 +154,5 @@ func gatherCounter(reg *prometheus.Registry, name string) int64 {
 		}
 		return int64(sum)
 	}
-	panic(fmt.Errorf("gatherCounter: metric %q not registered", name))
+	panic(fmt.Errorf("gatherCounter: metric %q not registered (this simulation is coupled to that Prometheus name in package github.com/grafana/warpstream-go/pkg/wgo)", name))
 }
