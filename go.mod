@@ -1,6 +1,6 @@
 module github.com/grafana/warpstream-go
 
-go 1.25.10
+go 1.26.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -22,7 +22,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
