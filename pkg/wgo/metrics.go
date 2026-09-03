@@ -3,6 +3,7 @@ package wgo
 import (
 	"regexp"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,6 +27,11 @@ type metrics struct {
 	hedgeAttemptsSuppressedTotal *prometheus.CounterVec
 
 	lingerFlushesTotal prometheus.Counter
+
+	// flushesInFlightCount backs flushesInFlight's observations; not itself exported.
+	// A histogram, not a gauge, so a scrape can't miss a spike between polls.
+	flushesInFlightCount atomic.Int64
+	flushesInFlight      prometheus.Histogram
 
 	produceDirectRequestsTotal         *prometheus.CounterVec
 	produceDirectRequestsFailedTotal   *prometheus.CounterVec
@@ -132,6 +138,13 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		lingerFlushesTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_linger_flushes_total",
 			Help: "Total number of partition batch flushes triggered by the linger buffer.",
+		}),
+		flushesInFlight: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Name:                            "warpstream_produce_flushes_in_flight",
+			Help:                            "Distribution of concurrent in-flight AgentBuffer flushes (main and hedge), sampled at each flush start (including itself).",
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
 		}),
 		produceDirectRequestsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_total",
