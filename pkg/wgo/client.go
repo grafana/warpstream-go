@@ -127,7 +127,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	}
 
 	innerTracker := NewAverageAgentStatsTracker()
-	tracker := NewCachedAgentStatsTracker(innerTracker, cfg.ClusterStatsTTL)
+	tracker := NewCachedAgentStatsTracker(NewObservedAgentStatsTracker(innerTracker, m), cfg.ClusterStatsTTL)
 
 	directProducer := NewKafkaDirectProducer(kgoClient, pool.TopicID, ProduceAPIVersion, cfg.DirectProducer, m)
 	// Tracker observes each per-attempt outcome directly. Cross-agent
@@ -157,9 +157,8 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	c.demoter = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg)
 	c.hedger = NewHedger(trackingProducer, tracker, c.demoter, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.BatchMaxBytes, m)
 	// The cluster buffer's AgentFlushFunc is the Hedger, wrapped only to
-	// bound each flush by WriteTimeout. The Hedger is otherwise shaped
-	// like a DirectProducer (same signature as KafkaDirectProducer) so it
-	// composes directly with the buffer.
+	// bound each flush by WriteTimeout. Hedger.ProduceSync still takes a
+	// nodeID so it composes directly with the buffer.
 	c.buffer = NewClusterBuffer[routedTopicPartitionRecords](cfg.Linger, cfg.BatchMaxBytes, c.flushBatch, m, reg)
 	c.startBackgroundRefresh()
 	return c, nil
@@ -393,12 +392,12 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 			case <-c.refreshNowCh:
 				ticker.Reset(c.cfg.MetadataRefreshInterval)
 				startedAt := time.Now()
-				c.refreshPool()
+				c.refreshPool(metadataRefreshTriggerOnDemand)
 				if !c.waitRefreshCooldown(time.Since(startedAt)) {
 					return
 				}
 			case <-ticker.C:
-				c.refreshPool()
+				c.refreshPool(metadataRefreshTriggerPeriodic)
 			}
 		}
 	}()
@@ -415,8 +414,10 @@ func (c *WarpstreamClient) triggerRefresh() {
 
 // refreshPool fetches Metadata and applies the snapshot. Failures are logged
 // and leave the previous snapshot in place.
-func (c *WarpstreamClient) refreshPool() {
+func (c *WarpstreamClient) refreshPool(trigger string) {
+	before := c.pool.Agents()
 	removed, err := c.pool.Refresh(c.refreshCtx)
+	c.metrics.observeMetadataRefresh(trigger, before, c.pool.Agents(), err)
 	if err != nil {
 		log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
 		return

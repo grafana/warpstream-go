@@ -45,7 +45,8 @@ func newMockDirectProducer() *mockDirectProducer {
 	}
 }
 
-func (m *mockDirectProducer) ProduceSync(ctx context.Context, nodeID int32, partitions []encodedTopicPartitionRecords) ProduceResult {
+func (m *mockDirectProducer) ProduceSync(ctx context.Context, target Agent, partitions []encodedTopicPartitionRecords) ProduceResult {
+	nodeID := target.NodeID
 	m.mu.Lock()
 	delay := m.delays[nodeID]
 	err := m.errs[nodeID]
@@ -111,9 +112,9 @@ func TestMockDirectProducer_MultipleCalls(t *testing.T) {
 		m := newMockDirectProducer()
 		ctx := context.Background()
 
-		_ = m.ProduceSync(ctx, 1, nil)
-		_ = m.ProduceSync(ctx, 2, nil)
-		_ = m.ProduceSync(ctx, 1, nil)
+		_ = m.ProduceSync(ctx, Agent{NodeID: 1}, nil)
+		_ = m.ProduceSync(ctx, Agent{NodeID: 2}, nil)
+		_ = m.ProduceSync(ctx, Agent{NodeID: 1}, nil)
 
 		calls := m.recordedCalls()
 		require.Len(t, calls, 3)
@@ -129,7 +130,7 @@ func TestMockDirectProducer_MultipleCalls(t *testing.T) {
 			wg.Add(1)
 			go func(nodeID int32) {
 				defer wg.Done()
-				_ = m.ProduceSync(context.Background(), nodeID, nil)
+				_ = m.ProduceSync(context.Background(), Agent{NodeID: nodeID}, nil)
 			}(int32(i))
 		}
 		wg.Wait()
@@ -143,7 +144,7 @@ func TestMockDirectProducer_MultipleCalls(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			_ = m.ProduceSync(context.Background(), 1, nil)
+			_ = m.ProduceSync(context.Background(), Agent{NodeID: 1}, nil)
 			close(done)
 		}()
 
@@ -197,7 +198,7 @@ func TestMockDirectProducer(t *testing.T) {
 			defer cancel()
 
 			start := time.Now()
-			err := m.ProduceSync(ctx, tc.nodeID, nil).error()
+			err := m.ProduceSync(ctx, Agent{NodeID: tc.nodeID}, nil).error()
 
 			if tc.wantErr {
 				require.Error(t, err)

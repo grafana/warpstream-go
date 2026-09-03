@@ -76,7 +76,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				Timestamp: time.Now(),
 			}}
 
-			res := producer.ProduceSync(t.Context(), brokerNodeID, partitionsForTest(records))
+			res := producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID}, partitionsForTest(records))
 			require.NoError(t, res.err)
 			require.NoError(t, parseProduceResponse(res.resp))
 
@@ -99,15 +99,30 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 			// Counter ticked once on the successful Produce; no failures.
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_total counter
-				warpstream_produce_direct_requests_total 1
+				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
 
-			// Per-attempt latency recorded once under outcome=success; no failure
-			// series exists (only the success series is collected).
+			res = producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID, State: AgentStateDemoted}, partitionsForTest([]*kgo.Record{{
+				Topic:     topicName,
+				Partition: partition,
+				Value:     []byte("probe"),
+				Timestamp: time.Now(),
+			}}))
+			require.NoError(t, res.err)
+
+			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# TYPE warpstream_produce_direct_requests_total counter
+				warpstream_produce_direct_requests_total{agent_state="demoted"} 1
+				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
+			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
+
+			// The latency histogram carries no agent_state label, so both
+			// successful calls land on the one success series.
 			successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
-			assert.Equal(t, uint64(1), successCount)
+			assert.Equal(t, uint64(2), successCount)
 			assert.Equal(t, 1, testutil.CollectAndCount(reg, "warpstream_produce_direct_request_latency_seconds"))
 		})
 	})
@@ -156,7 +171,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			})
 			require.Len(t, merged, 1)
 
-			res := producer.ProduceSync(t.Context(), brokerNodeID, unrouteEncodedTopicPartitionRecords(merged))
+			res := producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID}, unrouteEncodedTopicPartitionRecords(merged))
 			require.NoError(t, res.err)
 			require.NoError(t, parseProduceResponse(res.resp))
 
@@ -237,7 +252,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			}, newMetrics(reg))
 
 			startedAt := time.Now()
-			err = producer.ProduceSync(t.Context(), brokerNodeID, partitionsForTest([]*kgo.Record{{
+			err = producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID}, partitionsForTest([]*kgo.Record{{
 				Topic: topicName, Partition: partition, Value: []byte("v"), Timestamp: time.Now(),
 			}})).error()
 			elapsed := time.Since(startedAt)
@@ -262,12 +277,12 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 			// Failure was an attempt-timeout (DeadlineExceeded from inner ctx).
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent. Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_total counter
-				warpstream_produce_direct_requests_total 1
-				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
+				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_failed_total counter
-				warpstream_produce_direct_requests_failed_total{reason="timeout"} 1
+				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="timeout"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
 		})
 	})
@@ -325,7 +340,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 						ProduceRequestTimeoutOverhead: time.Second,
 					}, m)
 
-					res := producer.ProduceSync(t.Context(), brokerNodeID, partitionsForTest([]*kgo.Record{{
+					res := producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID}, partitionsForTest([]*kgo.Record{{
 						Topic: topicName, Partition: partition, Value: []byte("v"), Timestamp: time.Now(),
 					}}))
 
@@ -333,9 +348,9 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 					assert.ErrorIs(t, res.error(), tc.wantErr)
 
 					require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason. Each retry counts as a separate request.
+						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 						# TYPE warpstream_produce_direct_requests_failed_total counter
-						warpstream_produce_direct_requests_failed_total{reason="%s"} 1
+						warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="%s"} 1
 					`, tc.reason)), "warpstream_produce_direct_requests_failed_total"))
 
 					successCount, _ := histogramCountSum(t, m.produceDirectRequestLatencySuccess.(prometheus.Histogram))
