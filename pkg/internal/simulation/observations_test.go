@@ -16,14 +16,12 @@ func TestObservations_RecordIsThreadSafe(t *testing.T) {
 	const goroutines = 16
 	const perGoroutine = 200
 	var wg sync.WaitGroup
-	wg.Add(goroutines)
 	for range goroutines {
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range perGoroutine {
 				obs.record(time.Now(), 10*time.Millisecond, nil)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	assert.Equal(t, goroutines*perGoroutine, len(obs.snapshot().list))
