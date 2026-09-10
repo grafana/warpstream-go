@@ -414,7 +414,7 @@ func (c *WarpstreamClient) triggerRefresh() {
 
 // refreshPool fetches Metadata and applies the snapshot. Failures are logged
 // and leave the previous snapshot in place.
-func (c *WarpstreamClient) refreshPool(trigger string) {
+func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	before := c.pool.Agents()
 	removed, err := c.pool.Refresh(c.refreshCtx)
 	c.metrics.observeMetadataRefresh(trigger, before, c.pool.Agents(), err)

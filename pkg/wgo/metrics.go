@@ -85,10 +85,16 @@ const (
 	agentStateDemoted = "demoted"
 )
 
-const (
-	metadataRefreshTriggerPeriodic = "periodic"
-	metadataRefreshTriggerOnDemand = "on_demand"
+// metadataRefreshTrigger is why a live AgentPool Metadata refresh ran. Its
+// string value is the "trigger" label on metadataRefreshResultsTotal.
+type metadataRefreshTrigger string
 
+const (
+	metadataRefreshTriggerPeriodic metadataRefreshTrigger = "periodic"
+	metadataRefreshTriggerOnDemand metadataRefreshTrigger = "on_demand"
+)
+
+const (
 	metadataRefreshResultMembershipChanged = "membership_changed"
 	metadataRefreshResultUnchanged         = "unchanged"
 	metadataRefreshResultFailed            = "failed"
@@ -223,7 +229,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 // observeMetadataRefresh records one refresh. Membership is the sorted Agent
 // NodeID list; leader-only Metadata changes count as unchanged.
-func (m *metrics) observeMetadataRefresh(trigger string, before, after []int32, err error) {
+func (m *metrics) observeMetadataRefresh(trigger metadataRefreshTrigger, before, after []int32, err error) {
 	result := metadataRefreshResultUnchanged
 	switch {
 	case err != nil:
@@ -231,7 +237,7 @@ func (m *metrics) observeMetadataRefresh(trigger string, before, after []int32, 
 	case !slices.Equal(before, after):
 		result = metadataRefreshResultMembershipChanged
 	}
-	m.metadataRefreshResultsTotal.WithLabelValues(trigger, result).Inc()
+	m.metadataRefreshResultsTotal.WithLabelValues(string(trigger), result).Inc()
 }
 
 // observeClusterStats records one ClusterStats compute. Without a view the

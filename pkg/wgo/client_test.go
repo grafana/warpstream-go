@@ -1229,11 +1229,11 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 			// New topic, same Agent NodeIDs: on_demand is unchanged, not
 			// membership_changed. Constructor Refresh is not counted.
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-				metadataRefreshTriggerOnDemand, metadataRefreshResultUnchanged)))
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-				metadataRefreshTriggerOnDemand, metadataRefreshResultMembershipChanged)))
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultMembershipChanged)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-				metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+				string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
 
 			second := c.ProduceSync(t.Context(), []*kgo.Record{
 				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
@@ -1258,9 +1258,9 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 			synctest.Wait()
 
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-				metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+				string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-				metadataRefreshTriggerOnDemand, metadataRefreshResultUnchanged)))
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
 		})
 	})
 
@@ -1333,7 +1333,7 @@ func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 		synctest.Wait()
 
 		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-			metadataRefreshTriggerPeriodic, metadataRefreshResultUnchanged)))
+			string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
 		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
 	})
 }

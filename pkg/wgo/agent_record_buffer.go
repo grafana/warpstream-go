@@ -223,10 +223,10 @@ func (a *AgentBuffer[W]) startFlushLocked() {
 
 	a.flushWG.Add(1)
 	inFlight := a.metrics.flushesInFlightCount.Add(1)
-	a.metrics.flushesInFlight.Observe(float64(inFlight))
 	go func() {
 		defer a.flushWG.Done()
 		defer a.metrics.flushesInFlightCount.Add(-1)
+		a.metrics.flushesInFlight.Observe(float64(inFlight))
 		a.metrics.lingerFlushesTotal.Inc()
 		res := a.flush(a.flushCtx, a.nodeID, wire)
 		for _, e := range entries {

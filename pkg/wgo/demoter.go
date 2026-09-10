@@ -341,6 +341,8 @@ func (d *Demoter) Refresh(currentAgents []int32) {
 	defer d.lastDemotedProbeMu.Unlock()
 	for nodeID := range d.lastDemotedProbe {
 		if _, ok := current[nodeID]; !ok {
+			// Leaving the pool is not recovery: do not count a departed agent
+			// as restored on transitionsTotal.
 			delete(d.lastDemotedProbe, nodeID)
 		}
 	}
