@@ -543,7 +543,11 @@ func TestHedger_ProduceSync(t *testing.T) {
 		runHedger(h, context.Background(), req)
 
 		require.NoError(t, capture.get(topic, partition).err)
-		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		// hedgeAttemptsTotal is incremented on the fallback goroutine, which
+		// may not have run yet when the primary already won the race.
+		assert.Eventually(t, func() bool {
+			return testutil.ToFloat64(m.hedgeAttemptsTotal) == 1
+		}, time.Second, 10*time.Millisecond)
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
 		// Primary fires once; the hedge cascade has no candidates to try
 		// so no hedge wire request is issued.
