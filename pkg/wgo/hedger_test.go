@@ -168,7 +168,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer := newMockDirectProducer()
 		producer.respFn = successResp
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -189,7 +189,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 	t.Run("empty input is trivially successful", func(t *testing.T) {
 		producer := newMockDirectProducer()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		// Nothing to produce must classify as success, not the empty/error
 		// sentinel (guards the non-nil empty resp returned for this case).
@@ -205,7 +205,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		m := newMetrics(prometheus.NewPedanticRegistry())
 		// Empty tracker: AgentStats returns !ok for the primary, so
 		// shouldHedge bails at the no-agent-stats gate.
-		h := NewHedger(producer, NewAverageAgentStatsTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, NewAverageAgentStatsTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -224,7 +224,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		t.Cleanup(func() { close(gate) })
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		syncDone := make(chan struct{})
@@ -251,7 +251,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer.errs[primaryID] = kerr.RequestTimedOut
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -281,7 +281,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		m := newMetrics(reg)
 		fastCfg := cfg
 		fastCfg.MinHedgeDelay = time.Millisecond
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, fastCfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, fastCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -319,7 +319,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 		reg := prometheus.NewPedanticRegistry()
 		m := newMetrics(reg)
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -336,7 +336,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer.respFn = successResp
 		reg := prometheus.NewPedanticRegistry()
 		m := newMetrics(reg)
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -374,7 +374,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer.errs[primaryID] = kerr.RequestTimedOut
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), multiStrat, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), multiStrat, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -400,7 +400,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer := newMockDirectProducer()
 		producer.errs[primaryID] = kerr.RequestTimedOut
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), emptyStrat, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), emptyStrat, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -448,7 +448,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer.errs[primaryID] = kerr.RequestTimedOut
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), partialStrat, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), partialStrat, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -491,7 +491,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}},
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), probeStrat, health, probeCfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), probeStrat, health, probeCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		// primary is a probe (nodeState demoted).
@@ -533,7 +533,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}},
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -569,7 +569,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}},
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), strategy, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), strategy, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -592,7 +592,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		producer.errs[secondaryID] = kerr.LeaderNotAvailable
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -629,7 +629,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		failingCfg.MaxHedgeAgents = 4
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), strategy, health, failingCfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), strategy, health, failingCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -699,7 +699,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		ps.bucketsMu.Unlock()
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, tr, strategy, health, fastCfg, 0, 1<<20, m)
+		h := NewHedger(producer, tr, strategy, health, fastCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -759,7 +759,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		failingCfg.MaxHedgeAgents = 2
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, failingCfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, failingCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -787,7 +787,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		failingCfg.MaxHedgeAgents = 2
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, failingCfg, 0, 1<<20, m)
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, failingCfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		runHedger(h, context.Background(), makeReq(capture))
@@ -812,7 +812,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		t.Cleanup(func() { close(gate) })
 
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
@@ -849,7 +849,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}},
 		}
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), probeStrat, health, cfg, 0, 1<<20, m, nil)
 
 		capture := newResultCapture()
 		req := []promised[routedEncodedTopicPartitionRecords]{
@@ -873,7 +873,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 	t.Run("returns error when a routed partition's nodeID disagrees with primaryID", func(t *testing.T) {
 		producer := newMockDirectProducer()
 		m := newMetrics(prometheus.NewPedanticRegistry())
-		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m)
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
 
 		req := []routedEncodedTopicPartitionRecords{
 			{
