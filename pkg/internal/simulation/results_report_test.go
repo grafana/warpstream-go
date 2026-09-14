@@ -77,10 +77,11 @@ func TestResultsReport_GenerateMarkdown(t *testing.T) {
 	assert.Contains(t, md, "# wgo vs kgo simulation report")
 	assert.Contains(t, md, "## Summary")
 	assert.Contains(t, md, "| Scenario | wgo success | kgo success | success Δ | wgo slow |")
-	assert.Contains(t, md, "| all healthy | 10/10 (100.0%) | 10/10 (100.0%) | +0.0 pts | n/a |")
+	// no minSuccessDeltaVsKgo gate configured -> "n/a", not "+0.0 pts".
+	assert.Contains(t, md, "| all healthy | 10/10 (100.0%) | 10/10 (100.0%) | n/a | n/a |")
 	assert.Contains(t, md, "## all healthy")
 	assert.Contains(t, md, "everything fine")
-	assert.Contains(t, md, "- wgo-kgo success delta: +0.0 pts")
+	assert.Contains(t, md, "- wgo-kgo success delta: n/a")
 	assert.NotContains(t, md, "wgo slow fraction:")
 }
 
@@ -146,8 +147,44 @@ func TestResultsReport_GenerateMarkdown_ShowsSlowFractionAndDeltaGates(t *testin
 		},
 	}})
 	md := rr.generateMarkdown()
-	assert.Contains(t, md, "| 1 slow agent | 10/10 (100.0%) | 10/10 (100.0%) | +0.0 pts | 8.2% (≤10.0% >2s) |")
+	// no minSuccessDeltaVsKgo gate on "1 slow agent" -> "n/a" here too.
+	assert.Contains(t, md, "| 1 slow agent | 10/10 (100.0%) | 10/10 (100.0%) | n/a | 8.2% (≤10.0% >2s) |")
 	assert.Contains(t, md, "- wgo slow fraction: 8.2% of requests slower than 2s (ceiling 10.0%)")
+	assert.Contains(t, md, "- wgo-kgo success delta: n/a")
 	assert.Contains(t, md, "| 1 fast-failing agent | 10/10 (100.0%) | 0/10 (0.0%) | +100.0 pts | n/a |")
 	assert.Contains(t, md, "- wgo-kgo success delta: +100.0 pts (want ≥ 50.0 pts)")
+}
+
+// TestResultsReport_SlowFractionLine_RequiresCeiling: slowBudget set without
+// maxWgoSlowFraction (legal, just a no-op gate) must render "n/a"/empty in
+// both places, not "n/a" here and a bare percentage in the bullet.
+func TestResultsReport_SlowFractionLine_RequiresCeiling(t *testing.T) {
+	t.Parallel()
+	rr := &resultsReport{}
+	res := scenarioResult{
+		sc:              scenario{expect: scenarioExpectations{slowBudget: ptr(2 * time.Second)}},
+		wgoSlowFraction: ptr(0.082),
+	}
+	assert.Equal(t, "n/a", rr.slowFractionCell(res))
+	assert.Empty(t, rr.slowFractionLine(res))
+}
+
+// TestResultsReport_SuccessDeltaCell_NaWithoutGate: no gate -> "n/a" even
+// though a real delta exists; with a gate -> the actual delta.
+func TestResultsReport_SuccessDeltaCell_NaWithoutGate(t *testing.T) {
+	t.Parallel()
+	rr := &resultsReport{}
+
+	noGate := scenarioResult{
+		sc:         scenario{expect: scenarioExpectations{}},
+		wgoSummary: observationsSummary{total: 10, successes: 10},
+		kgoSummary: observationsSummary{total: 10, successes: 5},
+	}
+	assert.Equal(t, "n/a", rr.successDeltaCell(noGate))
+	assert.Equal(t, "n/a", rr.successDeltaLine(noGate))
+
+	withGate := noGate
+	withGate.sc.expect.minSuccessDeltaVsKgo = ptr(0.1)
+	assert.Equal(t, "+50.0 pts", rr.successDeltaCell(withGate))
+	assert.Equal(t, "+50.0 pts (want ≥ 10.0 pts)", rr.successDeltaLine(withGate))
 }

@@ -215,10 +215,13 @@ func (rr *resultsReport) summaryLine(s observationsSummary) string {
 		rate, rr.formatDuration(s.meanLatency), rr.formatDuration(s.p50Latency), rr.formatDuration(s.p99Latency))
 }
 
-// successDeltaCell renders wgo's success-rate margin over kgo, in percentage
-// points, e.g. "+45.0 pts". Always shown so a passing run still reports how
-// much headroom the head-to-head gate has.
+// successDeltaCell renders wgo's success-rate margin over kgo, e.g.
+// "+45.0 pts". "n/a" when no minSuccessDeltaVsKgo gate is configured, so
+// it's not mistaken for a gate passing with zero margin.
 func (rr *resultsReport) successDeltaCell(res scenarioResult) string {
+	if !res.hasSuccessDeltaGate() {
+		return "n/a"
+	}
 	return fmt.Sprintf("%+.1f pts", 100*(res.successRate()-res.kgoSuccessRate()))
 }
 
@@ -226,7 +229,7 @@ func (rr *resultsReport) successDeltaCell(res scenarioResult) string {
 // the gate threshold when one is configured.
 func (rr *resultsReport) successDeltaLine(res scenarioResult) string {
 	cell := rr.successDeltaCell(res)
-	if res.sc.expect.minSuccessDeltaVsKgo != nil {
+	if res.hasSuccessDeltaGate() {
 		return fmt.Sprintf("%s (want ≥ %.1f pts)", cell, 100**res.sc.expect.minSuccessDeltaVsKgo)
 	}
 	return cell
@@ -236,7 +239,7 @@ func (rr *resultsReport) successDeltaLine(res scenarioResult) string {
 // when the scenario asserts one, e.g. "8.2% (≤10.0% >2s)". "n/a" when the
 // scenario has no slow-fraction gate — there is no budget to measure against.
 func (rr *resultsReport) slowFractionCell(res scenarioResult) string {
-	if res.wgoSlowFraction == nil || res.sc.expect.slowBudget == nil || res.sc.expect.maxWgoSlowFraction == nil {
+	if !res.hasSlowFractionGate() {
 		return "n/a"
 	}
 	return fmt.Sprintf("%.1f%% (≤%.1f%% >%s)",
@@ -245,15 +248,11 @@ func (rr *resultsReport) slowFractionCell(res scenarioResult) string {
 
 // slowFractionLine is the per-scenario bullet for the same measurement.
 func (rr *resultsReport) slowFractionLine(res scenarioResult) string {
-	if res.wgoSlowFraction == nil || res.sc.expect.slowBudget == nil {
+	if !res.hasSlowFractionGate() {
 		return ""
 	}
-	line := fmt.Sprintf("wgo slow fraction: %.1f%% of requests slower than %s",
-		100**res.wgoSlowFraction, *res.sc.expect.slowBudget)
-	if res.sc.expect.maxWgoSlowFraction != nil {
-		line += fmt.Sprintf(" (ceiling %.1f%%)", 100**res.sc.expect.maxWgoSlowFraction)
-	}
-	return line
+	return fmt.Sprintf("wgo slow fraction: %.1f%% of requests slower than %s (ceiling %.1f%%)",
+		100**res.wgoSlowFraction, *res.sc.expect.slowBudget, 100**res.sc.expect.maxWgoSlowFraction)
 }
 
 // hedgeSurgePct renders the overall hedge surge (hedge wire requests as a
