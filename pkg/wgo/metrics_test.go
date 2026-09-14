@@ -93,10 +93,14 @@ func TestProducerStateMetricsMatchKprom(t *testing.T) {
 		"kprom's producer-state metric names changed; update kpromProducerStateMetricNames and the names this client registers in newMetrics / NewClusterBuffer")
 }
 
-// Under `go test`, warpstream-go is the main module (so version is Go's
-// "(devel)" marker) and Deps is empty (so franz_go_version stays "unknown");
-// see TestBuildInfoVersions for coverage of the Deps-lookup logic itself.
+// Under `go test`, whether debug.ReadBuildInfo() fills in Deps depends on the
+// Go version and local build setup, not on this code, so the exact version
+// strings vary by machine. This checks the gauge carries whatever
+// clientBuildInfo() itself returns; see TestBuildInfoVersions for coverage
+// of the Deps-lookup logic on fixed, synthetic input.
 func TestNewMetrics_BuildInfo(t *testing.T) {
+	wantVersion, wantFranzGoVersion := clientBuildInfo()
+
 	reg := prometheus.NewPedanticRegistry()
 	newMetrics(reg)
 
@@ -115,8 +119,8 @@ func TestNewMetrics_BuildInfo(t *testing.T) {
 		for _, lp := range m.GetLabel() {
 			labels[lp.GetName()] = lp.GetValue()
 		}
-		assert.Equal(t, "(devel)", labels["version"])
-		assert.Equal(t, "unknown", labels["franz_go_version"])
+		assert.Equal(t, wantVersion, labels["version"])
+		assert.Equal(t, wantFranzGoVersion, labels["franz_go_version"])
 		return
 	}
 	t.Fatal("warpstream_client_build_info metric not found")
