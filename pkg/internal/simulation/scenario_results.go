@@ -39,6 +39,18 @@ func successFraction(s observationsSummary) float64 {
 	return float64(s.successes) / float64(s.total)
 }
 
+// hasSlowFractionGate reports whether r has both the config and the
+// measurement needed to evaluate the slow-fraction gate.
+func (r scenarioResult) hasSlowFractionGate() bool {
+	return r.sc.expect.slowBudget != nil && r.sc.expect.maxWgoSlowFraction != nil && r.wgoSlowFraction != nil
+}
+
+// hasSuccessDeltaGate reports whether r's scenario asserts a
+// minSuccessDeltaVsKgo gate.
+func (r scenarioResult) hasSuccessDeltaGate() bool {
+	return r.sc.expect.minSuccessDeltaVsKgo != nil
+}
+
 // scenarioResults is the outcome of running every scenario.
 type scenarioResults struct {
 	entries []scenarioResult
@@ -69,7 +81,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		})
 	}
 
-	if exp.slowBudget != nil && exp.maxWgoSlowFraction != nil && res.wgoSlowFraction != nil {
+	if res.hasSlowFractionGate() {
 		if got := *res.wgoSlowFraction; got > *exp.maxWgoSlowFraction {
 			out = append(out, scenarioFailure{
 				scenario: res.sc.name,
@@ -79,7 +91,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 
-	if exp.minSuccessDeltaVsKgo != nil {
+	if res.hasSuccessDeltaGate() {
 		delta := res.successRate() - res.kgoSuccessRate()
 		if delta < *exp.minSuccessDeltaVsKgo {
 			out = append(out, scenarioFailure{

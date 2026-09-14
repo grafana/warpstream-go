@@ -103,7 +103,7 @@ func TestGatherCounter(t *testing.T) {
 
 	t.Run("panics on missing metric", func(t *testing.T) {
 		reg := prometheus.NewPedanticRegistry()
-		assert.PanicsWithError(t, `gatherCounter: metric "missing_total" not registered`, func() {
+		assert.PanicsWithError(t, `gatherCounter: metric "missing_total" not registered (this simulation is coupled to that Prometheus name in package github.com/grafana/warpstream-go/pkg/wgo)`, func() {
 			gatherCounter(reg, "missing_total")
 		})
 	})

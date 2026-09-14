@@ -67,15 +67,21 @@ func run(ctx context.Context) (scenarioResults, error) {
 	return scenarioResults{entries: out}, nil
 }
 
-// printSummary writes a one-line-per-scenario PASS/FAIL overview.
+// printSummary writes a one-line-per-scenario PASS/FAIL overview. Status is
+// driven by checkResult so a scenario that misses a slow-fraction or
+// success-delta gate cannot print as if it only had a success-rate floor.
 func printSummary(w io.Writer, r scenarioResults) {
 	fmt.Fprintln(w, "scenario summary (wgo app-level success):")
 	for _, res := range r.entries {
+		missed := checkResult(res)
 		status := "PASS"
-		if len(checkResult(res)) > 0 {
+		if len(missed) > 0 {
 			status = "FAIL"
 		}
 		fmt.Fprintf(w, "  [%s] %-42s %.1f%% (want >= %.1f%%)\n",
 			status, res.sc.name, 100*res.successRate(), 100*res.sc.expect.minWgoSuccessRate)
+		for _, f := range missed {
+			fmt.Fprintf(w, "         %s\n", f.detail)
+		}
 	}
 }
