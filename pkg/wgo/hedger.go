@@ -168,14 +168,22 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 
 	candidates := newHedgerCandidates(h.strategy, h.cfg.MaxHedgeAgents)
 
+	// raceWithPrimary starts the fallback cascade alongside the still-in-flight
+	// primary and returns whichever produces a usable outcome first. Shared by
+	// the delay==0 fast path and the timer.C branch below, so a future edit to
+	// this behavior can't land in only one of them.
+	raceWithPrimary := func() ProduceResult {
+		hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh)
+		observeAttempts(hedged.result, hedged.attempts)
+		return hedged.result
+	}
+
 	if shouldHedge {
 		// NewTimer(0) is already fired, so a select against a ready
 		// primaryCh is a coin flip. Skip the timer and always start
 		// the fallback race; either leg can still win.
 		if delay == 0 {
-			hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh)
-			observeAttempts(hedged.result, hedged.attempts)
-			return hedged.result
+			return raceWithPrimary()
 		}
 
 		timer := time.NewTimer(delay)
@@ -193,9 +201,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 			observeAttempts(result, hedged.attempts)
 			return result
 		case <-timer.C:
-			hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh)
-			observeAttempts(hedged.result, hedged.attempts)
-			return hedged.result
+			return raceWithPrimary()
 		}
 	}
 
