@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -90,6 +91,87 @@ func TestProducerStateMetricsMatchKprom(t *testing.T) {
 	}
 	assert.ElementsMatch(t, kpromProducerStateMetricNames, got,
 		"kprom's producer-state metric names changed; update kpromProducerStateMetricNames and the names this client registers in newMetrics / NewClusterBuffer")
+}
+
+// Under `go test`, whether debug.ReadBuildInfo() fills in Deps depends on the
+// Go version and local build setup, not on this code, so the exact version
+// strings vary by machine. This checks the gauge carries whatever
+// clientBuildInfo() itself returns; see TestBuildInfoVersions for coverage
+// of the Deps-lookup logic on fixed, synthetic input.
+func TestNewMetrics_BuildInfo(t *testing.T) {
+	wantVersion, wantFranzGoVersion := clientBuildInfo()
+
+	reg := prometheus.NewPedanticRegistry()
+	newMetrics(reg)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	for _, mf := range mfs {
+		if mf.GetName() != "warpstream_client_build_info" {
+			continue
+		}
+		require.Len(t, mf.GetMetric(), 1)
+		m := mf.GetMetric()[0]
+		assert.Equal(t, float64(1), m.GetGauge().GetValue())
+
+		labels := map[string]string{}
+		for _, lp := range m.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		assert.Equal(t, wantVersion, labels["version"])
+		assert.Equal(t, wantFranzGoVersion, labels["franz_go_version"])
+		return
+	}
+	t.Fatal("warpstream_client_build_info metric not found")
+}
+
+func TestBuildInfoVersions(t *testing.T) {
+	t.Run("reads warpstream-go and franz-go versions from Deps", func(t *testing.T) {
+		info := &debug.BuildInfo{
+			Main: debug.Module{Path: "example.com/someapp", Version: "v1.0.0"},
+			Deps: []*debug.Module{
+				{Path: warpstreamGoModulePath, Version: "v1.2.3"},
+				{Path: franzGoModulePath, Version: "v1.21.5"},
+			},
+		}
+		version, franzGoVersion := buildInfoVersions(info)
+		assert.Equal(t, "v1.2.3", version)
+		assert.Equal(t, "v1.21.5", franzGoVersion)
+	})
+
+	t.Run("prefers dep.Replace over the pre-replace requirement", func(t *testing.T) {
+		info := &debug.BuildInfo{
+			Main: debug.Module{Path: "example.com/someapp", Version: "v1.0.0"},
+			Deps: []*debug.Module{
+				{
+					Path:    franzGoModulePath,
+					Version: "v0.0.0-00010101000000-000000000000",
+					Replace: &debug.Module{Path: "../local-fork", Version: "v1.99.0"},
+				},
+			},
+		}
+		_, franzGoVersion := buildInfoVersions(info)
+		assert.Equal(t, "v1.99.0", franzGoVersion)
+	})
+
+	t.Run("falls back to unknown for a malformed version", func(t *testing.T) {
+		info := &debug.BuildInfo{
+			Deps: []*debug.Module{
+				{Path: franzGoModulePath, Version: ""},
+			},
+		}
+		_, franzGoVersion := buildInfoVersions(info)
+		assert.Equal(t, "unknown", franzGoVersion)
+	})
+
+	t.Run("uses Main.Version when warpstream-go is the main module", func(t *testing.T) {
+		info := &debug.BuildInfo{
+			Main: debug.Module{Path: warpstreamGoModulePath, Version: "(devel)"},
+		}
+		version, _ := buildInfoVersions(info)
+		assert.Equal(t, "(devel)", version)
+	})
 }
 
 // gaugeValue returns the single-series value of the named gauge family.
