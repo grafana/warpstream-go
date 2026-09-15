@@ -1,5 +1,4 @@
-//go:build (!arm && !arm64) || noasm || (arm64 && !gc)
-// +build !arm,!arm64 noasm arm64,!gc
+// +build !arm noasm
 
 package xxh32
 
