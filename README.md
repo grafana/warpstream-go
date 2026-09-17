@@ -27,6 +27,7 @@ This client has been designed around the following non-negotiable assumptions:
 2. **At-least-once delivery only.** Duplicates are tolerable. Any code that assumes exactly-once or in-partition record ordering must stay on franz-go.
 3. **No transactional or idempotent producer support.** `DisableIdempotentWrite()` semantics are baked in — no `producerId`/`producerEpoch`/`baseSequence` handshake.
 4. **Produce never blocks on Metadata.** The agent pool is refreshed on a timer and also on-demand when routing finds no candidate. The current Produce call still fails immediately rather than waiting for the fetch; a later Produce can use the updated pool. On-demand refreshes are coalesced and paced by `OnDemandMetadataRefreshInterval` (default 1s) to avoid request storms.
+5. **No custom partitioner.** wgo has no default partitioning logic and does not accept a custom `kgo.Partitioner`. The caller must set `record.Partition` on every record before calling Produce. An unset `Partition` field silently routes to partition 0.
 
 ## How it works
 
