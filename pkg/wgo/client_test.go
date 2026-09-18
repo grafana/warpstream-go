@@ -452,11 +452,7 @@ func TestWarpstreamClient_ProducedRecordFieldsMatchFranzGo(t *testing.T) {
 			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
 			fc := newFranzClient(t, clusterAddr, vnet)
 
-			// A compressible payload so both clients apply snappy: this client
-			// compresses only when it shrinks the batch, and franz-go's default
-			// codec preference is snappy. Incompressible payloads legitimately
-			// diverge (this client falls back to no compression, franz-go does not),
-			// which is a compression-policy difference, not a record-field one.
+			// Highly compressible payload, so Snappy shrinks it and both clients stamp codec 2.
 			value := bytes.Repeat([]byte("compress-me-"), 64)
 
 			franzRec := &kgo.Record{Topic: topic, Partition: 0, Value: value, Timestamp: time.Now()}
@@ -468,6 +464,30 @@ func TestWarpstreamClient_ProducedRecordFieldsMatchFranzGo(t *testing.T) {
 			require.Equal(t, uint8(2), franzRec.Attrs.CompressionType(), "franz-go must snappy-compress this payload")
 			assert.Equal(t, franzRec.Attrs, wgoRec.Attrs)
 			assert.Equal(t, uint8(2), wgoRec.Attrs.CompressionType())
+			assert.Equal(t, int8(0), wgoRec.Attrs.TimestampType())
+		})
+	})
+
+	t.Run("Attrs on success with an incompressible payload", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
+			fc := newFranzClient(t, clusterAddr, vnet)
+
+			// High-entropy so Snappy does not shrink; both clients then stamp codec 0.
+			value := make([]byte, 256)
+			for i := range value {
+				value[i] = byte(i * 167)
+			}
+
+			franzRec := &kgo.Record{Topic: topic, Partition: 0, Value: value, Timestamp: time.Now()}
+			require.NoError(t, fc.ProduceSync(t.Context(), franzRec).FirstErr())
+
+			wgoRec := &kgo.Record{Topic: topic, Partition: 0, Value: value, Timestamp: time.Now()}
+			require.NoError(t, c.ProduceSync(t.Context(), []*kgo.Record{wgoRec})[0].Err)
+
+			require.Equal(t, uint8(0), franzRec.Attrs.CompressionType(), "franz-go must leave this payload uncompressed")
+			assert.Equal(t, franzRec.Attrs, wgoRec.Attrs)
+			assert.Equal(t, uint8(0), wgoRec.Attrs.CompressionType())
 			assert.Equal(t, int8(0), wgoRec.Attrs.TimestampType())
 		})
 	})
