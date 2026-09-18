@@ -26,7 +26,8 @@ This client has been designed around the following non-negotiable assumptions:
 1. **Warpstream-specific.** Hedging the same batch across agents only works because any agent can serve any partition. Pointed at vanilla Kafka, the secondary leg would fail with `NotLeaderForPartition`.
 2. **At-least-once delivery only.** Duplicates are tolerable. Any code that assumes exactly-once or in-partition record ordering must stay on franz-go.
 3. **No transactional or idempotent producer support.** `DisableIdempotentWrite()` semantics are baked in — no `producerId`/`producerEpoch`/`baseSequence` handshake.
-4. **Background-only Metadata refresh.** Produce requests never block on Metadata; an out-of-date pool view is preferred to an in-flight stall.
+4. **Produce never blocks on Metadata.** The agent pool is refreshed on a timer and also on-demand when routing finds no candidate. The current Produce call still fails immediately rather than waiting for the fetch; a later Produce can use the updated pool. On-demand refreshes are coalesced and paced by `OnDemandMetadataRefreshInterval` (default 1s) to avoid request storms.
+5. **No custom partitioner.** wgo has no default partitioning logic and does not accept a custom `kgo.Partitioner`. The caller must set `record.Partition` on every record before calling Produce. An unset `Partition` field silently routes to partition 0.
 
 ## How it works
 
@@ -61,6 +62,8 @@ When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which
 - **Primary wins outright.** The primary leg returns first with a clean result; we surface it and the secondary never fires.
 - **Primary fails, cascade retries.** A leg counts as failed if *any* partition in its response errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling fails). The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
 - **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins, and the loser is cancelled.
+
+Before accepting a primary response, the Hedger checks that it includes every requested topic-partition. An incomplete response triggers the existing retry path and logs a warning with the agent ID and first missing topic-partition, even if a retry succeeds. Partitions still unacknowledged after retries are exhausted are reported as failed.
 
 The hedge decision is **data-driven**, not unconditional. The Hedger consults rolling per-agent latency and error stats (the same window the `Demoter` uses, so both components agree on "is agent X bad?"). When the primary looks unhealthy the hedge delay is the cluster's baseline latency, so the fallback fires quickly. When the primary looks healthy the delay is multiplied so we don't stampede the cluster during normal operation — but we still hedge, because tail-latency amplification (every application request fans out to all partitions; one slow primary stalls the whole request) is the dominant cost we're trying to avoid. Either way the computed delay is floored at the configured `MinHedgeDelay` (probes are the exception — they fire the fallback immediately with no delay).
 

@@ -593,3 +593,66 @@ func TestAgentBuffer_Close(t *testing.T) {
 		<-done
 	})
 }
+
+// flushesInFlightSample reads the current sample count and sum off the
+// warpstream_produce_flushes_in_flight histogram registered on reg.
+func flushesInFlightSample(t *testing.T, reg *prometheus.Registry) (count uint64, sum float64) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "warpstream_produce_flushes_in_flight" {
+			continue
+		}
+		require.Len(t, mf.GetMetric(), 1)
+		h := mf.GetMetric()[0].GetHistogram()
+		return h.GetSampleCount(), h.GetSampleSum()
+	}
+	t.Fatal("warpstream_produce_flushes_in_flight not registered")
+	return 0, 0
+}
+
+// TestAgentBuffer_FlushesInFlightHistogram verifies flushesInFlight observes
+// the in-flight count at each flush start, and not at completion.
+func TestAgentBuffer_FlushesInFlightHistogram(t *testing.T) {
+	flush := newRecordingFlush()
+	release := make(chan struct{})
+	flush.onFlush = func(int32, []*kgo.Record) error {
+		<-release
+		return nil
+	}
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+	a1 := NewAgentBuffer[routedTopicPartitionRecords](1, 10*time.Millisecond, 1<<20, flush.Func(), m)
+	a2 := NewAgentBuffer[routedTopicPartitionRecords](2, 10*time.Millisecond, 1<<20, flush.Func(), m)
+
+	count, sum := flushesInFlightSample(t, reg)
+	require.Zero(t, count)
+	require.Zero(t, sum)
+
+	done1 := make(chan error, 1)
+	a1.MultiAdd(routedToSharedDone(1, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done1 <- err }))
+	require.Eventually(t, func() bool { return flush.callCount() == 1 },
+		time.Second, 10*time.Millisecond)
+
+	count, sum = flushesInFlightSample(t, reg)
+	assert.EqualValues(t, 1, count, "one flush has started")
+	assert.Equal(t, float64(1), sum, "it observed in-flight=1")
+
+	done2 := make(chan error, 1)
+	a2.MultiAdd(routedToSharedDone(2, []*kgo.Record{makeRecord("t", 0, "v")}, func(err error) { done2 <- err }))
+	require.Eventually(t, func() bool { return flush.callCount() == 2 },
+		time.Second, 10*time.Millisecond)
+
+	count, sum = flushesInFlightSample(t, reg)
+	assert.EqualValues(t, 2, count, "a second flush started while the first was still blocked")
+	assert.Equal(t, float64(3), sum, "second observation is in-flight=2, so sum is 1+2")
+
+	close(release)
+	<-done1
+	<-done2
+
+	count, sum = flushesInFlightSample(t, reg)
+	assert.EqualValues(t, 2, count, "completions are not observed")
+	assert.Equal(t, float64(3), sum, "sample is unchanged after both flushes finish")
+}

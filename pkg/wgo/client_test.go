@@ -18,7 +18,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
-	"github.com/grafana/warpstream-go/pkg/wgo/internal/testkafka"
+	"github.com/grafana/warpstream-go/pkg/internal/testkafka"
 )
 
 // testWarpstreamOpts returns the options used to build a WarpstreamClient
@@ -55,10 +55,12 @@ func testWarpstreamOpts(clusterAddr, topic string) []Opt {
 // Extra opts are appended after the shared defaults, so a test can add options
 // (e.g. WithHooks) or override a default.
 //
-// The background metadata refresh goroutine runs but its ticker
-// (MetadataRefreshInterval) is well above any individual test's virtual runtime,
-// so it never fires; t.Cleanup runs inside the bubble and Close cancels the
-// refresh ctx and joins the goroutine before the bubble ends.
+// The background metadata refresh goroutine runs; its ticker
+// (MetadataRefreshInterval) is well above any individual test's virtual runtime
+// so the timer never fires on its own. Routing a record with no candidate
+// nudges an on-demand refresh, which is expected. t.Cleanup runs inside the
+// bubble and Close cancels the refresh ctx and joins the goroutine before the
+// bubble ends.
 func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32, opts ...Opt) (*WarpstreamClient, *kfake.Cluster, string, *kfake.VirtualNetwork) {
 	t.Helper()
 
@@ -708,7 +710,7 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 		WithWriteTimeout(writeTimeout),
 		WithProduceRequestTimeout(produceRequestTimeout),
 		WithProduceRequestTimeoutOverhead(produceTimeoutOverhead),
-		WithHedgerMinHedgeDelay(time.Hour),
+		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
 	}
 
 	// wedgeAgent makes every Produce request to the cluster block until the test
@@ -1038,21 +1040,8 @@ type produceClient interface {
 	Close()
 }
 
-// BenchmarkClient_Produce stresses Produce() throughput for both backends against
-// the same kfake cluster (multi-broker, multi-partition), with many concurrent
-// goroutines fanning small records across partitions. To keep the comparison
-// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
-// WarpstreamClient — both legs run with identical kgo configuration. The
-// custom records/sec metric reports post-completion throughput; combined
-// with -benchmem it gives a per-record CPU and allocation profile.
-func BenchmarkClient_Produce(b *testing.B) {
-	const (
-		topic         = "bench-topic"
-		numPartitions = int32(500)
-		numBrokers    = 100
-		valueLen      = 1024
-		recordsPerOp  = 100
-	)
+func newBenchmarkWarpstreamClient(b *testing.B, topic string, numPartitions int32, numBrokers int, linger time.Duration) *WarpstreamClient {
+	b.Helper()
 
 	cluster, addr := testkafka.CreateCluster(b, numPartitions, topic, testkafka.WithNumBrokers(numBrokers))
 	b.Cleanup(cluster.Close)
@@ -1065,13 +1054,13 @@ func BenchmarkClient_Produce(b *testing.B) {
 		WithClientID("warpstream-bench"),
 		WithDialTimeout(2*time.Second),
 		WithWriteTimeout(30*time.Second),
-		WithLinger(50*time.Millisecond),
+		WithLinger(linger),
 		WithBatchMaxBytes(16<<20),
 		WithHealthCheckSlowMultiplier(2.0),
 		WithHealthCheckMaxSlowFraction(0.3),
 		WithHealthCheckFaultyThreshold(0.05),
 		WithHealthCheckMaxFaultyFraction(0.3),
-		WithHedgerMinHedgeDelay(time.Hour), // Disable hedging: never fires within the benchmark.
+		WithHedgerMinHedgeDelay(time.Hour),
 		WithHedgerMaxHedgeAgents(3),
 		WithDemoterProbeInterval(time.Second),
 		WithClusterStatsTTL(time.Second),
@@ -1081,6 +1070,54 @@ func BenchmarkClient_Produce(b *testing.B) {
 	)
 	require.NoError(b, err)
 	b.Cleanup(wsc.Close)
+	return wsc
+}
+
+func seedBenchmarkAgentStats(wsc *WarpstreamClient, numBrokers int) {
+	now := time.Now()
+	for nodeID := range numBrokers {
+		// Agent stats require activity in two time buckets; seed both so the
+		// benchmark measures routing with an active healthy cluster view.
+		wsc.tracker.TrackAgentRequest(now.Add(-bucketDuration), int32(nodeID), time.Millisecond, nil)
+		wsc.tracker.TrackAgentRequest(now, int32(nodeID), time.Millisecond, nil)
+	}
+}
+
+func BenchmarkClient_Produce(b *testing.B) {
+	benchmarkClientProduce(b, 1024, false)
+}
+
+func BenchmarkClient_ProduceSmallPayload(b *testing.B) {
+	benchmarkClientProduce(b, 16, false)
+}
+
+func BenchmarkClient_ProduceSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduce(b, 16, true)
+}
+
+// benchmarkClientProduce stresses Produce() throughput for both backends against
+// the same kfake cluster (multi-broker, multi-partition), with many concurrent
+// goroutines fanning small records across partitions. To keep the comparison
+// apples-to-apples, the franz-go side uses the *kgo.Client embedded in the
+// WarpstreamClient — both legs run with identical kgo configuration. The
+// custom records/sec metric reports post-completion throughput; combined
+// with -benchmem it gives a per-record CPU and allocation profile.
+func benchmarkClientProduce(b *testing.B, valueLen int, steadyState bool) {
+	const (
+		topic         = "bench-topic"
+		numPartitions = int32(500)
+		numBrokers    = 100
+		recordsPerOp  = 100
+	)
+
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 50*time.Millisecond)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
 
 	// The franz-go leg reuses the kgo.Client embedded in the WarpstreamClient
 	// (its produce path is unaffected by the wrapping logic), so both legs
@@ -1143,6 +1180,64 @@ func BenchmarkClient_Produce(b *testing.B) {
 			})
 		}
 	}
+}
+
+// BenchmarkClient_ProduceSync exercises the complete batched produce path,
+// including routing, per-agent buffering, encoding, and the Kafka round trip.
+func BenchmarkClient_ProduceSync(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024, false)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayload(b *testing.B) {
+	benchmarkClientProduceSync(b, 16, false)
+}
+
+func BenchmarkClient_ProduceSyncSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 1024, true)
+}
+
+func BenchmarkClient_ProduceSyncSmallPayloadSteadyState(b *testing.B) {
+	benchmarkClientProduceSync(b, 16, true)
+}
+
+func benchmarkClientProduceSync(b *testing.B, valueLen int, steadyState bool) {
+	const (
+		topic           = "bench-topic"
+		numPartitions   = int32(100)
+		numBrokers      = 10
+		recordsPerBatch = 100
+	)
+
+	wsc := newBenchmarkWarpstreamClient(b, topic, numPartitions, numBrokers, 0)
+	if steadyState {
+		seedBenchmarkAgentStats(wsc, numBrokers)
+	}
+	value := make([]byte, valueLen)
+	records := make([]*kgo.Record, recordsPerBatch)
+	for i := range records {
+		records[i] = &kgo.Record{
+			Topic:     topic,
+			Partition: int32(i) % numPartitions,
+			Value:     value,
+		}
+	}
+
+	results := wsc.ProduceSync(context.Background(), records)
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		results = wsc.ProduceSync(context.Background(), records)
+	}
+	b.StopTimer()
+
+	for _, result := range results {
+		require.NoError(b, result.Err)
+	}
+	b.ReportMetric(float64(b.N*recordsPerBatch)/b.Elapsed().Seconds(), "records/sec")
 }
 
 // TestWarpstreamClient_ReusedPooledRecordsAreRaceFree exercises the produce
@@ -1222,7 +1317,7 @@ func TestWarpstreamClient_ReusedPooledRecordsAreRaceFree(t *testing.T) {
 		// shouldHedge is not suppressed (no cold-start, no dependence on crossing a
 		// 10s bucket boundary). 1ms baseline keeps the hedge delay well below the
 		// slow agent's injected 10ms latency.
-		inner := c.tracker.inner.(*AverageAgentStatsTracker)
+		inner := c.tracker.inner.(*ObservedAgentStatsTracker).inner.(*AverageAgentStatsTracker)
 		nowNs := time.Now().UnixNano()
 		for _, nodeID := range c.pool.Agents() {
 			seedFullWindow(inner, nodeID, nowNs, 50, 1, 0)
@@ -1316,6 +1411,185 @@ func TestWarpstreamClient_ReusedPooledRecordsAreRaceFree(t *testing.T) {
 			require.Zero(t, failures.Load(), "produces must succeed")
 			require.Positive(t, testutil.ToFloat64(c.metrics.produceRequestsHedgeTotal),
 				"expected the hedge path to fire; the test would not cover the regression otherwise")
+		})
+	})
+}
+
+func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
+	const topic = "test-topic"
+
+	t.Run("CreateTopics is visible on the next produce after a routing miss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			reg := prometheus.NewPedanticRegistry()
+			vnet := &kfake.VirtualNetwork{}
+			_, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			assert.Equal(t, 0, testutil.CollectAndCount(reg, "warpstream_metadata_refresh_results_total"))
+
+			const newTopic = "created-after-start"
+
+			createReq := kmsg.NewPtrCreateTopicsRequest()
+			createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
+				Topic:             newTopic,
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+			}}
+			_, err = c.Request(t.Context(), createReq)
+			require.NoError(t, err)
+
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
+			first := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Len(t, first, 1)
+			require.ErrorContains(t, first[0].Err, "no agent assigned")
+
+			synctest.Wait()
+
+			// New topic, same Agent NodeIDs: on_demand is unchanged, not
+			// membership_changed. Constructor Refresh is not counted.
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultMembershipChanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
+
+			second := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: newTopic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Len(t, second, 1)
+			require.NoError(t, second[0].Err)
+		})
+	})
+
+	t.Run("periodic refresh records periodic unchanged", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			reg := prometheus.NewPedanticRegistry()
+			vnet := &kfake.VirtualNetwork{}
+			_, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			assert.Equal(t, 0, testutil.CollectAndCount(reg, "warpstream_metadata_refresh_results_total"))
+
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
+		})
+	})
+
+	t.Run("concurrent unknown-topic produces coalesce to one refresh", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
+			time.Sleep(time.Nanosecond)
+			var meta atomic.Int64
+			cluster.ControlKey(int16(kmsg.Metadata), func(kmsg.Request) (kmsg.Response, error, bool) {
+				meta.Add(1)
+				return nil, nil, false
+			})
+
+			const n = 20
+			start := time.Now()
+			var wg sync.WaitGroup
+			wg.Add(n)
+			for range n {
+				go func() {
+					defer wg.Done()
+					done := make(chan struct{})
+					c.Produce(t.Context(), &kgo.Record{
+						Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now(),
+					}, func(*kgo.Record, error) { close(done) })
+					<-done
+				}()
+			}
+			wg.Wait()
+			assert.Zero(t, time.Since(start))
+
+			synctest.Wait()
+			assert.Equal(t, int64(1), meta.Load())
+		})
+	})
+
+	t.Run("Close during refresh cooldown does not deadlock", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+			})
+			require.Error(t, results[0].Err)
+			synctest.Wait()
+			c.Close()
+		})
+	})
+}
+
+func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reg := prometheus.NewPedanticRegistry()
+		vnet := &kfake.VirtualNetwork{}
+		_, clusterAddr := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithVirtualNetwork(vnet))
+		c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, "test-topic"), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		_, err = reg.Gather()
+		require.NoError(t, err)
+
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_fraction"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 0)
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
+
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+
+		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+			string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
+		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
+	})
+}
+
+func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {
+	t.Run("fetch time counts toward the interval", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			c := &WarpstreamClient{
+				cfg:        Config{OnDemandMetadataRefreshInterval: time.Second},
+				refreshCtx: ctx,
+			}
+
+			startedAt := time.Now()
+			assert.True(t, c.waitRefreshCooldown(250*time.Millisecond))
+			assert.Equal(t, 750*time.Millisecond, time.Since(startedAt))
+		})
+	})
+
+	t.Run("no additional wait after a slow fetch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			c := &WarpstreamClient{
+				cfg:        Config{OnDemandMetadataRefreshInterval: time.Second},
+				refreshCtx: ctx,
+			}
+
+			startedAt := time.Now()
+			assert.True(t, c.waitRefreshCooldown(2*time.Second))
+			assert.Zero(t, time.Since(startedAt))
 		})
 	})
 }
