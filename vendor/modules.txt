@@ -7,11 +7,14 @@ github.com/cespare/xxhash/v2
 # github.com/klauspost/compress v1.20.0
 ## explicit; go 1.25
 github.com/klauspost/compress
+github.com/klauspost/compress/flate
 github.com/klauspost/compress/fse
+github.com/klauspost/compress/gzip
 github.com/klauspost/compress/huff0
 github.com/klauspost/compress/internal/cpuinfo
 github.com/klauspost/compress/internal/le
 github.com/klauspost/compress/internal/race
+github.com/klauspost/compress/internal/regmask
 github.com/klauspost/compress/internal/snapref
 github.com/klauspost/compress/s2
 github.com/klauspost/compress/zstd
@@ -22,7 +25,7 @@ github.com/kylelemons/godebug/diff
 # github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
 ## explicit
 github.com/munnerz/goautoneg
-# github.com/pierrec/lz4/v4 v4.1.27
+# github.com/pierrec/lz4/v4 v4.1.30
 ## explicit; go 1.17
 github.com/pierrec/lz4/v4
 github.com/pierrec/lz4/v4/internal/lz4block
@@ -61,8 +64,8 @@ github.com/stretchr/testify/assert/yaml
 github.com/stretchr/testify/internal/difflib
 github.com/stretchr/testify/internal/spew
 github.com/stretchr/testify/require
-# github.com/twmb/franz-go v1.21.6
-## explicit; go 1.25.0
+# github.com/twmb/franz-go v1.22.0
+## explicit; go 1.26.0
 github.com/twmb/franz-go/pkg/kbin
 github.com/twmb/franz-go/pkg/kerr
 github.com/twmb/franz-go/pkg/kgo
@@ -73,7 +76,7 @@ github.com/twmb/franz-go/pkg/sasl
 # github.com/twmb/franz-go/pkg/kfake v0.0.0-20260820024614-9b174ed31afe
 ## explicit; go 1.25.0
 github.com/twmb/franz-go/pkg/kfake
-# github.com/twmb/franz-go/pkg/kmsg v1.13.1
+# github.com/twmb/franz-go/pkg/kmsg v1.14.0
 ## explicit; go 1.24.0
 github.com/twmb/franz-go/pkg/kmsg
 github.com/twmb/franz-go/pkg/kmsg/internal/kbin

@@ -616,7 +616,8 @@ func TestDecodeBatch_RoundTripsEncodeBatch(t *testing.T) {
 		},
 	}
 
-	encoded, _, _ := encodeBatch(records)
+	encoded, _, _, compressionType := encodeBatch(records)
+	require.Equal(t, uint8(2), compressionType, "batch must be Snappy-compressed to exercise the decode path")
 	require.Equal(t, int16(2), decodeRecordBatch(t, encoded).Attributes&0x7,
 		"batch must be Snappy-compressed to exercise the decode path")
 	got := decodeBatch(encoded)
