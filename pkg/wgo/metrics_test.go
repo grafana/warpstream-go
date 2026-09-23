@@ -239,6 +239,67 @@ func TestMetrics_ObserveClusterStats(t *testing.T) {
 	require.InDelta(t, 5, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
 }
 
+func TestNewMetrics_HedgeTriggers(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.hedgeTriggers[hedgeTriggerLatency].Inc()
+	m.hedgeTriggers[hedgeTriggerPrimaryFailure].Add(2)
+	m.hedgeTriggers[hedgeTriggerDemotedProbe].Add(3)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_hedge_triggers_total Why a produce fallback started: latency, primary_failure, or demoted_probe. One increment per fallback.
+		# TYPE warpstream_produce_hedge_triggers_total counter
+		warpstream_produce_hedge_triggers_total{trigger="demoted_probe"} 3
+		warpstream_produce_hedge_triggers_total{trigger="latency"} 1
+		warpstream_produce_hedge_triggers_total{trigger="primary_failure"} 2
+	`), "warpstream_produce_hedge_triggers_total"))
+}
+
+func TestNewMetrics_ProduceFinalOutcome(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted].Inc()
+	m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed].Add(2)
+	m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Add(3)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_final_outcome_total Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, or no_agent_assigned. One increment per failed produce, not per record or wire attempt.
+		# TYPE warpstream_produce_final_outcome_total counter
+		warpstream_produce_final_outcome_total{reason="all_candidates_exhausted"} 1
+		warpstream_produce_final_outcome_total{reason="hedging_suppressed_and_primary_failed"} 2
+		warpstream_produce_final_outcome_total{reason="no_agent_assigned"} 3
+	`), "warpstream_produce_final_outcome_total"))
+}
+
+func TestMetrics_ObserveAgentPoolChurn(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, nil, []int32{1, 2}, nil)
+	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2}, []int32{1, 2}, nil)
+	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, []int32{1}, []int32{1}, assert.AnError)
+	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2, 3}, []int32{1, 4}, nil)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_agentpool_agents_changed_total Agents added to or removed from the live AgentPool snapshot on a successful Metadata refresh, by direction. Constructor Refresh is not counted.
+		# TYPE warpstream_agentpool_agents_changed_total counter
+		warpstream_agentpool_agents_changed_total{direction="added"} 3
+		warpstream_agentpool_agents_changed_total{direction="removed"} 2
+	`), "warpstream_agentpool_agents_changed_total"))
+}
+
+func BenchmarkMetrics_HedgeTriggerInc(b *testing.B) {
+	m := newMetrics(prometheus.NewRegistry())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.hedgeAttemptsTotal.Inc()
+		m.hedgeTriggers[hedgeTriggerLatency].Inc()
+	}
+}
+
 func BenchmarkMetrics_DirectRequestAccounting(b *testing.B) {
 	m := newMetrics(prometheus.NewRegistry())
 	b.ReportAllocs()

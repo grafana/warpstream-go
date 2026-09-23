@@ -26,6 +26,9 @@ type metrics struct {
 	hedgeAttemptsTotal           prometheus.Counter
 	hedgeWinsTotal               prometheus.Counter
 	hedgeAttemptsSuppressedTotal *prometheus.CounterVec
+	hedgeTriggers                [hedgeTriggerCount]prometheus.Counter
+	produceFinalOutcome          [produceFinalOutcomeCount]prometheus.Counter
+	agentpoolAgentsChanged       [agentpoolChurnCount]prometheus.Counter
 
 	lingerFlushesTotal prometheus.Counter
 
@@ -99,6 +102,36 @@ const (
 	metadataRefreshResultMembershipChanged = "membership_changed"
 	metadataRefreshResultUnchanged         = "unchanged"
 	metadataRefreshResultFailed            = "failed"
+)
+
+// produceFinalOutcome is why a logical produce ended in failure (not why one
+// wire attempt failed). Success is not counted.
+type produceFinalOutcome int8
+
+const (
+	produceFinalOutcomeAllCandidatesExhausted produceFinalOutcome = iota
+	produceFinalOutcomeHedgingSuppressed
+	produceFinalOutcomeNoAgentAssigned
+	produceFinalOutcomeCount
+)
+
+const (
+	produceFinalOutcomeLabelAllCandidatesExhausted = "all_candidates_exhausted"
+	produceFinalOutcomeLabelHedgingSuppressed      = "hedging_suppressed_and_primary_failed"
+	produceFinalOutcomeLabelNoAgentAssigned        = "no_agent_assigned"
+)
+
+type agentpoolChurnDirection int8
+
+const (
+	agentpoolChurnAdded agentpoolChurnDirection = iota
+	agentpoolChurnRemoved
+	agentpoolChurnCount
+)
+
+const (
+	agentpoolChurnLabelAdded   = "added"
+	agentpoolChurnLabelRemoved = "removed"
 )
 
 func agentStateLabel(state AgentState) string {
@@ -177,6 +210,21 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"outcome"})
 
+	hedgeTriggers := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_hedge_triggers_total",
+		Help: "Why a produce fallback started: latency, primary_failure, or demoted_probe. One increment per fallback.",
+	}, []string{"trigger"})
+
+	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_final_outcome_total",
+		Help: "Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, or no_agent_assigned. One increment per failed produce, not per record or wire attempt.",
+	}, []string{"reason"})
+
+	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_agentpool_agents_changed_total",
+		Help: "Agents added to or removed from the live AgentPool snapshot on a successful Metadata refresh, by direction. Constructor Refresh is not counted.",
+	}, []string{"direction"})
+
 	version, franzGoVersion := clientBuildInfo()
 	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 		Name:        "warpstream_client_build_info",
@@ -197,6 +245,20 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "warpstream_hedge_attempts_suppressed_total",
 			Help: "Total number of produce requests where hedging was suppressed.",
 		}, []string{"reason"}),
+		hedgeTriggers: [hedgeTriggerCount]prometheus.Counter{
+			hedgeTriggerLatency:        hedgeTriggers.WithLabelValues(hedgeTriggerLabelLatency),
+			hedgeTriggerPrimaryFailure: hedgeTriggers.WithLabelValues(hedgeTriggerLabelPrimaryFailure),
+			hedgeTriggerDemotedProbe:   hedgeTriggers.WithLabelValues(hedgeTriggerLabelDemotedProbe),
+		},
+		produceFinalOutcome: [produceFinalOutcomeCount]prometheus.Counter{
+			produceFinalOutcomeAllCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelAllCandidatesExhausted),
+			produceFinalOutcomeHedgingSuppressed:      produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelHedgingSuppressed),
+			produceFinalOutcomeNoAgentAssigned:        produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelNoAgentAssigned),
+		},
+		agentpoolAgentsChanged: [agentpoolChurnCount]prometheus.Counter{
+			agentpoolChurnAdded:   agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelAdded),
+			agentpoolChurnRemoved: agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelRemoved),
+		},
 		lingerFlushesTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_linger_flushes_total",
 			Help: "Total number of partition batch flushes triggered by the linger buffer.",
@@ -294,6 +356,16 @@ func (m *metrics) observeMetadataRefresh(trigger metadataRefreshTrigger, before,
 		result = metadataRefreshResultMembershipChanged
 	}
 	m.metadataRefreshResultsTotal.WithLabelValues(string(trigger), result).Inc()
+	if err != nil {
+		return
+	}
+	added, removed := diffAgentMembership(before, after)
+	if added > 0 {
+		m.agentpoolAgentsChanged[agentpoolChurnAdded].Add(float64(added))
+	}
+	if removed > 0 {
+		m.agentpoolAgentsChanged[agentpoolChurnRemoved].Add(float64(removed))
+	}
 }
 
 // observeClusterStats records one ClusterStats compute. Without a view the

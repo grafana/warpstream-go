@@ -24,6 +24,21 @@ type HedgerConfig struct {
 	MaxHedgeAgents int
 }
 
+type hedgeTrigger int8
+
+const (
+	hedgeTriggerLatency hedgeTrigger = iota
+	hedgeTriggerPrimaryFailure
+	hedgeTriggerDemotedProbe
+	hedgeTriggerCount
+)
+
+const (
+	hedgeTriggerLabelLatency        = "latency"
+	hedgeTriggerLabelPrimaryFailure = "primary_failure"
+	hedgeTriggerLabelDemotedProbe   = "demoted_probe"
+)
+
 // Hedger orchestrates produce attempts across multiple agents for the
 // same batch of partitions. The whole "retry on a different agent,
 // possibly fire a hedge to race the primary, give up when
@@ -131,19 +146,20 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 		}
 	}
 
+	// Check the hedging delay to apply to this request.
+	delay, shouldHedge := h.shouldHedge(time.Now(), primaryID, routedPartitions)
+
 	// observeAttempts records the attempt depth of a resolved produce call,
 	// split by outcome: 1 = resolved on the primary, N = resolved after N-1
 	// hedge waves.
 	observeAttempts := func(result ProduceResult, attempts int) {
 		if result.succeeded() {
 			h.metrics.produceRequestsAttemptsSuccess.Observe(float64(attempts))
-		} else {
-			h.metrics.produceRequestsAttemptsFailure.Observe(float64(attempts))
+			return
 		}
+		h.metrics.produceRequestsAttemptsFailure.Observe(float64(attempts))
+		h.observeProduceFinalOutcome(shouldHedge)
 	}
-
-	// Check the hedging delay to apply to this request.
-	delay, shouldHedge := h.shouldHedge(time.Now(), primaryID, routedPartitions)
 
 	// The rest of the Hedger works with unrouted partitions, because it will be
 	// responsible to route partitions to other candidate agents during hedging
@@ -172,8 +188,8 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	// primary and returns whichever produces a usable outcome first. Shared by
 	// the delay==0 fast path and the timer.C branch below, so a future edit to
 	// this behavior can't land in only one of them.
-	raceWithPrimary := func() ProduceResult {
-		hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh)
+	raceWithPrimary := func(trigger hedgeTrigger) ProduceResult {
+		hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh, trigger)
 		observeAttempts(hedged.result, hedged.attempts)
 		return hedged.result
 	}
@@ -183,7 +199,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 		// primaryCh is a coin flip. Skip the timer and always start
 		// the fallback race; either leg can still win.
 		if delay == 0 {
-			return raceWithPrimary()
+			return raceWithPrimary(hedgeTriggerDemotedProbe)
 		}
 
 		timer := time.NewTimer(delay)
@@ -196,12 +212,12 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 				return primaryResult
 			}
 
-			hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates)
+			hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
 			result := selectProduceResult(primaryResult, hedged.result)
 			observeAttempts(result, hedged.attempts)
 			return result
 		case <-timer.C:
-			return raceWithPrimary()
+			return raceWithPrimary(hedgeTriggerLatency)
 		}
 	}
 
@@ -213,10 +229,18 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	}
 
 	// The primary has failed. Try secondaries.
-	hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates)
+	hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
 	result := selectProduceResult(primaryResult, hedged.result)
 	observeAttempts(result, hedged.attempts)
 	return result
+}
+
+func (h *Hedger) observeProduceFinalOutcome(shouldHedge bool) {
+	reason := produceFinalOutcomeAllCandidatesExhausted
+	if !shouldHedge {
+		reason = produceFinalOutcomeHedgingSuppressed
+	}
+	h.metrics.produceFinalOutcome[reason].Inc()
 }
 
 func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []encodedTopicPartitionRecords) ProduceResult {
@@ -238,10 +262,10 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 // cancel as soon as this function returns, which unwinds the losing leg.
 // The reported attempts is the depth of the winning leg: 1 when the
 // primary wins, the fallback's own depth when the fallback wins.
-func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult) hedgerProduceResult {
+func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
 	fallbackCh := make(chan hedgerProduceResult, 1)
 	go func() {
-		fallbackCh <- h.runHedgingAttempts(workCtx, primaryID, partitions, candidates)
+		fallbackCh <- h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, trigger)
 	}()
 
 	// Either side's "wait for the other" branch is bounded: both legs
@@ -278,8 +302,9 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 // MaxHedgeAgents, or ctx is canceled. The reported attempts is the total
 // attempt depth: 1 (the primary, which this function models as the first
 // tried agent) plus one per hedge wave dispatched.
-func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates) (out hedgerProduceResult) {
+func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, trigger hedgeTrigger) (out hedgerProduceResult) {
 	h.metrics.hedgeAttemptsTotal.Inc()
+	h.metrics.hedgeTriggers[trigger].Inc()
 	// Count a win only when the result is successful AND we weren't
 	// preempted by ctx cancellation (e.g. the racing variant aborting
 	// the fallback because the primary won).
