@@ -214,6 +214,7 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	})
 	if err != nil {
 		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Inc()
+		c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Inc()
 		promise(record, err)
 		return
 	}
@@ -308,6 +309,7 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 		// One record had no known candidate. Fail the whole batch
 		// uniformly: every ok record gets the same error.
 		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(okIndices)))
+		c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Inc()
 		for _, i := range okIndices {
 			results[i] = kgo.ProduceResult{Record: records[i], Err: err}
 		}

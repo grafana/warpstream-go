@@ -251,6 +251,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			require.Error(t, results[0].Err)
 			assert.ErrorContains(t, results[0].Err, "no agent assigned")
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// A rejection is not a failure: produceRecordsFailedTotal stays 0.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -305,6 +306,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// The oversized record is a rejection, not a failure; the ok record succeeds.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -329,6 +331,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			}
 
 			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// All records are rejections, not failures.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -654,6 +657,7 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "no agent assigned")
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// A rejection is not a failure: produceRecordsFailedTotal stays 0.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))

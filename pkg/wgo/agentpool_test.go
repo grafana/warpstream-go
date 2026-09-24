@@ -239,6 +239,41 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 
 func stringPtr(s string) *string { return &s }
 
+func TestDiffAgentMembership(t *testing.T) {
+	tests := map[string]struct {
+		old         []int32
+		new         []int32
+		wantAdded   int
+		wantRemoved int
+	}{
+		"unchanged": {
+			old: []int32{1, 2, 3}, new: []int32{1, 2, 3},
+		},
+		"one added": {
+			old: []int32{1, 2}, new: []int32{1, 2, 3}, wantAdded: 1,
+		},
+		"one removed": {
+			old: []int32{1, 2, 3}, new: []int32{1, 3}, wantRemoved: 1,
+		},
+		"replace one": {
+			old: []int32{1, 2, 3}, new: []int32{1, 4}, wantAdded: 1, wantRemoved: 2,
+		},
+		"empty to some": {
+			old: nil, new: []int32{1, 2}, wantAdded: 2,
+		},
+		"all removed": {
+			old: []int32{1, 2}, new: nil, wantRemoved: 2,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			added, removed := diffAgentMembership(tc.old, tc.new)
+			assert.Equal(t, tc.wantAdded, added)
+			assert.Equal(t, tc.wantRemoved, removed)
+		})
+	}
+}
+
 func TestDiffRemovedAgents(t *testing.T) {
 	tests := map[string]struct {
 		old      []int32
