@@ -890,6 +890,34 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted]))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed]))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeWriteTimeout]))
+	})
+
+	t.Run("ctx deadline mid-fallback: final outcome is write timeout", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		gate := make(chan struct{})
+		producer.blockCh[secondaryID] = gate
+		t.Cleanup(func() { close(gate) })
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		err := h.ProduceSync(ctx, primaryID, []routedEncodedTopicPartitionRecords{{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition}}),
+			nodeID:                       primaryID,
+		}}).error()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeWriteTimeout]))
 	})
 
 	t.Run("fallback wins: primary leg is canceled via workCtx instead of running until its per-attempt deadline", func(t *testing.T) {

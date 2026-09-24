@@ -263,13 +263,15 @@ func TestNewMetrics_ProduceFinalOutcome(t *testing.T) {
 	m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted].Inc()
 	m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed].Add(2)
 	m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Add(3)
+	m.produceFinalOutcome[produceFinalOutcomeWriteTimeout].Add(4)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_produce_final_outcome_total Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, or no_agent_assigned. One increment per failed produce, not per record or wire attempt.
+		# HELP warpstream_produce_final_outcome_total Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, no_agent_assigned, or write_timeout. One increment per failed produce, not per record or wire attempt.
 		# TYPE warpstream_produce_final_outcome_total counter
 		warpstream_produce_final_outcome_total{reason="all_candidates_exhausted"} 1
 		warpstream_produce_final_outcome_total{reason="hedging_suppressed_and_primary_failed"} 2
 		warpstream_produce_final_outcome_total{reason="no_agent_assigned"} 3
+		warpstream_produce_final_outcome_total{reason="write_timeout"} 4
 	`), "warpstream_produce_final_outcome_total"))
 }
 

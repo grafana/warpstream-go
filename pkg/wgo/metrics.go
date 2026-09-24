@@ -112,6 +112,7 @@ const (
 	produceFinalOutcomeAllCandidatesExhausted produceFinalOutcome = iota
 	produceFinalOutcomeHedgingSuppressed
 	produceFinalOutcomeNoAgentAssigned
+	produceFinalOutcomeWriteTimeout
 	produceFinalOutcomeCount
 )
 
@@ -119,6 +120,7 @@ const (
 	produceFinalOutcomeLabelAllCandidatesExhausted = "all_candidates_exhausted"
 	produceFinalOutcomeLabelHedgingSuppressed      = "hedging_suppressed_and_primary_failed"
 	produceFinalOutcomeLabelNoAgentAssigned        = "no_agent_assigned"
+	produceFinalOutcomeLabelWriteTimeout           = "write_timeout"
 )
 
 type agentpoolChurnDirection int8
@@ -217,7 +219,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_final_outcome_total",
-		Help: "Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, or no_agent_assigned. One increment per failed produce, not per record or wire attempt.",
+		Help: "Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, no_agent_assigned, or write_timeout. One increment per failed produce, not per record or wire attempt.",
 	}, []string{"reason"})
 
 	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
@@ -254,6 +256,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			produceFinalOutcomeAllCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelAllCandidatesExhausted),
 			produceFinalOutcomeHedgingSuppressed:      produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelHedgingSuppressed),
 			produceFinalOutcomeNoAgentAssigned:        produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelNoAgentAssigned),
+			produceFinalOutcomeWriteTimeout:           produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelWriteTimeout),
 		},
 		agentpoolAgentsChanged: [agentpoolChurnCount]prometheus.Counter{
 			agentpoolChurnAdded:   agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelAdded),

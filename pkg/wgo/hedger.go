@@ -159,11 +159,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 			return
 		}
 		h.metrics.produceRequestsAttemptsFailure.Observe(float64(attempts))
-		// Caller cancellation is not a terminal cluster outcome.
-		if callerErr := ctx.Err(); callerErr != nil && errors.Is(result.error(), callerErr) {
-			return
-		}
-		h.observeProduceFinalOutcome(shouldHedge)
+		h.observeProduceFinalOutcome(ctx, result, shouldHedge)
 	}
 
 	// The rest of the Hedger works with unrouted partitions, because it will be
@@ -240,7 +236,17 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	return result
 }
 
-func (h *Hedger) observeProduceFinalOutcome(shouldHedge bool) {
+func (h *Hedger) observeProduceFinalOutcome(ctx context.Context, result ProduceResult, shouldHedge bool) {
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(result.error(), ctxErr) {
+		switch ctxErr {
+		case context.Canceled:
+			return
+		case context.DeadlineExceeded:
+			h.metrics.produceFinalOutcome[produceFinalOutcomeWriteTimeout].Inc()
+			return
+		}
+	}
+
 	reason := produceFinalOutcomeAllCandidatesExhausted
 	if !shouldHedge {
 		reason = produceFinalOutcomeHedgingSuppressed
