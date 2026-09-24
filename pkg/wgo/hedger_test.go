@@ -887,6 +887,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 	})
 
 	t.Run("fallback wins: primary leg is canceled via workCtx instead of running until its per-attempt deadline", func(t *testing.T) {

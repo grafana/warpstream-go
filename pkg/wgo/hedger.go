@@ -2,6 +2,7 @@ package wgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -158,6 +159,10 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 			return
 		}
 		h.metrics.produceRequestsAttemptsFailure.Observe(float64(attempts))
+		// Caller cancellation is not a terminal cluster outcome.
+		if callerErr := ctx.Err(); callerErr != nil && errors.Is(result.error(), callerErr) {
+			return
+		}
 		h.observeProduceFinalOutcome(shouldHedge)
 	}
 
