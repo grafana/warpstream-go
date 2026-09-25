@@ -329,6 +329,11 @@ func BenchmarkDefaultPartitionAssignmentStrategy_Candidates(b *testing.B) {
 	}
 }
 
+// benchSink defeats dead-code elimination for benchmarks that would
+// otherwise discard their result into _, which lets the compiler prove
+// the result never escapes and skip real allocations.
+var benchSink *DefaultPartitionAssignmentStrategy
+
 // BenchmarkNewDefaultPartitionAssignmentStrategy measures the constructor
 // cost, which now scans leaders once to build the known-topics set.
 // Built once per AgentPool.Refresh, not per record, so this is off the
@@ -345,6 +350,7 @@ func BenchmarkNewDefaultPartitionAssignmentStrategy(b *testing.B) {
 		{agents: 1000, partitions: 2048},
 		{agents: 1000, partitions: 8192},
 	}
+	var sink *DefaultPartitionAssignmentStrategy
 	for _, cfg := range configs {
 		b.Run(fmt.Sprintf("agents=%d/partitions=%d", cfg.agents, cfg.partitions), func(b *testing.B) {
 			agents := makeNodeIDs(cfg.agents)
@@ -354,11 +360,17 @@ func BenchmarkNewDefaultPartitionAssignmentStrategy(b *testing.B) {
 			}
 			b.ResetTimer()
 			b.ReportAllocs()
+			// Assigning to a sink outside the loop, not to _, matters here:
+			// discarding the result lets the compiler prove it never
+			// escapes and skip the allocations entirely, understating the
+			// real cost — AgentPool.Refresh always stores this behind an
+			// atomic.Pointer, which does escape.
 			for range b.N {
-				_ = newDefaultPartitionAssignmentStrategy(agents, leaders)
+				sink = newDefaultPartitionAssignmentStrategy(agents, leaders)
 			}
 		})
 	}
+	benchSink = sink
 }
 
 func makeNodeIDs(n int) []int32 {
