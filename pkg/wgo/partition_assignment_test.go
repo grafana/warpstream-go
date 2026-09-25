@@ -112,8 +112,17 @@ func TestDefaultPartitionAssignmentStrategy_Candidates(t *testing.T) {
 		assert.Equal(t, int32(1), c[0].NodeID, "primary at [0]")
 	})
 
-	t.Run("returns nil for unknown partition", func(t *testing.T) {
-		assert.Nil(t, s.Candidates("t", 99, 3))
+	t.Run("falls back to a live agent for an unknown partition", func(t *testing.T) {
+		c := s.Candidates("t", 99, 3)
+		require.Len(t, c, 3)
+		for _, cand := range c {
+			assert.Contains(t, agents, cand.NodeID)
+		}
+	})
+
+	t.Run("returns nil for unknown partition when no agents are live", func(t *testing.T) {
+		empty := newDefaultPartitionAssignmentStrategy(nil, leaders)
+		assert.Nil(t, empty.Candidates("t", 99, 3))
 	})
 
 	t.Run("returns nil for maxCandidates<=0", func(t *testing.T) {
@@ -153,6 +162,105 @@ func TestDefaultPartitionAssignmentStrategy_Candidates(t *testing.T) {
 	})
 }
 
+func TestDefaultPartitionAssignmentStrategy_FallbackOnUnknownLeader(t *testing.T) {
+	agents := []int32{1, 2, 3, 4, 5}
+	// This one entry marks topic "t" as known, so every other partition
+	// looked up below takes the fallback path, not "topic unknown".
+	s := newDefaultPartitionAssignmentStrategy(agents, map[topicPartition]int32{
+		{topic: "t", partition: -1}: agents[0],
+	})
+
+	t.Run("fallback pick is deterministic across calls and instances", func(t *testing.T) {
+		c1 := s.Candidates("t", 7, 1)
+		c2 := s.Candidates("t", 7, 1)
+		require.Len(t, c1, 1)
+		assert.Equal(t, c1, c2)
+
+		s2 := newDefaultPartitionAssignmentStrategy(agents, map[topicPartition]int32{
+			{topic: "t", partition: -1}: agents[0],
+		})
+		c3 := s2.Candidates("t", 7, 1)
+		assert.Equal(t, c1, c3, "two independently constructed strategies over the same agent set must agree")
+	})
+
+	t.Run("fallback pick is exactly agents[hash(topic,partition) % len(agents)]", func(t *testing.T) {
+		for p := int32(0); p < 20; p++ {
+			c := s.Candidates("t", p, 1)
+			require.Len(t, c, 1)
+			want := agents[hashTopicPartition("t", p)%uint64(len(agents))]
+			assert.Equal(t, want, c[0].NodeID, "partition %d", p)
+		}
+	})
+
+	t.Run("fallback pick differs across partitions (not always agent[0])", func(t *testing.T) {
+		seen := map[int32]struct{}{}
+		for p := int32(0); p < 20; p++ {
+			c := s.Candidates("t", p, 1)
+			require.Len(t, c, 1)
+			seen[c[0].NodeID] = struct{}{}
+		}
+		assert.Greater(t, len(seen), 1, "20 partitions should not all hash to the same fallback agent")
+	})
+
+	t.Run("fallback pick is reported healthy, same as a known leader", func(t *testing.T) {
+		c := s.Candidates("t", 0, 1)
+		require.Len(t, c, 1)
+		assert.Equal(t, AgentStateHealthy, c[0].State)
+	})
+
+	t.Run("secondary candidates exclude the fallback pick, same as a known leader", func(t *testing.T) {
+		c := s.Candidates("t", 0, len(agents))
+		require.Len(t, c, len(agents))
+		seen := make(map[int32]struct{}, len(c))
+		for _, cand := range c {
+			_, dup := seen[cand.NodeID]
+			require.False(t, dup, "duplicate NodeID %d", cand.NodeID)
+			seen[cand.NodeID] = struct{}{}
+		}
+		for _, id := range agents {
+			assert.Contains(t, seen, id)
+		}
+	})
+
+	t.Run("single live agent: fallback returns it with no secondary", func(t *testing.T) {
+		single := newDefaultPartitionAssignmentStrategy([]int32{1}, map[topicPartition]int32{
+			{topic: "t", partition: -1}: 1,
+		})
+		c := single.Candidates("t", 0, 5)
+		require.Len(t, c, 1)
+		assert.Equal(t, int32(1), c[0].NodeID)
+	})
+
+	t.Run("no live agents at all: still returns nil, not a zero-value agent", func(t *testing.T) {
+		empty := newDefaultPartitionAssignmentStrategy(nil, map[topicPartition]int32{
+			{topic: "t", partition: -1}: 1,
+		})
+		assert.Nil(t, empty.Candidates("t", 0, 3))
+	})
+
+	t.Run("topic entirely unknown to Metadata: no fallback, stays nil", func(t *testing.T) {
+		// Unlike above, this topic has zero entries in leaders, so it's
+		// unknown, not just missing one leader. No fallback here.
+		unknownTopic := newDefaultPartitionAssignmentStrategy(agents, map[topicPartition]int32{
+			{topic: "other-topic", partition: 0}: agents[0],
+		})
+		assert.Nil(t, unknownTopic.Candidates("t", 0, 3))
+	})
+
+	t.Run("mixed: some partitions have a known leader, others fall back, in the same strategy", func(t *testing.T) {
+		mixed := newDefaultPartitionAssignmentStrategy(agents, map[topicPartition]int32{
+			{topic: "t", partition: 0}: 3,
+		})
+		known := mixed.Candidates("t", 0, 1)
+		require.Len(t, known, 1)
+		assert.Equal(t, int32(3), known[0].NodeID)
+
+		fallback := mixed.Candidates("t", 1, 1)
+		require.Len(t, fallback, 1)
+		assert.Contains(t, agents, fallback[0].NodeID)
+	})
+}
+
 func TestDefaultPartitionAssignmentStrategy_PrimaryAndSecondaryViaCandidates(t *testing.T) {
 	agents := []int32{1, 2, 3}
 	leaders := map[topicPartition]int32{
@@ -170,8 +278,10 @@ func TestDefaultPartitionAssignmentStrategy_PrimaryAndSecondaryViaCandidates(t *
 		assert.Equal(t, int32(2), c[0].NodeID)
 	})
 
-	t.Run("Candidates returns nil for unknown partition", func(t *testing.T) {
-		assert.Empty(t, s.Candidates("t", 99, 1))
+	t.Run("Candidates falls back to a live agent for unknown partition", func(t *testing.T) {
+		c := s.Candidates("t", 99, 1)
+		require.Len(t, c, 1)
+		assert.Contains(t, agents, c[0].NodeID)
 	})
 
 	t.Run("Candidates[1] (secondary) differs from Candidates[0] (primary)", func(t *testing.T) {
@@ -208,13 +318,26 @@ func BenchmarkDefaultPartitionAssignmentStrategy_Candidates(b *testing.B) {
 				_ = s.Candidates("ingest", 7, 3)
 			}
 		})
+		// The real routeRecords call shape: one candidate, leader known.
+		// Must never pay for the fallback hash or the non-leader walk.
+		b.Run(fmt.Sprintf("agents=%d/maxCandidates=1", n), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				_ = s.Candidates("ingest", 7, 1)
+			}
+		})
 	}
 }
 
-// BenchmarkNewDefaultPartitionAssignmentStrategy measures the constructor cost,
-// which precomputes the secondaries map for every partition. This is where the
-// hot-path work moved when the lazy sync.Map cache was replaced with eager
-// precomputation. A new strategy is built once per AgentPool.Refresh.
+// benchSink defeats dead-code elimination for benchmarks that would
+// otherwise discard their result into _, which lets the compiler prove
+// the result never escapes and skip real allocations.
+var benchSink *DefaultPartitionAssignmentStrategy
+
+// BenchmarkNewDefaultPartitionAssignmentStrategy measures the constructor
+// cost, which now scans leaders once to build the known-topics set.
+// Built once per AgentPool.Refresh, not per record, so this is off the
+// hot path — Candidates (benchmarked above) is what runs per record.
 //
 // In all configurations partitions >= 2 * agents: an agent without partitions
 // assigned to it is idle, so deployments always have more partitions than agents.
@@ -227,6 +350,7 @@ func BenchmarkNewDefaultPartitionAssignmentStrategy(b *testing.B) {
 		{agents: 1000, partitions: 2048},
 		{agents: 1000, partitions: 8192},
 	}
+	var sink *DefaultPartitionAssignmentStrategy
 	for _, cfg := range configs {
 		b.Run(fmt.Sprintf("agents=%d/partitions=%d", cfg.agents, cfg.partitions), func(b *testing.B) {
 			agents := makeNodeIDs(cfg.agents)
@@ -236,11 +360,17 @@ func BenchmarkNewDefaultPartitionAssignmentStrategy(b *testing.B) {
 			}
 			b.ResetTimer()
 			b.ReportAllocs()
+			// Assigning to a sink outside the loop, not to _, matters here:
+			// discarding the result lets the compiler prove it never
+			// escapes and skip the allocations entirely, understating the
+			// real cost — AgentPool.Refresh always stores this behind an
+			// atomic.Pointer, which does escape.
 			for range b.N {
-				_ = newDefaultPartitionAssignmentStrategy(agents, leaders)
+				sink = newDefaultPartitionAssignmentStrategy(agents, leaders)
 			}
 		})
 	}
+	benchSink = sink
 }
 
 func makeNodeIDs(n int) []int32 {
