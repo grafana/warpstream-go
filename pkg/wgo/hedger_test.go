@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -893,6 +894,163 @@ func TestHedger_ProduceSync(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "primaryID=1")
 		assert.Empty(t, producer.recordedCalls())
+	})
+
+	t.Run("shared hedge flush does not resolve a partition the leg did not send", func(t *testing.T) {
+		// Every caller's primary fails. caller-1 retries partition-0 on
+		// fallback-agent-B in its second wave. At the same time caller-2's first
+		// wave sends partition-0 to fallback-agent-A and partition-1 to
+		// fallback-agent-B. Both fallback-agent-B items share one flush, and
+		// caller-2 must not treat that flush's partition-0 entry as its own.
+		// Every request carrying caller-2's partition-0 fails, so caller-2 must
+		// report it as failed.
+		const (
+			primaryAgent   = int32(100)
+			fallbackAgentA = int32(101)
+			fallbackAgentB = int32(102)
+			partition0     = int32(0)
+			partition1     = int32(1)
+		)
+		strategy := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{
+				{topic, partition0}: healthyAgents(primaryAgent, fallbackAgentA, fallbackAgentB),
+				{topic, partition1}: healthyAgents(primaryAgent, fallbackAgentB),
+			},
+		}
+		recordValues := func(encoded []byte) []string {
+			var out []string
+			for _, r := range decodeBatch(encoded) {
+				out = append(out, string(r.Value))
+			}
+			return out
+		}
+		carries := func(partitions []encodedTopicPartitionRecords, value string) bool {
+			for _, p := range partitions {
+				if slices.Contains(recordValues(p.encoded), value) {
+					return true
+				}
+			}
+			return false
+		}
+
+		producer := newMockDirectProducer()
+		producer.errs[primaryAgent] = kerr.RequestTimedOut
+		producer.errs[fallbackAgentA] = kerr.KafkaStorageError
+		producer.respFn = func(_ int32, partitions []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) {
+			if carries(partitions, "caller-2-partition-0") {
+				return nil, kerr.KafkaStorageError
+			}
+			resp := &kmsg.ProduceResponse{}
+			for _, p := range partitions {
+				resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
+					Topic:      p.topic,
+					Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: p.partition}},
+				})
+			}
+			return resp, nil
+		}
+
+		// A primary failure returns long before this delay, so each caller
+		// cascades into runHedgingAttempts without racing the timer.
+		noRaceCfg := cfg
+		noRaceCfg.MinHedgeDelay = time.Hour
+
+		// The linger never fires: the test flushes each agent buffer explicitly.
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), strategy, health, noRaceCfg, time.Hour, 1<<20, m, nil)
+		t.Cleanup(h.Close)
+
+		agentBuffers := map[int32]*AgentBuffer[routedEncodedTopicPartitionRecords]{}
+		for _, agent := range []int32{fallbackAgentA, fallbackAgentB} {
+			b, err := h.hedgeBuffer.agentBufferFor(agent)
+			require.NoError(t, err)
+			agentBuffers[agent] = b
+		}
+		bufferedRecords := func(agent int32) []string {
+			b := agentBuffers[agent]
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			var out []string
+			for _, p := range b.nextProduceItems {
+				out = append(out, recordValues(p.item.encoded)...)
+			}
+			return out
+		}
+		flush := func(agent int32) {
+			agentBuffers[agent].timerFlush()
+		}
+		waitBuffered := func(agent int32, want ...string) {
+			require.EventuallyWithT(t, func(c *assert.CollectT) {
+				assert.ElementsMatch(c, want, bufferedRecords(agent))
+			}, time.Second, time.Millisecond)
+		}
+		routed := func(partition int32, value string, done func(ProduceResult)) promised[routedEncodedTopicPartitionRecords] {
+			return promised[routedEncodedTopicPartitionRecords]{
+				item: routedEncodedTopicPartitionRecords{
+					encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition, Value: []byte(value)}}),
+					nodeID:                       primaryAgent,
+				},
+				done: done,
+			}
+		}
+		produceAsync := func(parts ...promised[routedEncodedTopicPartitionRecords]) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				runHedger(h, context.Background(), parts)
+			}()
+			return done
+		}
+
+		// caller-1: wave 1 sends partition-0 to fallback-agent-A, which fails,
+		// so wave 2 buffers partition-0 on fallback-agent-B.
+		caller1 := newResultCapture()
+		caller1Done := produceAsync(
+			routed(partition0, "caller-1-partition-0", caller1.doneFor(topic, partition0)),
+		)
+		waitBuffered(fallbackAgentA, "caller-1-partition-0")
+		flush(fallbackAgentA)
+		waitBuffered(fallbackAgentB, "caller-1-partition-0")
+
+		// caller-2: wave 1 buffers partition-0 on fallback-agent-A and
+		// partition-1 on fallback-agent-B, next to caller-1's partition-0.
+		caller2 := newResultCapture()
+		caller2Done := produceAsync(
+			routed(partition0, "caller-2-partition-0", caller2.doneFor(topic, partition0)),
+			routed(partition1, "caller-2-partition-1", caller2.doneFor(topic, partition1)),
+		)
+		waitBuffered(fallbackAgentA, "caller-2-partition-0")
+		waitBuffered(fallbackAgentB, "caller-1-partition-0", "caller-2-partition-1")
+
+		// The shared fallback-agent-B flush succeeds. caller-2's partition-0 on
+		// fallback-agent-A fails.
+		flush(fallbackAgentB)
+		<-caller1Done
+		flush(fallbackAgentA)
+
+		// While the bug exists, caller-2 returns success off the shared
+		// fallback-agent-B flush and never retries partition-0, so waiting for
+		// it is enough. When fixing the bug, replace this wait with the loop
+		// below. A fixed caller-2 retries partition-0 on fallback-agent-B, and
+		// nothing else flushes that buffer because the linger is an hour, so
+		// without the loop the test hangs here.
+		<-caller2Done
+
+		// for waiting := true; waiting; {
+		// 	select {
+		// 	case <-caller2Done:
+		// 		waiting = false
+		// 	case <-time.After(time.Millisecond):
+		// 		if len(bufferedRecords(fallbackAgentB)) > 0 {
+		// 			flush(fallbackAgentB)
+		// 		}
+		// 	}
+		// }
+
+		require.NoError(t, caller1.get(topic, partition0).err)
+		require.NoError(t, caller2.get(topic, partition1).err)
+
+		require.Error(t, caller2.get(topic, partition0).err, "caller-2 was told partition-0 was produced, but every request carrying its partition-0 records failed")
 	})
 }
 
