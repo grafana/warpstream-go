@@ -49,6 +49,8 @@ For every record the client asks a `PartitionAssignmentStrategy` for an ordered 
 - **Deterministic.** Given the same Metadata view, every client instance picks the same primary and the same secondary for a given partition. Hedge load is predictable and analysable instead of randomly smeared across agents.
 - **State-aware.** A wrapper around the base strategy (the **Demoter**, see below) can mark an agent as demoted so it's elided from the candidate list or surfaced as a probe.
 
+A partition's leader can briefly go missing from that map during a Metadata refresh, even though nothing is actually wrong. When that happens for a topic the client otherwise knows, it picks a live agent for that partition instead of treating it as unroutable — any agent can serve any partition. A topic the client has never seen at all is left alone, so it still gets an on-demand refresh.
+
 ### Buffering: linger by destination agent, not by partition
 
 Records are buffered through a `ClusterRecordBuffer`, which bins them by the destination agent picked at routing time, then through a per-agent `AgentRecordBuffer`, which applies a configurable linger window before flushing. Each flush ships one Produce request to one agent carrying batches for as many partitions as the buffer accumulated.

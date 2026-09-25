@@ -107,12 +107,31 @@ func (l *LazyPartitionAssignmentStrategy) Candidates(topic string, partition int
 type DefaultPartitionAssignmentStrategy struct {
 	agents  []int32 // sorted ascending, snapshot at construction
 	leaders map[topicPartition]int32
+
+	// knownTopics is every topic with at least one entry in leaders.
+	// Candidates uses it to tell "this topic is known, one partition's
+	// leader is just missing" (safe to fall back to another agent) apart
+	// from "this topic is unknown to Metadata" (falling back would hide a
+	// topic that still needs an on-demand refresh).
+	//
+	// Edge case: if every partition of a small topic loses its leader in
+	// the same refresh, that topic looks unknown here too for that one
+	// refresh, and briefly loses the fallback. Rare, and not seen in the
+	// incidents this fix is based on, so left as-is for now.
+	knownTopics map[string]struct{}
 }
 
 func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPartition]int32) *DefaultPartitionAssignmentStrategy {
+	// Built from empty, not sized off leaders: there are far fewer
+	// distinct topics than partitions.
+	knownTopics := make(map[string]struct{})
+	for tp := range leaders {
+		knownTopics[tp.topic] = struct{}{}
+	}
 	return &DefaultPartitionAssignmentStrategy{
-		agents:  agents,
-		leaders: leaders,
+		agents:      agents,
+		leaders:     leaders,
+		knownTopics: knownTopics,
 	}
 }
 
@@ -120,13 +139,32 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 // the partition leader first, then deterministic hash-walked alternates. Every
 // entry is reported as AgentStateHealthy; this strategy has no health signal of
 // its own.
+//
+// If a partition has no known leader but its topic is otherwise known,
+// this falls back to a deterministic pick from the live agent set instead
+// of returning no candidates. Any live agent can serve any partition, so
+// this is a safe guess while the real leader is still unclear. A topic
+// Metadata has never returned is left alone, so it still gets an
+// on-demand refresh.
+//
+// Caveat: two clients that refreshed at different times can pick
+// different fallback agents for the same partition — a real leader
+// doesn't have that problem. The extra cost from that (more segment
+// streams per partition) is unmeasured; not assumed to be small.
 func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition int32, maxCandidates int) []Agent {
 	if maxCandidates <= 0 {
 		return nil
 	}
+
 	leader, ok := s.leaders[topicPartition{topic: topic, partition: partition}]
 	if !ok {
-		return nil
+		if len(s.agents) == 0 {
+			return nil
+		}
+		if _, topicKnown := s.knownTopics[topic]; !topicKnown {
+			return nil
+		}
+		leader = s.agents[hashTopicPartition(topic, partition)%uint64(len(s.agents))]
 	}
 
 	out := make([]Agent, 0, maxCandidates)
@@ -143,8 +181,9 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 	if nonLeaderCount <= 0 {
 		return out
 	}
-	h := hashTopicPartition(topic, partition)
-	start := int(h % uint64(nonLeaderCount))
+	// Recomputed here so the common one-candidate path above never pays
+	// for a hash it doesn't use.
+	start := int(hashTopicPartition(topic, partition) % uint64(nonLeaderCount))
 	for offset := 0; offset < nonLeaderCount && len(out) < maxCandidates; offset++ {
 		idx := (start + offset) % nonLeaderCount
 		out = append(out, Agent{NodeID: nthNonLeader(s.agents, leader, idx), State: AgentStateHealthy})
