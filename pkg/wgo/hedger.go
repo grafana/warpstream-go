@@ -395,9 +395,13 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 	// batch resolved early) never blocks the deliverer.
 	results := make(chan ProduceResult, len(groups))
 	for agent, parts := range groups {
+		own := make(map[topicPartition]struct{}, len(parts))
+		for _, p := range parts {
+			own[topicPartition{topic: p.topic, partition: p.partition}] = struct{}{}
+		}
 		var once sync.Once
 		legDone := func(res ProduceResult) {
-			once.Do(func() { results <- res })
+			once.Do(func() { results <- scopeProduceResultToPartitions(res, own) })
 		}
 		h.hedgeBuffer.MultiAdd(attemptCtx, newMultiRoutedEncodedTopicPartitionRecords(parts, agent, legDone))
 	}
