@@ -29,6 +29,36 @@ type ProduceResult struct {
 	compressionTypes map[topicPartition]uint8
 }
 
+// scopeProduceResultToPartitions trims resp to at most the entries in own, so
+// a caller's succeeded()/error() never depends on a different caller's
+// partition merged into the same flush. Entries of own that stay together
+// keep their existing all-or-nothing relationship to each other — this only
+// drops entries outside own, it does not further split own's own entries
+// apart. A whole-request err still applies to everyone and is kept as-is.
+func scopeProduceResultToPartitions(res ProduceResult, own map[topicPartition]struct{}) ProduceResult {
+	scoped := ProduceResult{err: res.err, compressionTypes: res.compressionTypes}
+	if res.resp == nil {
+		return scoped
+	}
+	// Non-nil but empty, not nil: nil reads as errEmptyProduceResult (no
+	// response at all), a different condition than "own's entries just
+	// weren't in this response" — which must stay a no-op, not a failure.
+	merged := &kmsg.ProduceResponse{Version: res.resp.Version, ThrottleMillis: res.resp.ThrottleMillis}
+	for _, t := range res.resp.Topics {
+		var kept []kmsg.ProduceResponseTopicPartition
+		for _, p := range t.Partitions {
+			if _, ok := own[topicPartition{topic: t.Topic, partition: p.Partition}]; ok {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) > 0 {
+			merged.Topics = append(merged.Topics, kmsg.ProduceResponseTopic{Topic: t.Topic, TopicID: t.TopicID, Partitions: kept})
+		}
+	}
+	scoped.resp = merged
+	return scoped
+}
+
 // succeeded reports whether ProduceResult is fully-successful.
 func (r ProduceResult) succeeded() bool {
 	// error() is the single predicate: it returns nil only for a fully-successful result

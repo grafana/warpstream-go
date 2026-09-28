@@ -95,6 +95,75 @@ func TestProduceResult_Error(t *testing.T) {
 	}
 }
 
+func TestScopeProduceResultToPartitions(t *testing.T) {
+	tp0 := topicPartition{topic: "t", partition: 0}
+	tp1 := topicPartition{topic: "t", partition: 1}
+	own := map[topicPartition]struct{}{tp0: {}}
+
+	t.Run("drops another caller's partition merged into the same flush", func(t *testing.T) {
+		res := ProduceResult{resp: makeProduceResponse(11, 0,
+			makeProduceResponseTopic("t",
+				makeProduceResponseTopicPartition(0, kerrNoError),
+				makeProduceResponseTopicPartition(1, kerr.NotLeaderForPartition.Code),
+			),
+		)}
+
+		scoped := scopeProduceResultToPartitions(res, own)
+
+		require.Len(t, scoped.resp.Topics, 1)
+		require.Len(t, scoped.resp.Topics[0].Partitions, 1)
+		assert.Equal(t, int32(0), scoped.resp.Topics[0].Partitions[0].Partition)
+		assert.NoError(t, scoped.error())
+	})
+
+	t.Run("keeps two of own's own partitions all-or-nothing with each other", func(t *testing.T) {
+		res := ProduceResult{resp: makeProduceResponse(11, 0,
+			makeProduceResponseTopic("t",
+				makeProduceResponseTopicPartition(0, kerrNoError),
+				makeProduceResponseTopicPartition(1, kerr.NotLeaderForPartition.Code),
+			),
+		)}
+
+		scoped := scopeProduceResultToPartitions(res, map[topicPartition]struct{}{tp0: {}, tp1: {}})
+
+		require.Len(t, scoped.resp.Topics[0].Partitions, 2)
+		assert.Error(t, scoped.error())
+	})
+
+	t.Run("none of own present stays a no-op, not an empty result", func(t *testing.T) {
+		res := ProduceResult{resp: makeProduceResponse(11, 0,
+			makeProduceResponseTopic("t", makeProduceResponseTopicPartition(1, kerrNoError)),
+		)}
+
+		scoped := scopeProduceResultToPartitions(res, own)
+
+		require.NotNil(t, scoped.resp)
+		assert.Empty(t, scoped.resp.Topics)
+		assert.NoError(t, scoped.error())
+		assert.NotErrorIs(t, scoped.error(), errEmptyProduceResult)
+	})
+
+	t.Run("a whole-flush transport error is kept for every partition", func(t *testing.T) {
+		res := ProduceResult{err: kerr.KafkaStorageError}
+
+		scoped := scopeProduceResultToPartitions(res, own)
+
+		assert.Nil(t, scoped.resp)
+		assert.ErrorIs(t, scoped.error(), kerr.KafkaStorageError)
+	})
+
+	t.Run("compressionTypes is shared, not scoped", func(t *testing.T) {
+		res := ProduceResult{
+			resp:             makeProduceResponse(11, 0, makeProduceResponseTopic("t", makeProduceResponseTopicPartition(0, kerrNoError))),
+			compressionTypes: map[topicPartition]uint8{tp0: 4, tp1: 7},
+		}
+
+		scoped := scopeProduceResultToPartitions(res, own)
+
+		assert.Equal(t, res.compressionTypes, scoped.compressionTypes)
+	})
+}
+
 func TestGetProduceResultErr(t *testing.T) {
 	cases := map[string]struct {
 		err  error
