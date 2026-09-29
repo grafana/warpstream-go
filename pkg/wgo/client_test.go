@@ -3,6 +3,7 @@ package wgo
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -332,6 +333,136 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// All records are rejections, not failures.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("partition split across flushes fails when a later flush fails it", func(t *testing.T) {
+		// ProduceSync splits partition-A across flushes; one chunk shares a flush
+		// with a Produce of partition-B. That flush lands A and fails B, and the
+		// later flushes fail A, so A must fail too.
+		synctest.Test(t, func(t *testing.T) {
+			const numPartitions = 12
+			vnet := &kfake.VirtualNetwork{}
+			cluster, addr := testkafka.CreateCluster(t, numPartitions, topic, testkafka.WithNumBrokers(3), testkafka.WithVirtualNetwork(vnet))
+			opts := append(testWarpstreamOpts(addr, topic),
+				WithDialer(vnet.DialContext),
+				WithBatchMaxBytes(512),
+				// Primary plus one fallback per partition.
+				WithHedgerMaxHedgeAgents(2),
+				// No hedge race: each flush cascades to its fallbacks only after
+				// the primary fails, so the attempt order is deterministic.
+				WithHedgerMinHedgeDelay(time.Hour),
+			)
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), opts...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			// Two partitions on one primary agent, so they share its buffer, with
+			// different fallbacks, so one hedge wave sends them to different
+			// agents.
+			var partitionA, partitionB, primary, fallbackA int32 = -1, -1, -1, -1
+		search:
+			for a := range int32(numPartitions) {
+				ca := c.demoter.Candidates(topic, a, 2)
+				for b := range int32(numPartitions) {
+					cb := c.demoter.Candidates(topic, b, 2)
+					if a != b && len(ca) == 2 && len(cb) == 2 && ca[0].NodeID == cb[0].NodeID && ca[1].NodeID != cb[1].NodeID {
+						partitionA, partitionB, primary, fallbackA = a, b, ca[0].NodeID, ca[1].NodeID
+						break search
+					}
+				}
+			}
+			require.NotEqual(t, int32(-1), partitionA, "no partition pair shares a primary with different fallbacks")
+
+			var (
+				mu               sync.Mutex
+				primaryRequests  [][]int32
+				fallbackAHits    int
+				recordRequestFor = func(node int32, partitions []int32) {
+					mu.Lock()
+					defer mu.Unlock()
+					if node == primary {
+						primaryRequests = append(primaryRequests, partitions)
+					}
+				}
+			)
+			cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				node := cluster.CurrentNode()
+				preq := req.(*kmsg.ProduceRequest)
+				presp := preq.ResponseKind().(*kmsg.ProduceResponse)
+				presp.Version = preq.Version
+				var partitions []int32
+				for _, rt := range preq.Topics {
+					out := kmsg.ProduceResponseTopic{Topic: rt.Topic, TopicID: rt.TopicID}
+					if out.Topic == "" {
+						out.Topic = topic
+					}
+					for _, rp := range rt.Partitions {
+						partitions = append(partitions, rp.Partition)
+						code := kerr.NotLeaderForPartition.Code
+						// Only the first hedge of partition-A (the first flush's)
+						// lands.
+						if node == fallbackA && rp.Partition == partitionA {
+							mu.Lock()
+							fallbackAHits++
+							if fallbackAHits == 1 {
+								code = kerrNoError
+							}
+							mu.Unlock()
+						}
+						out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{Partition: rp.Partition, ErrorCode: code})
+					}
+					presp.Topics = append(presp.Topics, out)
+				}
+				recordRequestFor(node, partitions)
+				return presp, nil, true
+			})
+
+			// Hold the primary's failure for flushes without partition-B, so the
+			// shared flush's result reaches caller-1 first and its hedge of
+			// partition-A goes out alone.
+			c.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, resp *kmsg.ProduceResponse, _ error) {
+				if nodeID != primary || resp == nil || partitionErrorFromResp(resp, topic, partitionB) != nil {
+					return
+				}
+				select {
+				case <-time.After(time.Second):
+				case <-ctx.Done():
+				}
+			})
+
+			caller2 := make(chan error, 1)
+			c.Produce(t.Context(), &kgo.Record{Topic: topic, Partition: partitionB, Value: []byte("caller-2")}, func(_ *kgo.Record, err error) {
+				caller2 <- err
+			})
+
+			caller1Records := make([]*kgo.Record, 5)
+			for i := range caller1Records {
+				caller1Records[i] = &kgo.Record{Topic: topic, Partition: partitionA, Value: bytes.Repeat([]byte{byte('0' + i)}, 150)}
+			}
+			caller1Results := c.ProduceSync(t.Context(), caller1Records)
+
+			mu.Lock()
+			require.Len(t, primaryRequests, 3, "caller-1's partition-A must go out as three chunks, got %v", primaryRequests)
+			// The flushes go out concurrently, so they can reach the agent in any
+			// order.
+			assert.True(t, slices.ContainsFunc(primaryRequests, func(p []int32) bool {
+				return slices.Contains(p, partitionA) && slices.Contains(p, partitionB)
+			}), "caller-2's record must share a flush with a caller-1 chunk, got %v", primaryRequests)
+			// Three requests: the shared flush's hedge, then each later chunk on
+			// its own. Those two chunks are too big to share one hedge batch.
+			assert.Equal(t, 3, fallbackAHits)
+			mu.Unlock()
+
+			caller2Err := <-caller2
+			require.ErrorIs(t, caller2Err, kgo.ErrRecordTimeout)
+			require.ErrorIs(t, caller2Err, kerr.NotLeaderForPartition)
+			require.Len(t, caller1Results, len(caller1Records))
+			for i, res := range caller1Results {
+				assert.ErrorIsf(t, res.Err, kgo.ErrRecordTimeout, "caller-1 record %d", i)
+				assert.ErrorIsf(t, res.Err, kerr.NotLeaderForPartition, "caller-1 record %d", i)
+			}
 		})
 	})
 }

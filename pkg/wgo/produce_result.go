@@ -29,20 +29,14 @@ type ProduceResult struct {
 	compressionTypes map[topicPartition]uint8
 }
 
-// scopeProduceResultToPartitions trims resp to at most the entries in own, so
-// a caller's succeeded()/error() never depends on a different caller's
-// partition merged into the same flush. Entries of own that stay together
-// keep their existing all-or-nothing relationship to each other — this only
-// drops entries outside own, it does not further split own's own entries
-// apart. A whole-request err still applies to everyone and is kept as-is.
+// scopeProduceResultToPartitions keeps only resp's entries for partitions in
+// own; err is kept as-is. A non-nil resp stays non-nil even when none of own is
+// present, so the result doesn't read as errEmptyProduceResult.
 func scopeProduceResultToPartitions(res ProduceResult, own map[topicPartition]struct{}) ProduceResult {
 	scoped := ProduceResult{err: res.err, compressionTypes: res.compressionTypes}
 	if res.resp == nil {
 		return scoped
 	}
-	// Non-nil but empty, not nil: nil reads as errEmptyProduceResult (no
-	// response at all), a different condition than "own's entries just
-	// weren't in this response" — which must stay a no-op, not a failure.
 	merged := &kmsg.ProduceResponse{Version: res.resp.Version, ThrottleMillis: res.resp.ThrottleMillis}
 	for _, t := range res.resp.Topics {
 		var kept []kmsg.ProduceResponseTopicPartition
@@ -186,7 +180,9 @@ func (a *produceResultAccumulator) remaining() []encodedTopicPartitionRecords {
 	return out
 }
 
-// accumulate folds one produce attempt's outcome into the merged state.
+// accumulate folds one produce attempt's outcome into the merged state. res
+// must only contain partitions sent in that attempt: every entry in a
+// successful res is resolved.
 func (a *produceResultAccumulator) accumulate(res ProduceResult) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

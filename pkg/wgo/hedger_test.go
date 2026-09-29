@@ -92,6 +92,43 @@ func (c *resultCapture) get(topic string, partition int32) hedgerResult {
 	return c.results[topicPartition{topic: topic, partition: partition}]
 }
 
+func routedHedgeRecord(topic string, partition, primary int32, value string, done func(ProduceResult)) promised[routedEncodedTopicPartitionRecords] {
+	return promised[routedEncodedTopicPartitionRecords]{
+		item: routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition, Value: []byte(value)}}),
+			nodeID:                       primary,
+		},
+		done: done,
+	}
+}
+
+func runHedgerAsync(h *Hedger, parts ...promised[routedEncodedTopicPartitionRecords]) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runHedger(h, context.Background(), parts)
+	}()
+	return done
+}
+
+func encodedRecordValues(encoded []byte) []string {
+	var out []string
+	for _, r := range decodeBatch(encoded) {
+		out = append(out, string(r.Value))
+	}
+	return out
+}
+
+func bufferedRecordValues(b *AgentBuffer[routedEncodedTopicPartitionRecords]) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []string
+	for _, p := range b.nextProduceItems {
+		out = append(out, encodedRecordValues(p.item.encoded)...)
+	}
+	return out
+}
+
 func TestHedger_ProduceSync(t *testing.T) {
 	const (
 		primaryID   = int32(1)
@@ -915,16 +952,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 				{topic, partition1}: healthyAgents(primaryAgent, fallbackAgentB),
 			},
 		}
-		recordValues := func(encoded []byte) []string {
-			var out []string
-			for _, r := range decodeBatch(encoded) {
-				out = append(out, string(r.Value))
-			}
-			return out
-		}
 		carries := func(partitions []encodedTopicPartitionRecords, value string) bool {
 			for _, p := range partitions {
-				if slices.Contains(recordValues(p.encoded), value) {
+				if slices.Contains(encodedRecordValues(p.encoded), value) {
 					return true
 				}
 			}
@@ -964,47 +994,20 @@ func TestHedger_ProduceSync(t *testing.T) {
 			require.NoError(t, err)
 			agentBuffers[agent] = b
 		}
-		bufferedRecords := func(agent int32) []string {
-			b := agentBuffers[agent]
-			b.mu.Lock()
-			defer b.mu.Unlock()
-			var out []string
-			for _, p := range b.nextProduceItems {
-				out = append(out, recordValues(p.item.encoded)...)
-			}
-			return out
-		}
 		flush := func(agent int32) {
 			agentBuffers[agent].timerFlush()
 		}
 		waitBuffered := func(agent int32, want ...string) {
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
-				assert.ElementsMatch(c, want, bufferedRecords(agent))
+				assert.ElementsMatch(c, want, bufferedRecordValues(agentBuffers[agent]))
 			}, time.Second, time.Millisecond)
-		}
-		routed := func(partition int32, value string, done func(ProduceResult)) promised[routedEncodedTopicPartitionRecords] {
-			return promised[routedEncodedTopicPartitionRecords]{
-				item: routedEncodedTopicPartitionRecords{
-					encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition, Value: []byte(value)}}),
-					nodeID:                       primaryAgent,
-				},
-				done: done,
-			}
-		}
-		produceAsync := func(parts ...promised[routedEncodedTopicPartitionRecords]) <-chan struct{} {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				runHedger(h, context.Background(), parts)
-			}()
-			return done
 		}
 
 		// caller-1: wave 1 sends partition-0 to fallback-agent-A, which fails,
 		// so wave 2 buffers partition-0 on fallback-agent-B.
 		caller1 := newResultCapture()
-		caller1Done := produceAsync(
-			routed(partition0, "caller-1-partition-0", caller1.doneFor(topic, partition0)),
+		caller1Done := runHedgerAsync(h,
+			routedHedgeRecord(topic, partition0, primaryAgent, "caller-1-partition-0", caller1.doneFor(topic, partition0)),
 		)
 		waitBuffered(fallbackAgentA, "caller-1-partition-0")
 		flush(fallbackAgentA)
@@ -1013,9 +1016,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		// caller-2: wave 1 buffers partition-0 on fallback-agent-A and
 		// partition-1 on fallback-agent-B, next to caller-1's partition-0.
 		caller2 := newResultCapture()
-		caller2Done := produceAsync(
-			routed(partition0, "caller-2-partition-0", caller2.doneFor(topic, partition0)),
-			routed(partition1, "caller-2-partition-1", caller2.doneFor(topic, partition1)),
+		caller2Done := runHedgerAsync(h,
+			routedHedgeRecord(topic, partition0, primaryAgent, "caller-2-partition-0", caller2.doneFor(topic, partition0)),
+			routedHedgeRecord(topic, partition1, primaryAgent, "caller-2-partition-1", caller2.doneFor(topic, partition1)),
 		)
 		waitBuffered(fallbackAgentA, "caller-2-partition-0")
 		waitBuffered(fallbackAgentB, "caller-1-partition-0", "caller-2-partition-1")
@@ -1037,7 +1040,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 				case <-deadline:
 					t.Fatal("timed out waiting for caller to finish")
 				case <-time.After(time.Millisecond):
-					if len(bufferedRecords(fallbackAgentB)) > 0 {
+					if len(bufferedRecordValues(agentBuffers[fallbackAgentB])) > 0 {
 						flush(fallbackAgentB)
 					}
 				}
@@ -1100,42 +1103,14 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 		agentBuffer, err := h.hedgeBuffer.agentBufferFor(fallbackAgent)
 		require.NoError(t, err)
-		bufferedRecords := func() []string {
-			agentBuffer.mu.Lock()
-			defer agentBuffer.mu.Unlock()
-			var out []string
-			for _, p := range agentBuffer.nextProduceItems {
-				for _, r := range decodeBatch(p.item.encoded) {
-					out = append(out, string(r.Value))
-				}
-			}
-			return out
-		}
-		routed := func(partition int32, value string, done func(ProduceResult)) promised[routedEncodedTopicPartitionRecords] {
-			return promised[routedEncodedTopicPartitionRecords]{
-				item: routedEncodedTopicPartitionRecords{
-					encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition, Value: []byte(value)}}),
-					nodeID:                       primaryAgent,
-				},
-				done: done,
-			}
-		}
-		produceAsync := func(parts ...promised[routedEncodedTopicPartitionRecords]) <-chan struct{} {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				runHedger(h, context.Background(), parts)
-			}()
-			return done
-		}
 
 		callerOK := newResultCapture()
 		callerBad := newResultCapture()
-		doneOK := produceAsync(routed(partitionOK, "ok", callerOK.doneFor(topic, partitionOK)))
-		doneBad := produceAsync(routed(partitionBad, "bad", callerBad.doneFor(topic, partitionBad)))
+		doneOK := runHedgerAsync(h, routedHedgeRecord(topic, partitionOK, primaryAgent, "ok", callerOK.doneFor(topic, partitionOK)))
+		doneBad := runHedgerAsync(h, routedHedgeRecord(topic, partitionBad, primaryAgent, "bad", callerBad.doneFor(topic, partitionBad)))
 
 		require.EventuallyWithT(t, func(c *assert.CollectT) {
-			assert.ElementsMatch(c, []string{"ok", "bad"}, bufferedRecords())
+			assert.ElementsMatch(c, []string{"ok", "bad"}, bufferedRecordValues(agentBuffer))
 		}, time.Second, time.Millisecond)
 		agentBuffer.timerFlush()
 
@@ -1199,39 +1174,15 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 		agentBuffer, err := h.hedgeBuffer.agentBufferFor(fallbackAgent)
 		require.NoError(t, err)
-		bufferedRecords := func() []string {
-			agentBuffer.mu.Lock()
-			defer agentBuffer.mu.Unlock()
-			var out []string
-			for _, p := range agentBuffer.nextProduceItems {
-				for _, r := range decodeBatch(p.item.encoded) {
-					out = append(out, string(r.Value))
-				}
-			}
-			return out
-		}
-		routed := func(partition int32, value string, done func(ProduceResult)) promised[routedEncodedTopicPartitionRecords] {
-			return promised[routedEncodedTopicPartitionRecords]{
-				item: routedEncodedTopicPartitionRecords{
-					encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition, Value: []byte(value)}}),
-					nodeID:                       primaryAgent,
-				},
-				done: done,
-			}
-		}
 
 		caller := newResultCapture()
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			runHedger(h, context.Background(), []promised[routedEncodedTopicPartitionRecords]{
-				routed(partitionA, "a", caller.doneFor(topic, partitionA)),
-				routed(partitionB, "b", caller.doneFor(topic, partitionB)),
-			})
-		}()
+		done := runHedgerAsync(h,
+			routedHedgeRecord(topic, partitionA, primaryAgent, "a", caller.doneFor(topic, partitionA)),
+			routedHedgeRecord(topic, partitionB, primaryAgent, "b", caller.doneFor(topic, partitionB)),
+		)
 
 		require.EventuallyWithT(t, func(c *assert.CollectT) {
-			assert.ElementsMatch(c, []string{"a", "b"}, bufferedRecords())
+			assert.ElementsMatch(c, []string{"a", "b"}, bufferedRecordValues(agentBuffer))
 		}, time.Second, time.Millisecond)
 		agentBuffer.timerFlush()
 

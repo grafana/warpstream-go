@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +15,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // recordingFlush captures every flush invocation made by a buffer. onFlush,
@@ -327,6 +331,88 @@ func TestAgentBuffer_Add(t *testing.T) {
 					t.Fatal("split item's done did not fire")
 				}
 				assert.Equal(t, int32(1), atomic.LoadInt32(&doneCalls), "done must fire exactly once")
+			})
+
+			t.Run("split item reports its own partition's failure from any of its flushes", func(t *testing.T) {
+				// Partition-0 is split across flushes. One chunk shares a flush that
+				// lands partition-0 and fails partition-1. Partition-0 must still
+				// fail when that shared flush is the first result kept.
+				const batchMaxBytes = 512
+				release := make(chan struct{})
+				var (
+					mu      sync.Mutex
+					layouts [][]int32
+				)
+				flush := func(_ context.Context, _ int32, parts []routedTopicPartitionRecords) ProduceResult {
+					var layout []int32
+					for _, p := range parts {
+						layout = append(layout, p.partition)
+					}
+					mu.Lock()
+					layouts = append(layouts, layout)
+					mu.Unlock()
+
+					sharedWithPartition1 := slices.Contains(layout, 1)
+					if !sharedWithPartition1 {
+						// Hold partition-0-only flushes until the shared flush has
+						// completed every entry, so caller-1's chunk in it
+						// resolves first.
+						<-release
+					}
+					topic := kmsg.ProduceResponseTopic{Topic: "t"}
+					for _, p := range parts {
+						code := kerr.NotLeaderForPartition.Code
+						if p.partition == 0 && sharedWithPartition1 {
+							code = kerrNoError
+						}
+						topic.Partitions = append(topic.Partitions, kmsg.ProduceResponseTopicPartition{Partition: p.partition, ErrorCode: code})
+					}
+					// Every flush leaves a partition failed, so it carries the
+					// Hedger's retry-exhausted error alongside the per-partition
+					// entries, as the client's flush does.
+					return ProduceResult{
+						resp: &kmsg.ProduceResponse{Topics: []kmsg.ProduceResponseTopic{topic}},
+						err:  fmt.Errorf("%w: %w", kgo.ErrRecordTimeout, kerr.NotLeaderForPartition),
+					}
+				}
+				a := NewAgentBuffer[routedTopicPartitionRecords](1, time.Hour, batchMaxBytes, flush, newMetrics(prometheus.NewPedanticRegistry()))
+
+				caller1 := make(chan error, 1)
+				records := make([]*kgo.Record, 5)
+				for i := range records {
+					records[i] = makeRecord("t", 0, string(bytes.Repeat([]byte("x"), 200)))
+				}
+				adder.add(a, routedToWithDone(1, records, func(grp []*kgo.Record) func(ProduceResult) {
+					return perPartitionDone("t", 0, grp, func(err error) { caller1 <- err })
+				})[0])
+
+				// caller-2's done runs after caller-1's chunk in the shared flush,
+				// since the flush completes entries in the order they were added.
+				caller2 := make(chan error, 1)
+				adder.add(a, routedToWithDone(1, []*kgo.Record{makeRecord("t", 1, "v")}, func(grp []*kgo.Record) func(ProduceResult) {
+					return perPartitionDone("t", 1, grp, func(err error) {
+						caller2 <- err
+						close(release)
+					})
+				})[0])
+				a.Close()
+
+				mu.Lock()
+				require.Greater(t, len(layouts), 1, "partition-0 must be split across multiple flushes")
+				require.True(t, slices.ContainsFunc(layouts, func(l []int32) bool {
+					return slices.Contains(l, 0) && slices.Contains(l, 1)
+				}), "caller-2's partition-1 must share a flush with a caller-1 chunk, got %v", layouts)
+				mu.Unlock()
+
+				for name, ch := range map[string]chan error{"caller-1": caller1, "caller-2": caller2} {
+					select {
+					case err := <-ch:
+						assert.ErrorIsf(t, err, kgo.ErrRecordTimeout, "%s", name)
+						assert.ErrorIsf(t, err, kerr.NotLeaderForPartition, "%s", name)
+					case <-time.After(time.Second):
+						t.Fatalf("%s's done did not fire", name)
+					}
+				}
 			})
 
 			// Two same-partition adds within one flush window coalesce into a single
