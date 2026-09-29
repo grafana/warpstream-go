@@ -41,13 +41,33 @@ func partitionEntries(resp *kmsg.ProduceResponse, topic string) map[int32]kmsg.P
 	return out
 }
 
+type testProduceResultAccumulator struct {
+	*produceResultAccumulator
+}
+
 // mustNewProduceResultAccumulator builds an accumulator and fails the
 // test if the input has duplicate (topic, partition) pairs.
-func mustNewProduceResultAccumulator(t *testing.T, partitions []encodedTopicPartitionRecords) *produceResultAccumulator {
+func mustNewProduceResultAccumulator(t *testing.T, partitions []encodedTopicPartitionRecords) *testProduceResultAccumulator {
 	t.Helper()
 	a, err := newProduceResultAccumulator(partitions)
 	require.NoError(t, err)
-	return a
+	return &testProduceResultAccumulator{produceResultAccumulator: a}
+}
+
+func scopeAllResponsePartitions(res ProduceResult) scopedProduceResult {
+	own := make(map[topicPartition]struct{})
+	if res.resp != nil {
+		for _, t := range res.resp.Topics {
+			for _, p := range t.Partitions {
+				own[topicPartition{topic: t.Topic, partition: p.Partition}] = struct{}{}
+			}
+		}
+	}
+	return scopeProduceResultToPartitions(res, own)
+}
+
+func (a *testProduceResultAccumulator) accumulate(res ProduceResult) {
+	a.produceResultAccumulator.accumulate(scopeAllResponsePartitions(res))
 }
 
 func TestProduceResult_Error(t *testing.T) {
@@ -95,12 +115,12 @@ func TestProduceResult_Error(t *testing.T) {
 	}
 }
 
-func TestScopeProduceResultToPartitions(t *testing.T) {
+func TestScopedProduceResult_Error(t *testing.T) {
 	tp0 := topicPartition{topic: "t", partition: 0}
 	tp1 := topicPartition{topic: "t", partition: 1}
 	own := map[topicPartition]struct{}{tp0: {}}
 
-	t.Run("drops another caller's partition merged into the same flush", func(t *testing.T) {
+	t.Run("ignores another caller's error merged into the same flush", func(t *testing.T) {
 		res := ProduceResult{resp: makeProduceResponse(11, 0,
 			makeProduceResponseTopic("t",
 				makeProduceResponseTopicPartition(0, kerrNoError),
@@ -110,10 +130,8 @@ func TestScopeProduceResultToPartitions(t *testing.T) {
 
 		scoped := scopeProduceResultToPartitions(res, own)
 
-		require.Len(t, scoped.resp.Topics, 1)
-		require.Len(t, scoped.resp.Topics[0].Partitions, 1)
-		assert.Equal(t, int32(0), scoped.resp.Topics[0].Partitions[0].Partition)
 		assert.NoError(t, scoped.error())
+		assert.False(t, scoped.allOwned)
 	})
 
 	t.Run("keeps two of own's own partitions all-or-nothing with each other", func(t *testing.T) {
@@ -126,8 +144,8 @@ func TestScopeProduceResultToPartitions(t *testing.T) {
 
 		scoped := scopeProduceResultToPartitions(res, map[topicPartition]struct{}{tp0: {}, tp1: {}})
 
-		require.Len(t, scoped.resp.Topics[0].Partitions, 2)
 		assert.Error(t, scoped.error())
+		assert.True(t, scoped.allOwned)
 	})
 
 	t.Run("none of own present stays a no-op, not an empty result", func(t *testing.T) {
@@ -137,10 +155,16 @@ func TestScopeProduceResultToPartitions(t *testing.T) {
 
 		scoped := scopeProduceResultToPartitions(res, own)
 
-		require.NotNil(t, scoped.resp)
-		assert.Empty(t, scoped.resp.Topics)
 		assert.NoError(t, scoped.error())
 		assert.NotErrorIs(t, scoped.error(), errEmptyProduceResult)
+		assert.False(t, scoped.allOwned)
+	})
+
+	t.Run("non-nil empty response stays successful", func(t *testing.T) {
+		scoped := scopeProduceResultToPartitions(ProduceResult{resp: &kmsg.ProduceResponse{}}, own)
+
+		assert.NoError(t, scoped.error())
+		assert.True(t, scoped.allOwned)
 	})
 
 	t.Run("a whole-flush transport error is kept for every partition", func(t *testing.T) {
@@ -148,7 +172,6 @@ func TestScopeProduceResultToPartitions(t *testing.T) {
 
 		scoped := scopeProduceResultToPartitions(res, own)
 
-		assert.Nil(t, scoped.resp)
 		assert.ErrorIs(t, scoped.error(), kerr.KafkaStorageError)
 	})
 
@@ -160,7 +183,7 @@ func TestScopeProduceResultToPartitions(t *testing.T) {
 
 		scoped := scopeProduceResultToPartitions(res, own)
 
-		assert.Equal(t, res.compressionTypes, scoped.compressionTypes)
+		assert.Equal(t, res.compressionTypes, scoped.raw.compressionTypes)
 	})
 }
 
@@ -391,6 +414,48 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		rem := a.remaining()
 		require.Len(t, rem, 1)
 		assert.Equal(t, int32(1), rem[0].partition)
+	})
+
+	t.Run("attempt ownership ignores another agent's still-pending partition", func(t *testing.T) {
+		tp0 := topicPartition{topic: "t", partition: 0}
+		tp1 := topicPartition{topic: "t", partition: 1}
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
+			makeTopicPartitionRecords("t", 0),
+			makeTopicPartitionRecords("t", 1),
+		})
+		res := ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
+			kmsg.ProduceResponseTopicPartition{Partition: 0, ErrorCode: kerrNoError, BaseOffset: 100},
+			kmsg.ProduceResponseTopicPartition{Partition: 1, ErrorCode: kerrNoError, BaseOffset: 200},
+		))}
+
+		a.produceResultAccumulator.accumulate(scopeProduceResultToPartitions(res, map[topicPartition]struct{}{tp1: {}}))
+
+		assert.False(t, a.done())
+		assert.Contains(t, a.pending, tp0)
+		assert.NotContains(t, a.pending, tp1)
+		assert.NotContains(t, a.resolved, tp0)
+		assert.Contains(t, a.resolved, tp1)
+	})
+
+	t.Run("attempt ownership ignores another agent's error", func(t *testing.T) {
+		tp0 := topicPartition{topic: "t", partition: 0}
+		tp1 := topicPartition{topic: "t", partition: 1}
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{
+			makeTopicPartitionRecords("t", 0),
+			makeTopicPartitionRecords("t", 1),
+		})
+		res := ProduceResult{resp: makeProduceResponse(0, 0, makeProduceResponseTopic("t",
+			makeProduceResponseTopicPartition(0, kerr.NotLeaderForPartition.Code),
+			kmsg.ProduceResponseTopicPartition{Partition: 1, ErrorCode: kerrNoError, BaseOffset: 200},
+		))}
+
+		a.produceResultAccumulator.accumulate(scopeProduceResultToPartitions(res, map[topicPartition]struct{}{tp1: {}}))
+
+		assert.False(t, a.done())
+		assert.Contains(t, a.pending, tp0)
+		assert.NotContains(t, a.pending, tp1)
+		assert.Empty(t, a.failed)
+		assert.Nil(t, a.lastErr.err)
 	})
 
 	t.Run("multiple successful calls together resolve everything and capture metadata", func(t *testing.T) {
