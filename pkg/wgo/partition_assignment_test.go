@@ -180,7 +180,8 @@ func TestDefaultPartitionAssignmentStrategy_FallbackOnUnknownLeader(t *testing.T
 			{topic: "t", partition: -1}: agents[0],
 		})
 		c3 := s2.Candidates("t", 7, 1)
-		assert.Equal(t, c1, c3, "two independently constructed strategies over the same agent set must agree")
+		// Two independently constructed strategies over the same agent set must agree.
+		assert.Equal(t, c1, c3)
 	})
 
 	t.Run("fallback pick is exactly agents[hash(topic,partition) % len(agents)]", func(t *testing.T) {
@@ -199,7 +200,8 @@ func TestDefaultPartitionAssignmentStrategy_FallbackOnUnknownLeader(t *testing.T
 			require.Len(t, c, 1)
 			seen[c[0].NodeID] = struct{}{}
 		}
-		assert.Greater(t, len(seen), 1, "20 partitions should not all hash to the same fallback agent")
+		// 20 partitions should not all hash to the same fallback agent.
+		assert.Greater(t, len(seen), 1)
 	})
 
 	t.Run("fallback pick is reported healthy, same as a known leader", func(t *testing.T) {
