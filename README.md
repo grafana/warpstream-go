@@ -54,12 +54,14 @@ Records are buffered through a `ClusterRecordBuffer`, which bins them by the des
 
 Linger by agent (not by partition) is what lets a single wire request fan out across many partitions, and what makes the hedge cascade efficient: a hedge wave sends one request per fallback-agent too, not one per partition.
 
+One `ProduceSync` call that puts more than `BatchMaxBytes` on a single partition is split across flushes and completed once. The call fails if any of those flushes fails that partition. Another partition in the same flush does not decide it.
+
 ### Hedger: race the primary against a fallback
 
 When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which decides whether to race the primary against a secondary agent. Per call it produces one of three outcomes:
 
 - **Primary wins outright.** The primary leg returns first with a clean result; we surface it and the secondary never fires.
-- **Primary fails, cascade retries.** A leg counts as failed if *any* partition in its response errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling fails). The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
+- **Primary fails, cascade retries.** A leg counts as failed if *any* partition it sent errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling from the same call fails). Hedge legs from concurrent calls to the same agent can share one flush; each leg reads only the partitions it sent, so another call's outcome never resolves or fails it. The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
 - **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins, and the loser is cancelled.
 
 Before accepting a primary response, the Hedger checks that it includes every requested topic-partition. An incomplete response triggers the existing retry path and logs a warning with the agent ID and first missing topic-partition, even if a retry succeeds. Partitions still unacknowledged after retries are exhausted are reported as failed.
