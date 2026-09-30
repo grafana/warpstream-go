@@ -156,6 +156,7 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 		return nil
 	}
 
+	var h uint64
 	leader, ok := s.leaders[topicPartition{topic: topic, partition: partition}]
 	if !ok {
 		if len(s.agents) == 0 {
@@ -164,7 +165,8 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 		if _, topicKnown := s.knownTopics[topic]; !topicKnown {
 			return nil
 		}
-		leader = s.agents[hashTopicPartition(topic, partition)%uint64(len(s.agents))]
+		h = hashTopicPartition(topic, partition)
+		leader = s.agents[h%uint64(len(s.agents))]
 	}
 
 	out := make([]Agent, 0, maxCandidates)
@@ -181,9 +183,12 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 	if nonLeaderCount <= 0 {
 		return out
 	}
-	// Recomputed here so the common one-candidate path above never pays
-	// for a hash it doesn't use.
-	start := int(hashTopicPartition(topic, partition) % uint64(nonLeaderCount))
+	// The one-candidate return above never reaches this hash. A fallback
+	// pick already stored it.
+	if ok {
+		h = hashTopicPartition(topic, partition)
+	}
+	start := int(h % uint64(nonLeaderCount))
 	for offset := 0; offset < nonLeaderCount && len(out) < maxCandidates; offset++ {
 		idx := (start + offset) % nonLeaderCount
 		out = append(out, Agent{NodeID: nthNonLeader(s.agents, leader, idx), State: AgentStateHealthy})
