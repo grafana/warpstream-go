@@ -2,6 +2,7 @@ package wgo
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -424,6 +426,35 @@ func TestSplitPromisedRoutedBatchByBatchMaxBytes(t *testing.T) {
 				return rs
 			})
 			assert.ErrorIs(t, got.err, boom1)
+		})
+		// The first result fails only a sibling partition, and carries the
+		// Hedger's overall timeout. This partition's own later failure must win.
+		t.Run("sibling failure does not hide this partition's later failure", func(t *testing.T) {
+			own := kmsg.ProduceResponseTopicPartition{Partition: 3, ErrorCode: kerr.NotLeaderForPartition.Code}
+			misleading := ProduceResult{
+				resp: &kmsg.ProduceResponse{Topics: []kmsg.ProduceResponseTopic{{
+					Topic: "t",
+					Partitions: []kmsg.ProduceResponseTopicPartition{
+						{Partition: 3, ErrorCode: kerrNoError},
+						{Partition: 1, ErrorCode: kerr.NotLeaderForPartition.Code},
+					},
+				}}},
+				err: fmt.Errorf("%w: %w", kgo.ErrRecordTimeout, kerr.NotLeaderForPartition),
+			}
+			ownFail := ProduceResult{
+				resp: &kmsg.ProduceResponse{Topics: []kmsg.ProduceResponseTopic{{Topic: "t", Partitions: []kmsg.ProduceResponseTopicPartition{own}}}},
+				err:  fmt.Errorf("%w: %w", kgo.ErrRecordTimeout, kerr.NotLeaderForPartition),
+			}
+			got := run(t, func(n int) []ProduceResult {
+				rs := allSuccess(n)
+				rs[0] = misleading
+				rs[1] = ownFail
+				return rs
+			})
+			require.ErrorIs(t, got.error(), kerr.NotLeaderForPartition)
+			require.Len(t, got.resp.Topics, 1)
+			require.Len(t, got.resp.Topics[0].Partitions, 1)
+			assert.Equal(t, int32(3), got.resp.Topics[0].Partitions[0].Partition)
 		})
 	})
 
