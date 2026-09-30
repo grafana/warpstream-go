@@ -334,6 +334,63 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 		})
 	})
+
+	t.Run("partial leader-map drop on a known topic: falls back instead of rejecting the whole batch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 2)
+
+			// Read the real leader and topic UUID that the initial Refresh
+			// already found, then rebuild the pool state with partition 1's
+			// leader dropped but partition 0's kept — same shape as the real
+			// bug, and the topic is still known.
+			cands := c.demoter.Candidates(topic, 0, 1)
+			require.Len(t, cands, 1)
+			leader := cands[0].NodeID
+			topicID, ok := c.pool.TopicID(topic)
+			require.True(t, ok)
+
+			c.pool.state.Store(&poolState{
+				agents:   []int32{leader},
+				topicIDs: map[string][16]byte{topic: topicID},
+				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
+					{topic: topic, partition: 0}: leader,
+				}),
+			})
+
+			// Partition 0 (healthy sibling) and partition 1 (dropped leader)
+			// in the same call — proves the sibling survives, not just that
+			// the dropped partition itself falls back.
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+				{Topic: topic, Partition: 1, Value: []byte("b"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			// Before this fix, partition 1 having no candidate would have
+			// aborted the whole call, failing partition 0 along with it.
+			require.NoError(t, results[0].Err)
+			require.NoError(t, results[1].Err)
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+
+			consumer, err := kgo.NewClient(
+				kgo.SeedBrokers(clusterAddr),
+				kgo.Dialer(vnet.DialContext),
+				kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+					topic: {0: kgo.NewOffset().AtStart(), 1: kgo.NewOffset().AtStart()},
+				}),
+			)
+			require.NoError(t, err)
+			t.Cleanup(consumer.Close)
+
+			fetches := consumer.PollFetches(t.Context())
+			require.NoError(t, fetches.Err())
+			require.Len(t, fetches.Records(), 2)
+			got := map[int32]string{}
+			for _, r := range fetches.Records() {
+				got[r.Partition] = string(r.Value)
+			}
+			assert.Equal(t, map[int32]string{0: "a", 1: "b"}, got)
+		})
+	})
 }
 
 func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
