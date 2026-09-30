@@ -61,22 +61,23 @@ func NewAgentPool(client *kgo.Client) *AgentPool {
 	p := &AgentPool{client: client}
 	p.state.Store(&poolState{
 		topicIDs: map[string][16]byte{},
-		strategy: newDefaultPartitionAssignmentStrategy(nil, nil),
+		strategy: newDefaultPartitionAssignmentStrategy(nil, nil, nil),
 	})
 	return p
 }
 
 // Refresh atomically replaces the snapshot. Returns the NodeIDs that have left
 // the cluster since the last Refresh — callers must purge per-agent state
-// (stats, etc.) for those IDs. Not safe for concurrent calls.
-func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, err error) {
+// (stats, etc.) for those IDs. dropped counts leaders excluded from the broker
+// set and names one when the count is above zero. Not safe for concurrent calls.
+func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, dropped leaderDrops, err error) {
 	// Topics=nil requests metadata for every topic in the cluster.
 	// A tiny positive cache age keeps production refreshes fresh while using
 	// kgo's bounded internal Metadata retry policy.
 	req := kmsg.NewPtrMetadataRequest()
 	meta, err := p.client.RequestCachedMetadata(ctx, req, time.Nanosecond)
 	if err != nil {
-		return nil, fmt.Errorf("fetching metadata: %w", err)
+		return nil, leaderDrops{}, fmt.Errorf("fetching metadata: %w", err)
 	}
 
 	newAgents := make([]int32, 0, len(meta.Brokers))
@@ -91,15 +92,15 @@ func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, err error) {
 	}
 
 	prev := p.state.Load()
-	newLeaders, newTopicIDs := buildLeadersAndTopicIDs(meta.Topics, agentSet, prev.topicIDs)
+	newLeaders, newTopicIDs, noLiveLeader, dropped := buildLeadersAndTopicIDs(meta.Topics, agentSet, prev.topicIDs)
 	removed = diffRemovedAgents(prev.agents, agentSet)
 
 	p.state.Store(&poolState{
 		agents:   newAgents,
 		topicIDs: newTopicIDs,
-		strategy: newDefaultPartitionAssignmentStrategy(newAgents, newLeaders),
+		strategy: newDefaultPartitionAssignmentStrategy(newAgents, newLeaders, noLiveLeader),
 	})
-	return removed, nil
+	return removed, dropped, nil
 }
 
 // Strategy returns the strategy from the last Refresh.
@@ -120,18 +121,31 @@ func (p *AgentPool) TopicID(topic string) ([16]byte, bool) {
 	return id, ok
 }
 
+// leaderDrops counts leaders whose NodeID was absent from the broker set.
+// Topic, Partition, and NodeID are one sample when Count is above zero.
+type leaderDrops struct {
+	Count     int
+	Topic     string
+	Partition int32
+	NodeID    int32
+}
+
 // buildLeadersAndTopicIDs extracts the leader map and topic UUIDs from a
-// Metadata response. Drops leaders pointing to NodeIDs absent from agentSet
-// (transient mid-update window). Carries previous UUIDs forward for topics
-// returned with a non-zero ErrorCode, so transient errors don't blank the
-// topic from the producer's view.
+// Metadata response, plus topics that listed partitions and kept none (nil
+// when there are none) and the excluded-leader count with one sample.
+// Drops leaders pointing to NodeIDs absent from agentSet (transient
+// mid-update window). Carries previous UUIDs forward for topics returned
+// with a non-zero ErrorCode, so transient errors don't blank the topic
+// from the producer's view. A non-zero ErrorCode is not a drop.
 func buildLeadersAndTopicIDs(
 	respTopics []kmsg.MetadataResponseTopic,
 	agentSet map[int32]struct{},
 	prevTopicIDs map[string][16]byte,
-) (map[topicPartition]int32, map[string][16]byte) {
+) (map[topicPartition]int32, map[string][16]byte, map[string]struct{}, leaderDrops) {
 	topicIDs := make(map[string][16]byte, len(respTopics))
 	leaders := make(map[topicPartition]int32, len(respTopics)*8)
+	var topicsWithNoLiveLeader map[string]struct{}
+	var dropped leaderDrops
 	for _, t := range respTopics {
 		if t.Topic == nil {
 			continue
@@ -145,14 +159,29 @@ func buildLeadersAndTopicIDs(
 			continue
 		}
 		topicIDs[name] = t.TopicID
+		seen, kept := 0, 0
 		for _, part := range t.Partitions {
+			seen++
 			if _, known := agentSet[part.Leader]; !known {
+				if dropped.Count == 0 {
+					dropped.Topic = name
+					dropped.Partition = part.Partition
+					dropped.NodeID = part.Leader
+				}
+				dropped.Count++
 				continue
 			}
+			kept++
 			leaders[topicPartition{topic: name, partition: part.Partition}] = part.Leader
 		}
+		if seen > 0 && kept == 0 {
+			if topicsWithNoLiveLeader == nil {
+				topicsWithNoLiveLeader = make(map[string]struct{})
+			}
+			topicsWithNoLiveLeader[name] = struct{}{}
+		}
 	}
-	return leaders, topicIDs
+	return leaders, topicIDs, topicsWithNoLiveLeader, dropped
 }
 
 // diffRemovedAgents returns NodeIDs in old that are absent from newSet.

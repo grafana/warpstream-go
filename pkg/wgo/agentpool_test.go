@@ -30,9 +30,10 @@ func TestAgentPool_Refresh(t *testing.T) {
 
 		pool := NewAgentPool(client)
 
-		removed, err := pool.Refresh(t.Context())
+		removed, dropped, err := pool.Refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
+		assert.Zero(t, dropped.Count)
 		assert.NotNil(t, pool.Strategy())
 
 		id, ok := pool.TopicID(topicName)
@@ -46,12 +47,12 @@ func TestAgentPool_Refresh(t *testing.T) {
 			assert.GreaterOrEqual(t, cands[0].NodeID, int32(0))
 		}
 
-		removed, err = pool.Refresh(t.Context())
+		removed, _, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
 
 		s1 := pool.Strategy()
-		_, err = pool.Refresh(t.Context())
+		_, _, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		s2 := pool.Strategy()
 		assert.NotSame(t, s1, s2)
@@ -106,7 +107,7 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		pool := NewAgentPool(client)
 
 		// Refresh discovers all topics in the cluster.
-		_, err = pool.Refresh(t.Context())
+		_, _, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 
 		idA, okA := pool.TopicID(topicA)
@@ -139,7 +140,7 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 
 		// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
 		time.Sleep(time.Nanosecond)
-		_, err = pool.Refresh(t.Context())
+		_, _, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		_, okB = pool.TopicID(topicB)
 		assert.False(t, okB)
@@ -154,10 +155,12 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 	idB := [16]byte{0x43}
 
 	tests := map[string]struct {
-		respTopics   []kmsg.MetadataResponseTopic
-		prevTopicIDs map[string][16]byte
-		wantLeaders  map[topicPartition]int32
-		wantTopicIDs map[string][16]byte
+		respTopics       []kmsg.MetadataResponseTopic
+		prevTopicIDs     map[string][16]byte
+		wantLeaders      map[topicPartition]int32
+		wantTopicIDs     map[string][16]byte
+		wantNoLiveLeader map[string]struct{}
+		wantDropped      leaderDrops
 	}{
 		"happy path: single topic, all leaders known": {
 			respTopics: []kmsg.MetadataResponseTopic{{
@@ -200,6 +203,7 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 				{topic: "a", partition: 2}: 3,
 			},
 			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantDropped:  leaderDrops{Count: 1, Topic: "a", Partition: 1, NodeID: 99},
 		},
 		"topic absent from response is evicted (deletion is authoritative)": {
 			respTopics:   []kmsg.MetadataResponseTopic{},
@@ -224,15 +228,62 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 				TopicID:    idA,
 				Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}},
 			}},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 1, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"every partition leader unknown: first excluded leader is the sample": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{
+					{Partition: 0, Leader: 99},
+					{Partition: 1, Leader: 98},
+				},
+			}},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 2, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"one topic fully excluded, another kept": {
+			respTopics: []kmsg.MetadataResponseTopic{
+				{Topic: stringPtr("a"), TopicID: idA, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}}},
+				{Topic: stringPtr("b"), TopicID: idB, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 1}}},
+			},
+			wantLeaders:      map[topicPartition]int32{{topic: "b", partition: 0}: 1},
+			wantTopicIDs:     map[string][16]byte{"a": idA, "b": idB},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 1, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"two topics both lose every leader: count sums and the sample stays on the first": {
+			respTopics: []kmsg.MetadataResponseTopic{
+				{Topic: stringPtr("a"), TopicID: idA, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}}},
+				{Topic: stringPtr("b"), TopicID: idB, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 3, Leader: 98}}},
+			},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA, "b": idB},
+			wantNoLiveLeader: map[string]struct{}{"a": {}, "b": {}},
+			wantDropped:      leaderDrops{Count: 2, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"empty partition list with a zero error code stays out of the no-live-leader set": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:      stringPtr("a"),
+				TopicID:    idA,
+				Partitions: nil,
+			}},
 			wantLeaders:  map[topicPartition]int32{},
 			wantTopicIDs: map[string][16]byte{"a": idA},
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			leaders, topicIDs := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
+			leaders, topicIDs, noLiveLeader, dropped := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
 			assert.Equal(t, tc.wantLeaders, leaders)
 			assert.Equal(t, tc.wantTopicIDs, topicIDs)
+			assert.Equal(t, tc.wantNoLiveLeader, noLiveLeader)
+			assert.Equal(t, tc.wantDropped, dropped)
 		})
 	}
 }
@@ -290,7 +341,7 @@ func TestAgentPool_StrategyConcurrent(t *testing.T) {
 		t.Cleanup(client.Close)
 
 		pool := NewAgentPool(client)
-		_, err = pool.Refresh(t.Context())
+		_, _, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 
 		// Spin up concurrent readers and let them overlap. The value of this test
