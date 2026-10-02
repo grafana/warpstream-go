@@ -400,6 +400,35 @@ func (c *WarpstreamClient) Close() {
 	})
 }
 
+// refreshBackoff paces on-demand Metadata fetches. The delay starts at floor,
+// grows after each on-demand fetch up to ceiling, and returns to floor when a
+// periodic fetch runs.
+type refreshBackoff struct {
+	floor   time.Duration
+	ceiling time.Duration
+	delay   time.Duration
+}
+
+func newRefreshBackoff(floor, ceiling time.Duration) refreshBackoff {
+	return refreshBackoff{floor: floor, ceiling: ceiling, delay: floor}
+}
+
+func (b *refreshBackoff) current() time.Duration { return b.delay }
+
+func (b *refreshBackoff) advance() {
+	// time.Duration is an int64. Doubling past MaxInt64 wraps negative.
+	// At or below half the ceiling, delay*2 still fits and stays within it.
+	if b.delay > b.ceiling/2 {
+		b.delay = b.ceiling
+		return
+	}
+	b.delay *= 2
+}
+
+func (b *refreshBackoff) reset() {
+	b.delay = b.floor
+}
+
 // startBackgroundRefresh owns every post-startup AgentPool.Refresh: the
 // periodic ticker and on-demand nudges from triggerRefresh. One owner means
 // Refresh is never concurrent. refreshCtx (cancelled by Close) stops the loop,
@@ -412,20 +441,42 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 		defer c.refreshWG.Done()
 		ticker := time.NewTicker(c.cfg.MetadataRefreshInterval)
 		defer ticker.Stop()
+		backoff := newRefreshBackoff(c.cfg.OnDemandMetadataRefreshInterval, c.cfg.MetadataRefreshInterval)
 		for {
+			periodic := false
 			select {
 			case <-c.refreshCtx.Done():
 				return
 			case <-c.refreshNowCh:
-				ticker.Reset(c.cfg.MetadataRefreshInterval)
-				startedAt := time.Now()
-				c.refreshPool(metadataRefreshTriggerOnDemand)
-				if !c.waitRefreshCooldown(time.Since(startedAt)) {
+			case <-ticker.C:
+				// A nudge queued at the same instant wins. At the ceiling the
+				// cooldown ends as the tick lands, and taking the tick would
+				// reset the delay.
+				select {
+				case <-c.refreshNowCh:
+				default:
+					periodic = true
+				}
+			}
+
+			if periodic {
+				c.refreshPool(metadataRefreshTriggerPeriodic)
+				// A nudge queued during this fetch must not start another after Close.
+				if c.refreshCtx.Err() != nil {
 					return
 				}
-			case <-ticker.C:
-				c.refreshPool(metadataRefreshTriggerPeriodic)
+				backoff.reset()
+				continue
 			}
+			ticker.Reset(c.cfg.MetadataRefreshInterval)
+			startedAt := time.Now()
+			c.refreshPool(metadataRefreshTriggerOnDemand)
+			c.waitRefreshCooldown(backoff.current(), time.Since(startedAt))
+			// Return before select can take the nudge the fetch just queued.
+			if c.refreshCtx.Err() != nil {
+				return
+			}
+			backoff.advance()
 		}
 	}()
 }
@@ -454,8 +505,7 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	}
 	c.demoter.Refresh(c.pool.Agents())
 	// Nudge so a stand-in does not wait for the next periodic tick. Produce does
-	// not block. After a periodic tick the follow-up starts at once; later
-	// repeats wait out OnDemandMetadataRefreshInterval (default 1s).
+	// not block. The refresh loop paces the follow-up.
 	c.noteLeaderDrops(dropped, true)
 }
 
@@ -475,21 +525,18 @@ func (c *WarpstreamClient) noteLeaderDrops(dropped leaderDrops, nudge bool) {
 	}
 }
 
-// waitRefreshCooldown enforces the configured minimum between on-demand
-// refresh start times. Time spent fetching already counts toward the interval.
-// Returns false during close so the refresh loop exits without spinning.
-func (c *WarpstreamClient) waitRefreshCooldown(elapsed time.Duration) bool {
-	remaining := c.cfg.OnDemandMetadataRefreshInterval - elapsed
+// waitRefreshCooldown sleeps out the rest of delay. Time already spent
+// fetching counts. Close cancels refreshCtx and the wait returns.
+func (c *WarpstreamClient) waitRefreshCooldown(delay, elapsed time.Duration) {
+	remaining := delay - elapsed
 	if remaining <= 0 {
-		return c.refreshCtx.Err() == nil
+		return
 	}
 	t := time.NewTimer(remaining)
 	defer t.Stop()
 	select {
 	case <-c.refreshCtx.Done():
-		return false
 	case <-t.C:
-		return true
 	}
 }
 
