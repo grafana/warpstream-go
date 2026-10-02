@@ -3,6 +3,7 @@ package wgo
 import (
 	"bytes"
 	"context"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1639,7 +1640,7 @@ func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {
 			}
 
 			startedAt := time.Now()
-			assert.True(t, c.waitRefreshCooldown(250*time.Millisecond))
+			c.waitRefreshCooldown(time.Second, 250*time.Millisecond)
 			assert.Equal(t, 750*time.Millisecond, time.Since(startedAt))
 		})
 	})
@@ -1654,10 +1655,272 @@ func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {
 			}
 
 			startedAt := time.Now()
-			assert.True(t, c.waitRefreshCooldown(2*time.Second))
+			c.waitRefreshCooldown(time.Second, 2*time.Second)
 			assert.Zero(t, time.Since(startedAt))
 		})
 	})
+
+	t.Run("close interrupts the wait", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			c := &WarpstreamClient{
+				cfg:        Config{OnDemandMetadataRefreshInterval: time.Second},
+				refreshCtx: ctx,
+			}
+
+			startedAt := time.Now()
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				cancel()
+			}()
+			c.waitRefreshCooldown(time.Second, 0)
+			assert.Equal(t, 100*time.Millisecond, time.Since(startedAt))
+		})
+	})
+}
+
+func TestRefreshBackoff_Advance(t *testing.T) {
+	b := newRefreshBackoff(time.Second, 10*time.Second)
+	assert.Equal(t, time.Second, b.current())
+	for _, want := range []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second} {
+		b.advance()
+		assert.Equal(t, want, b.current())
+	}
+	b.reset()
+	assert.Equal(t, time.Second, b.current())
+
+	// Doubling this delay would wrap time.Duration. advance saturates instead.
+	ceiling := time.Duration(math.MaxInt64)
+	b = newRefreshBackoff(ceiling/2+1, ceiling)
+	b.advance()
+	assert.Equal(t, ceiling, b.current())
+}
+
+func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
+	const topic = "test-topic"
+
+	t.Run("leader drop backs off until a clean snapshot restores the leader", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, clusterAddr := testkafka.CreateCluster(t, 1, topic,
+				testkafka.WithVirtualNetwork(vnet), testkafka.WithNumBrokers(3))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			before := c.demoter.Candidates(topic, 0, 1)
+			require.Len(t, before, 1)
+			leader := before[0].NodeID
+
+			raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+			require.NoError(t, err)
+			template := raw.(*kmsg.MetadataResponse)
+
+			var poison atomic.Bool
+			cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				if !poison.Load() {
+					return nil, nil, false
+				}
+				return metadataWithMissingLeaders(template, 99, req.GetVersion()), nil, true
+			})
+
+			poison.Store(true)
+			time.Sleep(time.Nanosecond)
+			c.triggerRefresh()
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 1, 0)
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+			assertMissingLeader(t, c, topic)
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("stand-in"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 1)
+			require.NoError(t, results[0].Err)
+
+			// Gaps after the first fetch: 1s, 2s, 4s, 8s, then 10s. The 10s
+			// gap ends as the periodic tick lands; the queued nudge keeps it
+			// on-demand, so the delay does not fall back to 1s.
+			for i, gap := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second} {
+				time.Sleep(gap)
+				synctest.Wait()
+				assertOnDemandRefresh(t, c, float64(i+2), 0)
+			}
+			assert.Equal(t, float64(6), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 6, 0)
+
+			poison.Store(false)
+			time.Sleep(9 * time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 7, 0)
+			assert.Equal(t, float64(6), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+			assertLeaderRestored(t, c, topic, leader)
+
+			restored := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("leader"), Timestamp: time.Now()},
+			})
+			require.Len(t, restored, 1)
+			require.NoError(t, restored[0].Err)
+
+			// The clean fetch did not ask for another. The periodic tick
+			// resets the gap to the floor.
+			time.Sleep(9 * time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 7, 0)
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 7, 1)
+
+			c.triggerRefresh()
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 8, 1)
+			// Queue the next nudge during the floor cooldown. A delay still
+			// at the ceiling would not fetch again inside this second.
+			c.triggerRefresh()
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 8, 1)
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 9, 1)
+		})
+	})
+
+	t.Run("routing miss uses the same backoff", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			time.Sleep(time.Nanosecond)
+			miss := func() {
+				results := c.ProduceSync(t.Context(), []*kgo.Record{
+					{Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now()},
+				})
+				require.ErrorContains(t, results[0].Err, "no agent assigned")
+			}
+
+			miss()
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 1, 0)
+
+			miss()
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 1, 0)
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 2, 0)
+
+			miss()
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 2, 0)
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 3, 0)
+		})
+	})
+
+	t.Run("failed fetch advances backoff and close interrupts the cooldown", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+			raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+			require.NoError(t, err)
+			template := raw.(*kmsg.MetadataResponse)
+			// A response error fails the fetch in one round trip. Closing the
+			// connection instead makes kgo retry, and that retry time would
+			// swallow the cooldown this test is measuring.
+			cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				resp := cloneMetadataResponse(template, req.GetVersion())
+				resp.ErrorCode = kerr.UnknownServerError.Code
+				return resp, nil, true
+			})
+
+			time.Sleep(time.Nanosecond)
+			c.triggerRefresh()
+			synctest.Wait()
+			assert.Equal(t, float64(1), failedOnDemandRefreshes(c))
+
+			c.triggerRefresh()
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assert.Equal(t, float64(1), failedOnDemandRefreshes(c))
+			time.Sleep(500 * time.Millisecond)
+			synctest.Wait()
+			assert.Equal(t, float64(2), failedOnDemandRefreshes(c))
+
+			c.triggerRefresh()
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assert.Equal(t, float64(2), failedOnDemandRefreshes(c))
+			time.Sleep(time.Second)
+			synctest.Wait()
+			assert.Equal(t, float64(3), failedOnDemandRefreshes(c))
+
+			startedAt := time.Now()
+			c.Close()
+			assert.Zero(t, time.Since(startedAt))
+		})
+	})
+}
+
+func assertOnDemandRefresh(t *testing.T, c *WarpstreamClient, onDemand, periodic float64) {
+	t.Helper()
+	assert.Equal(t, onDemand, testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+		string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
+	assert.Equal(t, periodic, testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+		string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
+}
+
+func failedOnDemandRefreshes(c *WarpstreamClient) float64 {
+	return testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+		string(metadataRefreshTriggerOnDemand), metadataRefreshResultFailed))
+}
+
+func assertMissingLeader(t *testing.T, c *WarpstreamClient, topic string) {
+	t.Helper()
+	_, ok := c.pool.Strategy().(*DefaultPartitionAssignmentStrategy).leaders[topicPartition{topic: topic, partition: 0}]
+	assert.False(t, ok)
+	cands := c.demoter.Candidates(topic, 0, 1)
+	require.Len(t, cands, 1)
+	assert.NotEqual(t, int32(99), cands[0].NodeID)
+	assert.Contains(t, c.pool.Agents(), cands[0].NodeID)
+}
+
+func assertLeaderRestored(t *testing.T, c *WarpstreamClient, topic string, leader int32) {
+	t.Helper()
+	got, ok := c.pool.Strategy().(*DefaultPartitionAssignmentStrategy).leaders[topicPartition{topic: topic, partition: 0}]
+	require.True(t, ok)
+	assert.Equal(t, leader, got)
+	cands := c.demoter.Candidates(topic, 0, 1)
+	require.Len(t, cands, 1)
+	assert.Equal(t, leader, cands[0].NodeID)
+}
+
+func cloneMetadataResponse(src *kmsg.MetadataResponse, version int16) *kmsg.MetadataResponse {
+	out := *src
+	out.Version = version
+	out.Brokers = slices.Clone(src.Brokers)
+	out.Topics = slices.Clone(src.Topics)
+	for i := range out.Topics {
+		out.Topics[i].Partitions = slices.Clone(src.Topics[i].Partitions)
+	}
+	return &out
+}
+
+func metadataWithMissingLeaders(src *kmsg.MetadataResponse, missingLeader int32, version int16) *kmsg.MetadataResponse {
+	out := cloneMetadataResponse(src, version)
+	for i := range out.Topics {
+		for j := range out.Topics[i].Partitions {
+			out.Topics[i].Partitions[j].Leader = missingLeader
+		}
+	}
+	return out
 }
 
 // lockedBuffer is a concurrency-safe sink for logger output, which franz-go
