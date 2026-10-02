@@ -445,6 +445,10 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 			startedAt := time.Now()
 			c.refreshPool(metadataRefreshTriggerOnDemand)
 			c.waitRefreshCooldown(backoff.current(), time.Since(startedAt))
+			// Return before select can take the nudge the fetch just queued.
+			if c.refreshCtx.Err() != nil {
+				return
+			}
 			backoff.advance()
 		}
 	}()

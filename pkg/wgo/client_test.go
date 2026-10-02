@@ -1867,6 +1867,43 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 			assert.Zero(t, time.Since(startedAt))
 		})
 	})
+
+	t.Run("close during a leader-drop cooldown does not fetch again", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, clusterAddr := testkafka.CreateCluster(t, 1, topic,
+				testkafka.WithVirtualNetwork(vnet), testkafka.WithNumBrokers(3))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+			require.NoError(t, err)
+			template := raw.(*kmsg.MetadataResponse)
+
+			var poison atomic.Bool
+			cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				if !poison.Load() {
+					return nil, nil, false
+				}
+				return metadataWithMissingLeaders(template, 99, req.GetVersion()), nil, true
+			})
+
+			poison.Store(true)
+			time.Sleep(time.Nanosecond)
+			c.triggerRefresh()
+			synctest.Wait()
+			assertOnDemandRefresh(t, c, 1, 0)
+
+			// noteLeaderDrops already queued the next nudge. Close must not run it.
+			startedAt := time.Now()
+			c.Close()
+			assert.Zero(t, time.Since(startedAt))
+			assertOnDemandRefresh(t, c, 1, 0)
+		})
+	})
 }
 
 func assertOnDemandRefresh(t *testing.T, c *WarpstreamClient, onDemand, periodic float64) {
