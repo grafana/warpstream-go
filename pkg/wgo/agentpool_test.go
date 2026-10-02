@@ -30,9 +30,10 @@ func TestAgentPool_Refresh(t *testing.T) {
 
 		pool := NewAgentPool(client)
 
-		removed, err := pool.Refresh(t.Context())
+		removed, dropped, err := pool.refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
+		assert.Zero(t, dropped.Count)
 		assert.NotNil(t, pool.Strategy())
 
 		id, ok := pool.TopicID(topicName)
@@ -154,10 +155,13 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 	idB := [16]byte{0x43}
 
 	tests := map[string]struct {
-		respTopics   []kmsg.MetadataResponseTopic
-		prevTopicIDs map[string][16]byte
-		wantLeaders  map[topicPartition]int32
-		wantTopicIDs map[string][16]byte
+		respTopics       []kmsg.MetadataResponseTopic
+		prevTopicIDs     map[string][16]byte
+		wantLeaders      map[topicPartition]int32
+		wantTopicIDs     map[string][16]byte
+		wantNoLiveLeader map[string]struct{}
+		wantNoLeader     map[topicPartition]struct{}
+		wantDropped      leaderDrops
 	}{
 		"happy path: single topic, all leaders known": {
 			respTopics: []kmsg.MetadataResponseTopic{{
@@ -200,6 +204,7 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 				{topic: "a", partition: 2}: 3,
 			},
 			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantDropped:  leaderDrops{Count: 1, Topic: "a", Partition: 1, NodeID: 99},
 		},
 		"topic absent from response is evicted (deletion is authoritative)": {
 			respTopics:   []kmsg.MetadataResponseTopic{},
@@ -224,15 +229,105 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 				TopicID:    idA,
 				Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}},
 			}},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 1, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"every partition leader unknown: first excluded leader is the sample": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{
+					{Partition: 0, Leader: 99},
+					{Partition: 1, Leader: 98},
+				},
+			}},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 2, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"one topic fully excluded, another kept": {
+			respTopics: []kmsg.MetadataResponseTopic{
+				{Topic: stringPtr("a"), TopicID: idA, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}}},
+				{Topic: stringPtr("b"), TopicID: idB, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 1}}},
+			},
+			wantLeaders:      map[topicPartition]int32{{topic: "b", partition: 0}: 1},
+			wantTopicIDs:     map[string][16]byte{"a": idA, "b": idB},
+			wantNoLiveLeader: map[string]struct{}{"a": {}},
+			wantDropped:      leaderDrops{Count: 1, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"two topics both lose every leader: count sums and the sample stays on the first": {
+			respTopics: []kmsg.MetadataResponseTopic{
+				{Topic: stringPtr("a"), TopicID: idA, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 99}}},
+				{Topic: stringPtr("b"), TopicID: idB, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 3, Leader: 98}}},
+			},
+			wantLeaders:      map[topicPartition]int32{},
+			wantTopicIDs:     map[string][16]byte{"a": idA, "b": idB},
+			wantNoLiveLeader: map[string]struct{}{"a": {}, "b": {}},
+			wantDropped:      leaderDrops{Count: 2, Topic: "a", Partition: 0, NodeID: 99},
+		},
+		"partition leader below zero is not a drop and not a fallback topic": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{{
+					Partition: 0,
+					Leader:    -1,
+					ErrorCode: 5, // LEADER_NOT_AVAILABLE
+				}},
+			}},
+			wantLeaders:  map[topicPartition]int32{},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantNoLeader: map[topicPartition]struct{}{{topic: "a", partition: 0}: {}},
+		},
+		"leader below zero does not count when a sibling names a missing node": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{
+					{Partition: 0, Leader: -1, ErrorCode: 5},
+					{Partition: 1, Leader: 1},
+					{Partition: 2, Leader: 99},
+				},
+			}},
+			wantLeaders:  map[topicPartition]int32{{topic: "a", partition: 1}: 1},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantNoLeader: map[topicPartition]struct{}{{topic: "a", partition: 0}: {}},
+			wantDropped:  leaderDrops{Count: 1, Topic: "a", Partition: 2, NodeID: 99},
+		},
+		"partition error that still names a live leader is kept": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{{
+					Partition: 0,
+					Leader:    1,
+					ErrorCode: 9, // REPLICA_NOT_AVAILABLE
+				}},
+			}},
+			wantLeaders:  map[topicPartition]int32{{topic: "a", partition: 0}: 1},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+		},
+		"empty partition list with a zero error code stays out of the no-live-leader set": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:      stringPtr("a"),
+				TopicID:    idA,
+				Partitions: nil,
+			}},
 			wantLeaders:  map[topicPartition]int32{},
 			wantTopicIDs: map[string][16]byte{"a": idA},
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			leaders, topicIDs := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
+			leaders, topicIDs, noLiveLeader, noLeader, dropped := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
 			assert.Equal(t, tc.wantLeaders, leaders)
 			assert.Equal(t, tc.wantTopicIDs, topicIDs)
+			assert.Equal(t, tc.wantNoLiveLeader, noLiveLeader)
+			assert.Equal(t, tc.wantNoLeader, noLeader)
+			assert.Equal(t, tc.wantDropped, dropped)
 		})
 	}
 }

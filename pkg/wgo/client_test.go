@@ -352,7 +352,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				topicIDs: map[string][16]byte{topic: topicID},
 				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
 					{topic: topic, partition: 0}: leader,
-				}),
+				}, nil, nil),
 			})
 
 			// Partition 0 (healthy sibling) and partition 1 (dropped leader)
@@ -387,6 +387,74 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				got[r.Partition] = string(r.Value)
 			}
 			assert.Equal(t, map[int32]string{0: "a", 1: "b"}, got)
+		})
+	})
+
+	t.Run("topic whose every leader was dropped falls back; a sibling topic still routes", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const other = "other-topic"
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
+
+			createReq := kmsg.NewPtrCreateTopicsRequest()
+			createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
+				Topic:             other,
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+			}}
+			_, err := c.Request(t.Context(), createReq)
+			require.NoError(t, err)
+
+			// Past Refresh's one-nanosecond metadata cache so the new topic is visible.
+			time.Sleep(time.Nanosecond)
+			_, err = c.pool.Refresh(t.Context())
+			require.NoError(t, err)
+
+			leaderCands := c.demoter.Candidates(other, 0, 1)
+			require.Len(t, leaderCands, 1)
+			leader := leaderCands[0].NodeID
+			wipedID, ok := c.pool.TopicID(topic)
+			require.True(t, ok)
+			otherID, ok := c.pool.TopicID(other)
+			require.True(t, ok)
+
+			// topic lost every leader, so it must hash onto the one live broker.
+			// other keeps its leader. A nil candidate for topic would fail both records.
+			c.pool.state.Store(&poolState{
+				agents:   []int32{leader},
+				topicIDs: map[string][16]byte{topic: wipedID, other: otherID},
+				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
+					{topic: other, partition: 0}: leader,
+				}, map[string]struct{}{topic: {}}, nil),
+			})
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("wiped"), Timestamp: time.Now()},
+				{Topic: other, Partition: 0, Value: []byte("kept"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			require.NoError(t, results[0].Err)
+			require.NoError(t, results[1].Err)
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+
+			consumer, err := kgo.NewClient(
+				kgo.SeedBrokers(clusterAddr),
+				kgo.Dialer(vnet.DialContext),
+				kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+					topic: {0: kgo.NewOffset().AtStart()},
+					other: {0: kgo.NewOffset().AtStart()},
+				}),
+			)
+			require.NoError(t, err)
+			t.Cleanup(consumer.Close)
+
+			fetches := consumer.PollFetches(t.Context())
+			require.NoError(t, fetches.Err())
+			require.Len(t, fetches.Records(), 2)
+			got := map[string]string{}
+			for _, r := range fetches.Records() {
+				got[r.Topic] = string(r.Value)
+			}
+			assert.Equal(t, map[string]string{topic: "wiped", other: "kept"}, got)
 		})
 	})
 
@@ -1524,6 +1592,40 @@ func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 			string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
 		require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_cluster_stats_available"), 0)
 	})
+}
+
+func TestWarpstreamClient_NoteLeaderDrops(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	c := &WarpstreamClient{
+		logger:       nopLogger{},
+		metrics:      newMetrics(reg),
+		refreshNowCh: make(chan struct{}, 1),
+	}
+
+	c.noteLeaderDrops(leaderDrops{}, true)
+	assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	select {
+	case <-c.refreshNowCh:
+		t.Fatal("clean refresh nudged")
+	default:
+	}
+
+	c.noteLeaderDrops(leaderDrops{Count: 2, Topic: "ingest", Partition: 35, NodeID: 99}, true)
+	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	select {
+	case <-c.refreshNowCh:
+	default:
+		t.Fatal("refresh that excluded leaders did not nudge")
+	}
+
+	// Constructor path counts the drop and does not fill the nudge channel.
+	c.noteLeaderDrops(leaderDrops{Count: 1, Topic: "ingest", Partition: 0, NodeID: 7}, false)
+	assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	select {
+	case <-c.refreshNowCh:
+		t.Fatal("constructor refresh nudged")
+	default:
+	}
 }
 
 func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {

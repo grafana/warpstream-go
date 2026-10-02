@@ -108,23 +108,27 @@ type DefaultPartitionAssignmentStrategy struct {
 	agents  []int32 // sorted ascending, snapshot at construction
 	leaders map[topicPartition]int32
 
-	// knownTopics is every topic with at least one entry in leaders.
+	// knownTopics is every topic with at least one entry in leaders, plus every
+	// topic whose partitions this refresh listed and then excluded entirely.
 	// Candidates uses it to tell "this topic is known, one partition's
 	// leader is just missing" (safe to fall back to another agent) apart
 	// from "this topic is unknown to Metadata" (falling back would hide a
 	// topic that still needs an on-demand refresh).
 	//
-	// Edge case: if every partition of a small topic loses its leader in
-	// the same refresh, that topic looks unknown here too for that one
-	// refresh, and briefly loses the fallback. Rare, and not seen in the
-	// incidents this fix is based on, so left as-is for now.
+	// A topic Metadata has never returned, and a topic-level error, stay out.
+	// A partition whose Leader was below 0 stays out of the fallback too,
+	// even when this topic is known through some other partition.
 	knownTopics map[string]struct{}
+	noLeader    map[topicPartition]struct{}
 }
 
-func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPartition]int32) *DefaultPartitionAssignmentStrategy {
+func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPartition]int32, topicsWithNoLiveLeader map[string]struct{}, noLeader map[topicPartition]struct{}) *DefaultPartitionAssignmentStrategy {
 	// Built from empty, not sized off leaders: there are far fewer
 	// distinct topics than partitions.
 	knownTopics := make(map[string]struct{})
+	for topic := range topicsWithNoLiveLeader {
+		knownTopics[topic] = struct{}{}
+	}
 	for tp := range leaders {
 		knownTopics[tp.topic] = struct{}{}
 	}
@@ -132,6 +136,7 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 		agents:      agents,
 		leaders:     leaders,
 		knownTopics: knownTopics,
+		noLeader:    noLeader,
 	}
 }
 
@@ -144,8 +149,10 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 // this falls back to a deterministic pick from the live agent set instead
 // of returning no candidates. Any live agent can serve any partition, so
 // this is a safe guess while the real leader is still unclear. A topic
-// Metadata has never returned is left alone, so it still gets an
-// on-demand refresh.
+// whose partitions this refresh listed and then excluded entirely counts
+// as known. A topic Metadata has never returned is left alone, so it still
+// gets an on-demand refresh. A partition whose Leader was below 0 returns
+// nil: WarpStream named no agent, so this does not pick one.
 //
 // Caveat: two clients that refreshed at different times can pick
 // different fallback agents for the same partition — a real leader
@@ -157,8 +164,12 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 	}
 
 	var h uint64
-	leader, ok := s.leaders[topicPartition{topic: topic, partition: partition}]
+	tp := topicPartition{topic: topic, partition: partition}
+	leader, ok := s.leaders[tp]
 	if !ok {
+		if _, unnamed := s.noLeader[tp]; unnamed {
+			return nil
+		}
 		if len(s.agents) == 0 {
 			return nil
 		}

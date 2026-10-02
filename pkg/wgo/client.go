@@ -121,7 +121,8 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 
 	m := newMetrics(reg)
 	pool := NewAgentPool(kgoClient)
-	if _, err := pool.Refresh(context.Background()); err != nil {
+	_, dropped, err := pool.refresh(context.Background())
+	if err != nil {
 		kgoClient.Close()
 		return nil, fmt.Errorf("initial agent pool refresh: %w", err)
 	}
@@ -150,6 +151,9 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		refreshCancel:  refreshCancel,
 		refreshNowCh:   make(chan struct{}, 1),
 	}
+	// Count a dropped leader and do not nudge: the refresh goroutine starts below.
+	// The periodic tick fetches the next snapshot.
+	c.noteLeaderDrops(dropped, false)
 	// Demoter sits on top of the lazy pool strategy so refresh-driven
 	// agent-pool changes flow through transparently while the Demoter's
 	// per-agent probe-timing state persists across refreshes.
@@ -416,7 +420,7 @@ func (c *WarpstreamClient) triggerRefresh() {
 // and leave the previous snapshot in place.
 func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	before := c.pool.Agents()
-	removed, err := c.pool.Refresh(c.refreshCtx)
+	removed, dropped, err := c.pool.refresh(c.refreshCtx)
 	c.metrics.observeMetadataRefresh(trigger, before, c.pool.Agents(), err)
 	if err != nil {
 		log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
@@ -426,6 +430,26 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 		c.tracker.PurgeAgents(removed)
 	}
 	c.demoter.Refresh(c.pool.Agents())
+	// Nudge so a stand-in does not wait for the next periodic tick. Produce does
+	// not block. After a periodic tick the follow-up starts at once; later
+	// repeats wait out OnDemandMetadataRefreshInterval (default 1s).
+	c.noteLeaderDrops(dropped, true)
+}
+
+// noteLeaderDrops counts and logs excluded leaders. nudge asks for another fetch.
+func (c *WarpstreamClient) noteLeaderDrops(dropped leaderDrops, nudge bool) {
+	if dropped.Count == 0 {
+		return
+	}
+	c.metrics.agentPoolLeaderDroppedTotal.Add(float64(dropped.Count))
+	log(c.logger, kgo.LogLevelWarn, "warpstream agentpool: leaders excluded from map",
+		"count", dropped.Count,
+		"first_topic", dropped.Topic,
+		"first_partition", dropped.Partition,
+		"first_node_id", dropped.NodeID)
+	if nudge {
+		c.triggerRefresh()
+	}
 }
 
 // waitRefreshCooldown enforces the configured minimum between on-demand
