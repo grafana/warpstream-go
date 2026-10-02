@@ -352,7 +352,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				topicIDs: map[string][16]byte{topic: topicID},
 				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
 					{topic: topic, partition: 0}: leader,
-				}, nil),
+				}, nil, nil),
 			})
 
 			// Partition 0 (healthy sibling) and partition 1 (dropped leader)
@@ -424,7 +424,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				topicIDs: map[string][16]byte{topic: wipedID, other: otherID},
 				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
 					{topic: other, partition: 0}: leader,
-				}, map[string]struct{}{topic: {}}),
+				}, map[string]struct{}{topic: {}}, nil),
 			})
 
 			results := c.ProduceSync(t.Context(), []*kgo.Record{

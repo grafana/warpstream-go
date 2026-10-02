@@ -239,7 +239,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}, []string{"reason"}),
 		agentPoolLeaderDroppedTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_agentpool_leader_dropped_total",
-			Help: "Partition leaders excluded from the assignment map because their NodeID was absent from that Metadata response's broker list. One increment per excluded leader, including the constructor refresh. Topic-level Metadata errors are not counted.",
+			Help: "Partition leaders excluded from the assignment map because their NodeID was absent from that Metadata response's broker list. One increment per excluded leader, including the constructor refresh. Topic-level Metadata errors are not counted. A partition Leader below 0 is not counted.",
 		}),
 		metadataRefreshResultsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_metadata_refresh_results_total",

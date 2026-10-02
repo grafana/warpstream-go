@@ -116,10 +116,13 @@ type DefaultPartitionAssignmentStrategy struct {
 	// topic that still needs an on-demand refresh).
 	//
 	// A topic Metadata has never returned, and a topic-level error, stay out.
+	// A partition whose Leader was below 0 stays out of the fallback too,
+	// even when this topic is known through some other partition.
 	knownTopics map[string]struct{}
+	noLeader    map[topicPartition]struct{}
 }
 
-func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPartition]int32, topicsWithNoLiveLeader map[string]struct{}) *DefaultPartitionAssignmentStrategy {
+func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPartition]int32, topicsWithNoLiveLeader map[string]struct{}, noLeader map[topicPartition]struct{}) *DefaultPartitionAssignmentStrategy {
 	// Built from empty, not sized off leaders: there are far fewer
 	// distinct topics than partitions.
 	knownTopics := make(map[string]struct{})
@@ -133,6 +136,7 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 		agents:      agents,
 		leaders:     leaders,
 		knownTopics: knownTopics,
+		noLeader:    noLeader,
 	}
 }
 
@@ -147,7 +151,8 @@ func newDefaultPartitionAssignmentStrategy(agents []int32, leaders map[topicPart
 // this is a safe guess while the real leader is still unclear. A topic
 // whose partitions this refresh listed and then excluded entirely counts
 // as known. A topic Metadata has never returned is left alone, so it still
-// gets an on-demand refresh.
+// gets an on-demand refresh. A partition whose Leader was below 0 returns
+// nil: WarpStream named no agent, so this does not pick one.
 //
 // Caveat: two clients that refreshed at different times can pick
 // different fallback agents for the same partition — a real leader
@@ -159,8 +164,12 @@ func (s *DefaultPartitionAssignmentStrategy) Candidates(topic string, partition 
 	}
 
 	var h uint64
-	leader, ok := s.leaders[topicPartition{topic: topic, partition: partition}]
+	tp := topicPartition{topic: topic, partition: partition}
+	leader, ok := s.leaders[tp]
 	if !ok {
+		if _, unnamed := s.noLeader[tp]; unnamed {
+			return nil
+		}
 		if len(s.agents) == 0 {
 			return nil
 		}

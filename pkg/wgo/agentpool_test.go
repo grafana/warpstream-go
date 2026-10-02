@@ -160,6 +160,7 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 		wantLeaders      map[topicPartition]int32
 		wantTopicIDs     map[string][16]byte
 		wantNoLiveLeader map[string]struct{}
+		wantNoLeader     map[topicPartition]struct{}
 		wantDropped      leaderDrops
 	}{
 		"happy path: single topic, all leaders known": {
@@ -267,6 +268,48 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 			wantNoLiveLeader: map[string]struct{}{"a": {}, "b": {}},
 			wantDropped:      leaderDrops{Count: 2, Topic: "a", Partition: 0, NodeID: 99},
 		},
+		"partition leader below zero is not a drop and not a fallback topic": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{{
+					Partition: 0,
+					Leader:    -1,
+					ErrorCode: 5, // LEADER_NOT_AVAILABLE
+				}},
+			}},
+			wantLeaders:  map[topicPartition]int32{},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantNoLeader: map[topicPartition]struct{}{{topic: "a", partition: 0}: {}},
+		},
+		"leader below zero does not count when a sibling names a missing node": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{
+					{Partition: 0, Leader: -1, ErrorCode: 5},
+					{Partition: 1, Leader: 1},
+					{Partition: 2, Leader: 99},
+				},
+			}},
+			wantLeaders:  map[topicPartition]int32{{topic: "a", partition: 1}: 1},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+			wantNoLeader: map[topicPartition]struct{}{{topic: "a", partition: 0}: {}},
+			wantDropped:  leaderDrops{Count: 1, Topic: "a", Partition: 2, NodeID: 99},
+		},
+		"partition error that still names a live leader is kept": {
+			respTopics: []kmsg.MetadataResponseTopic{{
+				Topic:   stringPtr("a"),
+				TopicID: idA,
+				Partitions: []kmsg.MetadataResponseTopicPartition{{
+					Partition: 0,
+					Leader:    1,
+					ErrorCode: 9, // REPLICA_NOT_AVAILABLE
+				}},
+			}},
+			wantLeaders:  map[topicPartition]int32{{topic: "a", partition: 0}: 1},
+			wantTopicIDs: map[string][16]byte{"a": idA},
+		},
 		"empty partition list with a zero error code stays out of the no-live-leader set": {
 			respTopics: []kmsg.MetadataResponseTopic{{
 				Topic:      stringPtr("a"),
@@ -279,10 +322,11 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			leaders, topicIDs, noLiveLeader, dropped := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
+			leaders, topicIDs, noLiveLeader, noLeader, dropped := buildLeadersAndTopicIDs(tc.respTopics, knownAgents, tc.prevTopicIDs)
 			assert.Equal(t, tc.wantLeaders, leaders)
 			assert.Equal(t, tc.wantTopicIDs, topicIDs)
 			assert.Equal(t, tc.wantNoLiveLeader, noLiveLeader)
+			assert.Equal(t, tc.wantNoLeader, noLeader)
 			assert.Equal(t, tc.wantDropped, dropped)
 		})
 	}
