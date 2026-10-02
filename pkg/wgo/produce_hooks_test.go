@@ -195,6 +195,37 @@ func TestWarpstreamClient_ProduceRecordHooks(t *testing.T) {
 		})
 	})
 
+	t.Run("ProduceSync repeated record pointer reports each position's error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			hook := &recordingHook{}
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1, WithHooks(hook))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()}
+			results := c.ProduceSync(ctx, []*kgo.Record{r, miss, r, miss})
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			require.ErrorIs(t, results[2].Err, context.Canceled)
+			require.ErrorContains(t, results[3].Err, "no agent assigned")
+
+			events := hook.snapshot()
+			require.Equal(t, []string{
+				"buffered", "buffered", "buffered", "buffered",
+				"unbuffered", "unbuffered", "unbuffered", "unbuffered",
+			}, kindsOf(events))
+			assert.Same(t, r, events[4].rec)
+			assert.Same(t, miss, events[5].rec)
+			assert.Same(t, r, events[6].rec)
+			assert.Same(t, miss, events[7].rec)
+			assert.ErrorIs(t, events[4].err, context.Canceled)
+			assert.ErrorContains(t, events[5].err, "no agent assigned")
+			assert.ErrorIs(t, events[6].err, context.Canceled)
+			assert.ErrorContains(t, events[7].err, "no agent assigned")
+		})
+	})
+
 	t.Run("ProduceSync pre-canceled mixed call keeps each record's error", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			hook := &recordingHook{}

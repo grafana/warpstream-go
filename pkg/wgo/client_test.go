@@ -635,6 +635,112 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		})
 	})
 
+	t.Run("repeated routable record pointer fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			other := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("other"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, other, r, r})
+			require.Len(t, results, 4)
+			assert.Same(t, r, results[0].Record)
+			assert.NoError(t, results[0].Err)
+			assert.Same(t, other, results[1].Record)
+			assert.NoError(t, results[1].Err)
+			assert.Same(t, r, results[2].Record)
+			assert.NoError(t, results[2].Err)
+			assert.Same(t, r, results[3].Record)
+			assert.NoError(t, results[3].Err)
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("repeated routable record pointer canceled fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(ctx, []*kgo.Record{r, r})
+			require.Len(t, results, 2)
+			for i, res := range results {
+				assert.Same(t, r, res.Record)
+				assert.ErrorIs(t, res.Err, context.Canceled, "result %d", i)
+			}
+			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+		})
+	})
+
+	t.Run("repeated routable record pointer terminal failure fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, addr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(addr, topic),
+				WithDialer(vnet.DialContext),
+				WithHedgerMaxHedgeAgents(1),
+				WithHedgerMinHedgeDelay(time.Hour),
+			)...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				preq := req.(*kmsg.ProduceRequest)
+				presp := preq.ResponseKind().(*kmsg.ProduceResponse)
+				presp.Version = preq.Version
+				for _, rt := range preq.Topics {
+					out := kmsg.ProduceResponseTopic{Topic: rt.Topic}
+					if out.Topic == "" {
+						out.Topic = topic
+					}
+					for _, rp := range rt.Partitions {
+						out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{
+							Partition: rp.Partition,
+							ErrorCode: kerr.NotLeaderForPartition.Code,
+						})
+					}
+					presp.Topics = append(presp.Topics, out)
+				}
+				return presp, nil, true
+			})
+
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("wire"), Timestamp: time.Now()}
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, r})
+			require.Len(t, results, 2)
+			for i, res := range results {
+				assert.Same(t, r, res.Record)
+				assert.ErrorIs(t, res.Err, kgo.ErrRecordTimeout, "result %d", i)
+			}
+			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("repeated routable record pointer stays separate from a routing miss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("ok"), Timestamp: time.Now()}
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, miss, r, miss, miss})
+			require.Len(t, results, 5)
+			assert.Same(t, r, results[0].Record)
+			assert.NoError(t, results[0].Err)
+			assert.Same(t, miss, results[1].Record)
+			assert.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Same(t, r, results[2].Record)
+			assert.NoError(t, results[2].Err)
+			assert.Same(t, miss, results[3].Record)
+			assert.ErrorContains(t, results[3].Err, "no agent assigned")
+			assert.Same(t, miss, results[4].Record)
+			assert.ErrorContains(t, results[4].Err, "no agent assigned")
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
+
 	t.Run("repeated unroutable record pointer fails every input position", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)

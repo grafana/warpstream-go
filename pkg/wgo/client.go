@@ -282,9 +282,28 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	}
 
 	wg.Add(len(okRecords))
+	// Last input index for each pointer. Completions write that slot only.
 	indexOf := make(map[*kgo.Record]int, len(okRecords))
 	for _, idx := range okIndices {
 		indexOf[records[idx]] = idx
+	}
+	// A repeated pointer shares that slot's outcome. Copy it to the other
+	// positions on return, before the unbuffered hooks above.
+	if len(indexOf) < len(okRecords) {
+		defer func() {
+			for _, idx := range okIndices {
+				canon := indexOf[records[idx]]
+				if idx != canon {
+					results[idx] = results[canon]
+				}
+			}
+		}()
+	}
+	write := func(recs []*kgo.Record, err error) {
+		for _, r := range recs {
+			results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
+			wg.Done()
+		}
 	}
 
 	routed, rejected := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
@@ -294,30 +313,14 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 				// partition group; pre-dispatch rejections never reach here.
 				c.metrics.produceRecordsFailedTotal.Add(float64(len(groupRecords)))
 			}
-			for _, r := range groupRecords {
-				results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
-				wg.Done()
-			}
+			write(groupRecords, err)
 		})
 	})
 
 	if len(rejected) > 0 {
-		// indexOf stores one index per pointer. Write every input position.
-		rejectedErr := make(map[*kgo.Record]error, len(rejected))
 		for _, rg := range rejected {
 			c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(rg.records)))
-			for _, r := range rg.records {
-				rejectedErr[r] = rg.err
-			}
-		}
-		for _, idx := range okIndices {
-			r := records[idx]
-			err, ok := rejectedErr[r]
-			if !ok {
-				continue
-			}
-			results[idx] = kgo.ProduceResult{Record: r, Err: err}
-			wg.Done()
+			write(rg.records, rg.err)
 		}
 	}
 	if len(routed) == 0 {
