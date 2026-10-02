@@ -68,9 +68,16 @@ func NewAgentPool(client *kgo.Client) *AgentPool {
 
 // Refresh atomically replaces the snapshot. Returns the NodeIDs that have left
 // the cluster since the last Refresh — callers must purge per-agent state
-// (stats, etc.) for those IDs. dropped counts leaders excluded from the broker
+// (stats, etc.) for those IDs. Not safe for concurrent calls.
+func (p *AgentPool) Refresh(ctx context.Context) ([]int32, error) {
+	removed, _, err := p.refresh(ctx)
+	return removed, err
+}
+
+// refresh atomically replaces the snapshot. removed is the NodeIDs that have
+// left since the last refresh. dropped counts leaders excluded from the broker
 // set and names one when the count is above zero. Not safe for concurrent calls.
-func (p *AgentPool) Refresh(ctx context.Context) (removed []int32, dropped leaderDrops, err error) {
+func (p *AgentPool) refresh(ctx context.Context) (removed []int32, dropped leaderDrops, err error) {
 	// Topics=nil requests metadata for every topic in the cluster.
 	// A tiny positive cache age keeps production refreshes fresh while using
 	// kgo's bounded internal Metadata retry policy.

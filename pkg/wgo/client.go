@@ -121,7 +121,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 
 	m := newMetrics(reg)
 	pool := NewAgentPool(kgoClient)
-	_, dropped, err := pool.Refresh(context.Background())
+	_, dropped, err := pool.refresh(context.Background())
 	if err != nil {
 		kgoClient.Close()
 		return nil, fmt.Errorf("initial agent pool refresh: %w", err)
@@ -420,7 +420,7 @@ func (c *WarpstreamClient) triggerRefresh() {
 // and leave the previous snapshot in place.
 func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	before := c.pool.Agents()
-	removed, dropped, err := c.pool.Refresh(c.refreshCtx)
+	removed, dropped, err := c.pool.refresh(c.refreshCtx)
 	c.metrics.observeMetadataRefresh(trigger, before, c.pool.Agents(), err)
 	if err != nil {
 		log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)

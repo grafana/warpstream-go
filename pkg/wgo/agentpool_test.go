@@ -30,7 +30,7 @@ func TestAgentPool_Refresh(t *testing.T) {
 
 		pool := NewAgentPool(client)
 
-		removed, dropped, err := pool.Refresh(t.Context())
+		removed, dropped, err := pool.refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
 		assert.Zero(t, dropped.Count)
@@ -47,12 +47,12 @@ func TestAgentPool_Refresh(t *testing.T) {
 			assert.GreaterOrEqual(t, cands[0].NodeID, int32(0))
 		}
 
-		removed, _, err = pool.Refresh(t.Context())
+		removed, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		assert.Empty(t, removed)
 
 		s1 := pool.Strategy()
-		_, _, err = pool.Refresh(t.Context())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		s2 := pool.Strategy()
 		assert.NotSame(t, s1, s2)
@@ -107,7 +107,7 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 		pool := NewAgentPool(client)
 
 		// Refresh discovers all topics in the cluster.
-		_, _, err = pool.Refresh(t.Context())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 
 		idA, okA := pool.TopicID(topicA)
@@ -140,7 +140,7 @@ func TestAgentPool_RefreshMultiTopic(t *testing.T) {
 
 		// Advance the fake clock past Refresh's one-nanosecond cache-age limit.
 		time.Sleep(time.Nanosecond)
-		_, _, err = pool.Refresh(t.Context())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 		_, okB = pool.TopicID(topicB)
 		assert.False(t, okB)
@@ -385,7 +385,7 @@ func TestAgentPool_StrategyConcurrent(t *testing.T) {
 		t.Cleanup(client.Close)
 
 		pool := NewAgentPool(client)
-		_, _, err = pool.Refresh(t.Context())
+		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
 
 		// Spin up concurrent readers and let them overlap. The value of this test

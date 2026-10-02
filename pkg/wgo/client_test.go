@@ -406,7 +406,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 
 			// Past Refresh's one-nanosecond metadata cache so the new topic is visible.
 			time.Sleep(time.Nanosecond)
-			_, _, err = c.pool.Refresh(t.Context())
+			_, err = c.pool.Refresh(t.Context())
 			require.NoError(t, err)
 
 			leaderCands := c.demoter.Candidates(other, 0, 1)

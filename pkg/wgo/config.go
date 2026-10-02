@@ -72,8 +72,9 @@ type Config struct {
 	MetadataRefreshInterval time.Duration
 
 	// OnDemandMetadataRefreshInterval is the minimum time between the start of
-	// Metadata refreshes triggered by routing misses. Must be > 0 and no
-	// greater than MetadataRefreshInterval.
+	// on-demand Metadata refreshes: a routing miss, and a follow-up after a
+	// refresh that excluded a leader. Must be > 0 and no greater than
+	// MetadataRefreshInterval.
 	OnDemandMetadataRefreshInterval time.Duration
 }
 
@@ -336,8 +337,9 @@ func WithMetadataRefreshInterval(d time.Duration) Opt {
 }
 
 // WithOnDemandMetadataRefreshInterval sets the minimum time between the start
-// of Metadata refreshes triggered by routing misses. It must be no greater
-// than the background MetadataRefreshInterval.
+// of on-demand Metadata refreshes: a routing miss, and a follow-up after a
+// refresh that excluded a leader. It must be no greater than the background
+// MetadataRefreshInterval.
 func WithOnDemandMetadataRefreshInterval(d time.Duration) Opt {
 	return opt{func(c *Config) { c.OnDemandMetadataRefreshInterval = d }}
 }
