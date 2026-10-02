@@ -1904,6 +1904,40 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 			assertOnDemandRefresh(t, c, 1, 0)
 		})
 	})
+
+	t.Run("close during a periodic fetch does not run a queued nudge", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+			release := make(chan struct{})
+			var blockNext atomic.Bool
+			blockNext.Store(true)
+			cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				// AgentPool.Refresh asks for every topic. kgo's own loop asks
+				// for brokers only, and blocking that request stalls the cluster.
+				if req.(*kmsg.MetadataRequest).Topics == nil && blockNext.CompareAndSwap(true, false) {
+					cluster.SleepControl(func() { <-release })
+				}
+				return nil, nil, false
+			})
+
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+			// Queue a nudge while a Metadata request may be in flight. The count
+			// below is taken after that nudge has either run or is still waiting
+			// behind the blocked request.
+			c.triggerRefresh()
+			synctest.Wait()
+			before := onDemandRefreshes(c)
+
+			go c.Close()
+			synctest.Wait()
+			close(release)
+			synctest.Wait()
+
+			assert.Equal(t, before, onDemandRefreshes(c))
+		})
+	})
 }
 
 func assertOnDemandRefresh(t *testing.T, c *WarpstreamClient, onDemand, periodic float64) {
@@ -1912,6 +1946,12 @@ func assertOnDemandRefresh(t *testing.T, c *WarpstreamClient, onDemand, periodic
 		string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)))
 	assert.Equal(t, periodic, testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
 		string(metadataRefreshTriggerPeriodic), metadataRefreshResultUnchanged)))
+}
+
+func onDemandRefreshes(c *WarpstreamClient) float64 {
+	return testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+		string(metadataRefreshTriggerOnDemand), metadataRefreshResultUnchanged)) +
+		failedOnDemandRefreshes(c)
 }
 
 func failedOnDemandRefreshes(c *WarpstreamClient) float64 {

@@ -377,12 +377,6 @@ func (c *WarpstreamClient) Close() {
 	})
 }
 
-// startBackgroundRefresh owns every post-startup AgentPool.Refresh: the
-// periodic ticker and on-demand nudges from triggerRefresh. One owner means
-// Refresh is never concurrent. refreshCtx (cancelled by Close) stops the loop,
-// interrupts an in-flight Refresh, and aborts the cooldown. We rely on kgo's
-// per-attempt RequestTimeoutOverhead and overall retry policy rather than
-// adding a separate per-refresh deadline.
 // refreshBackoff paces on-demand Metadata fetches. The delay starts at floor,
 // grows after each on-demand fetch up to ceiling, and returns to floor when a
 // periodic fetch runs.
@@ -412,6 +406,12 @@ func (b *refreshBackoff) reset() {
 	b.delay = b.floor
 }
 
+// startBackgroundRefresh owns every post-startup AgentPool.Refresh: the
+// periodic ticker and on-demand nudges from triggerRefresh. One owner means
+// Refresh is never concurrent. refreshCtx (cancelled by Close) stops the loop,
+// interrupts an in-flight Refresh, and aborts the cooldown. We rely on kgo's
+// per-attempt RequestTimeoutOverhead and overall retry policy rather than
+// adding a separate per-refresh deadline.
 func (c *WarpstreamClient) startBackgroundRefresh() {
 	c.refreshWG.Add(1)
 	go func() {
@@ -438,6 +438,10 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 
 			if periodic {
 				c.refreshPool(metadataRefreshTriggerPeriodic)
+				// A nudge queued during this fetch must not start another after Close.
+				if c.refreshCtx.Err() != nil {
+					return
+				}
 				backoff.reset()
 				continue
 			}
