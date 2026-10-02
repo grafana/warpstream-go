@@ -310,27 +310,50 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		})
 	})
 
-	t.Run("multi-record batch with an unroutable partition counts every ok record rejected", func(t *testing.T) {
+	t.Run("unroutable partition rejects only its own records", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 2)
 
-			// One record targets an unknown topic: routeRecords fails the whole
-			// batch uniformly, so every ok record is counted under no_agent_assigned.
+			oversize := make([]byte, 2<<20)
 			records := []*kgo.Record{
 				{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
 				{Topic: "does-not-exist", Partition: 0, Value: []byte("b"), Timestamp: time.Now()},
-				{Topic: topic, Partition: 0, Value: []byte("c"), Timestamp: time.Now()},
+				{Topic: topic, Partition: 1, Value: oversize, Timestamp: time.Now()},
+				{Topic: topic, Partition: 1, Value: []byte("c"), Timestamp: time.Now()},
 			}
 			results := c.ProduceSync(t.Context(), records)
-			require.Len(t, results, 3)
-			for i := range results {
-				assert.ErrorContains(t, results[i].Err, "no agent assigned")
+			require.Len(t, results, 4)
+			assert.NoError(t, results[0].Err)
+			assert.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.ErrorIs(t, results[2].Err, kerr.MessageTooLarge)
+			assert.NoError(t, results[3].Err)
+			for i, r := range results {
+				assert.Same(t, records[i], r.Record)
 			}
 
-			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsTotal))
-			// All records are rejections, not failures.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+
+			consumer, err := kgo.NewClient(
+				kgo.SeedBrokers(clusterAddr),
+				kgo.Dialer(vnet.DialContext),
+				kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+					topic: {0: kgo.NewOffset().AtStart(), 1: kgo.NewOffset().AtStart()},
+				}),
+			)
+			require.NoError(t, err)
+			t.Cleanup(consumer.Close)
+
+			fetches := consumer.PollFetches(t.Context())
+			require.NoError(t, fetches.Err())
+			require.Len(t, fetches.Records(), 2)
+			got := map[int32]string{}
+			for _, r := range fetches.Records() {
+				got[r.Partition] = string(r.Value)
+			}
+			assert.Equal(t, map[int32]string{0: "a", 1: "c"}, got)
 		})
 	})
 
@@ -588,6 +611,379 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			}
 		})
 	})
+
+	t.Run("all unroutable records return without producing", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			records := make([]*kgo.Record, 5)
+			for i := range records {
+				records[i] = &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte{byte('a' + i)}}
+			}
+
+			started := time.Now()
+			results := c.ProduceSync(t.Context(), records)
+			assert.Zero(t, time.Since(started))
+			require.Len(t, results, len(records))
+			for i, res := range results {
+				assert.ErrorContains(t, res.Err, "no agent assigned")
+				assert.Same(t, records[i], res.Record)
+				assert.True(t, records[i].Timestamp.IsZero())
+			}
+			assert.Equal(t, float64(len(records)), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+		})
+	})
+
+	t.Run("repeated routable record pointer fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			other := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("other"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, other, r, r})
+			require.Len(t, results, 4)
+			assert.Same(t, r, results[0].Record)
+			assert.NoError(t, results[0].Err)
+			assert.Same(t, other, results[1].Record)
+			assert.NoError(t, results[1].Err)
+			assert.Same(t, r, results[2].Record)
+			assert.NoError(t, results[2].Err)
+			assert.Same(t, r, results[3].Record)
+			assert.NoError(t, results[3].Err)
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("repeated routable record pointer canceled fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(ctx, []*kgo.Record{r, r})
+			require.Len(t, results, 2)
+			for i, res := range results {
+				assert.Same(t, r, res.Record)
+				assert.ErrorIs(t, res.Err, context.Canceled, "result %d", i)
+			}
+			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+		})
+	})
+
+	t.Run("repeated routable record pointer terminal failure fills every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, addr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(addr, topic),
+				WithDialer(vnet.DialContext),
+				WithHedgerMaxHedgeAgents(1),
+				WithHedgerMinHedgeDelay(time.Hour),
+			)...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				preq := req.(*kmsg.ProduceRequest)
+				presp := preq.ResponseKind().(*kmsg.ProduceResponse)
+				presp.Version = preq.Version
+				for _, rt := range preq.Topics {
+					out := kmsg.ProduceResponseTopic{Topic: rt.Topic}
+					if out.Topic == "" {
+						out.Topic = topic
+					}
+					for _, rp := range rt.Partitions {
+						out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{
+							Partition: rp.Partition,
+							ErrorCode: kerr.NotLeaderForPartition.Code,
+						})
+					}
+					presp.Topics = append(presp.Topics, out)
+				}
+				return presp, nil, true
+			})
+
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("wire"), Timestamp: time.Now()}
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, r})
+			require.Len(t, results, 2)
+			for i, res := range results {
+				assert.Same(t, r, res.Record)
+				assert.ErrorIs(t, res.Err, kgo.ErrRecordTimeout, "result %d", i)
+			}
+			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("repeated routable record pointer stays separate from a routing miss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("ok"), Timestamp: time.Now()}
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()}
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r, miss, r, miss, miss})
+			require.Len(t, results, 5)
+			assert.Same(t, r, results[0].Record)
+			assert.NoError(t, results[0].Err)
+			assert.Same(t, miss, results[1].Record)
+			assert.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Same(t, r, results[2].Record)
+			assert.NoError(t, results[2].Err)
+			assert.Same(t, miss, results[3].Record)
+			assert.ErrorContains(t, results[3].Err, "no agent assigned")
+			assert.Same(t, miss, results[4].Record)
+			assert.ErrorContains(t, results[4].Err, "no agent assigned")
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
+
+	t.Run("repeated unroutable record pointer fails every input position", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			r := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			okRec := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("ok"), Timestamp: time.Now()}
+
+			repeated := c.ProduceSync(t.Context(), []*kgo.Record{r, r})
+			require.Len(t, repeated, 2)
+			for i, res := range repeated {
+				assert.Same(t, r, res.Record)
+				assert.ErrorContains(t, res.Err, "no agent assigned", "result %d", i)
+			}
+
+			mixed := c.ProduceSync(t.Context(), []*kgo.Record{r, okRec, r})
+			require.Len(t, mixed, 3)
+			assert.Same(t, r, mixed[0].Record)
+			assert.ErrorContains(t, mixed[0].Err, "no agent assigned")
+			assert.Same(t, okRec, mixed[1].Record)
+			assert.NoError(t, mixed[1].Err)
+			assert.Same(t, r, mixed[2].Record)
+			assert.ErrorContains(t, mixed[2].Err, "no agent assigned")
+			assert.Equal(t, float64(4), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
+
+	t.Run("negative leader rejects only that partition", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 2)
+			cands := c.demoter.Candidates(topic, 0, 1)
+			require.Len(t, cands, 1)
+			leader := cands[0].NodeID
+			topicID, ok := c.pool.TopicID(topic)
+			require.True(t, ok)
+
+			c.pool.state.Store(&poolState{
+				agents:   []int32{leader},
+				topicIDs: map[string][16]byte{topic: topicID},
+				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
+					{topic: topic, partition: 0}: leader,
+				}, nil, map[topicPartition]struct{}{
+					{topic: topic, partition: 1}: {},
+				}),
+			})
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("kept"), Timestamp: time.Now()},
+				{Topic: topic, Partition: 1, Value: []byte("unnamed"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			require.NoError(t, results[0].Err)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+
+			consumer, err := kgo.NewClient(
+				kgo.SeedBrokers(clusterAddr),
+				kgo.Dialer(vnet.DialContext),
+				kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+					topic: {0: kgo.NewOffset().AtStart(), 1: kgo.NewOffset().AtStart()},
+				}),
+			)
+			require.NoError(t, err)
+			t.Cleanup(consumer.Close)
+			fetches := consumer.PollFetches(t.Context())
+			require.NoError(t, fetches.Err())
+			require.Len(t, fetches.Records(), 1)
+			assert.Equal(t, []byte("kept"), fetches.Records()[0].Value)
+			assert.Equal(t, int32(0), fetches.Records()[0].Partition)
+		})
+	})
+
+	t.Run("empty agent pool rejects every record", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			c.pool.state.Store(&poolState{
+				strategy: newDefaultPartitionAssignmentStrategy(nil, nil, nil, nil),
+			})
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+				{Topic: "other", Partition: 0, Value: []byte("b"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			assert.ErrorContains(t, results[0].Err, "no agent assigned")
+			assert.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+		})
+	})
+
+	t.Run("routing miss stays separate from a failed accepted partition", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, addr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(addr, topic),
+				WithDialer(vnet.DialContext),
+				WithHedgerMaxHedgeAgents(1),
+				WithHedgerMinHedgeDelay(time.Hour),
+			)...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				preq := req.(*kmsg.ProduceRequest)
+				presp := preq.ResponseKind().(*kmsg.ProduceResponse)
+				presp.Version = preq.Version
+				for _, rt := range preq.Topics {
+					out := kmsg.ProduceResponseTopic{Topic: rt.Topic}
+					if out.Topic == "" {
+						out.Topic = topic
+					}
+					for _, rp := range rt.Partitions {
+						out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{
+							Partition: rp.Partition,
+							ErrorCode: kerr.NotLeaderForPartition.Code,
+						})
+					}
+					presp.Topics = append(presp.Topics, out)
+				}
+				return presp, nil, true
+			})
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("wire"), Timestamp: time.Now()},
+				{Topic: "does-not-exist", Partition: 0, Value: []byte("miss"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			require.ErrorIs(t, results[0].Err, kgo.ErrRecordTimeout)
+			assert.NotContains(t, results[0].Err.Error(), "no agent assigned")
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
+
+	t.Run("accepted group split across flushes completes once beside a routing miss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			vnet := &kfake.VirtualNetwork{}
+			cluster, addr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+			c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+				testWarpstreamOpts(addr, topic),
+				WithDialer(vnet.DialContext),
+				WithBatchMaxBytes(512),
+			)...)
+			require.NoError(t, err)
+			t.Cleanup(c.Close)
+
+			var requests atomic.Int32
+			cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				requests.Add(1)
+				return nil, nil, false
+			})
+
+			records := make([]*kgo.Record, 6)
+			for i := range 5 {
+				records[i] = &kgo.Record{Topic: topic, Partition: 0, Value: bytes.Repeat([]byte{byte('a' + i)}, 150)}
+			}
+			records[5] = &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("miss")}
+			results := c.ProduceSync(t.Context(), records)
+			require.Len(t, results, 6)
+			for i := range 5 {
+				assert.NoError(t, results[i].Err)
+			}
+			assert.ErrorContains(t, results[5].Err, "no agent assigned")
+			assert.GreaterOrEqual(t, requests.Load(), int32(2))
+		})
+	})
+
+	t.Run("pre-canceled mixed call keeps the routing error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m")}
+			results := c.ProduceSync(ctx, []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("a")},
+				miss,
+			})
+			require.Len(t, results, 2)
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.True(t, miss.Timestamp.IsZero())
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
+
+	t.Run("mid-flight cancel keeps the routing error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			release := make(chan struct{})
+			started := make(chan struct{})
+			var once sync.Once
+			c.SetTestProduceResponseHook(func(ctx context.Context, _ int32, _ *kmsg.ProduceResponse, _ error) {
+				once.Do(func() { close(started) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			})
+
+			ctx, cancel := context.WithCancel(t.Context())
+			var results kgo.ProduceResults
+			done := make(chan struct{})
+			go func() {
+				results = c.ProduceSync(ctx, []*kgo.Record{
+					{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+					{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()},
+				})
+				close(done)
+			}()
+			<-started
+			cancel()
+			<-done
+			close(release)
+			synctest.Wait()
+
+			require.Len(t, results, 2)
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Equal(t, int64(0), c.BufferedProduceRecords())
+		})
+	})
+
+	t.Run("closed buffer fails accepted records and keeps routing errors", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			c.buffer.Close()
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+				{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 2)
+			require.ErrorIs(t, results[0].Err, errBufferClosed)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
+		})
+	})
 }
 
 func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
@@ -605,6 +1001,32 @@ func TestWarpstreamClient_RoutingFailureLeavesTimestampUnstamped(t *testing.T) {
 			require.Len(t, results, 1)
 			require.Error(t, results[0].Err)
 			assert.True(t, rec.Timestamp.IsZero(), "routing failure must not stamp the caller's record")
+		})
+	})
+
+	t.Run("ProduceSync mixed call stamps only accepted records", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m")}
+			tooBig := &kgo.Record{Topic: topic, Partition: 0, Value: make([]byte, 2<<20)}
+			kept := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+			set := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("set"), Timestamp: kept}
+			unset := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("unset")}
+			unset2 := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("unset2")}
+
+			results := c.ProduceSync(t.Context(), []*kgo.Record{miss, tooBig, set, unset, unset2})
+			require.Len(t, results, 5)
+			require.ErrorContains(t, results[0].Err, "no agent assigned")
+			require.ErrorIs(t, results[1].Err, kerr.MessageTooLarge)
+			require.NoError(t, results[2].Err)
+			require.NoError(t, results[3].Err)
+			require.NoError(t, results[4].Err)
+
+			assert.True(t, miss.Timestamp.IsZero())
+			assert.True(t, tooBig.Timestamp.IsZero())
+			assert.True(t, set.Timestamp.Equal(kept))
+			assert.False(t, unset.Timestamp.IsZero())
+			assert.True(t, unset.Timestamp.Equal(unset2.Timestamp))
 		})
 	})
 
@@ -1907,35 +2329,39 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 
 	t.Run("close during a periodic fetch does not run a queued nudge", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
-			release := make(chan struct{})
-			var blockNext atomic.Bool
-			blockNext.Store(true)
-			cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
-				cluster.KeepControl()
-				// AgentPool.Refresh asks for every topic. kgo's own loop asks
-				// for brokers only, and blocking that request stalls the cluster.
-				if req.(*kmsg.MetadataRequest).Topics == nil && blockNext.CompareAndSwap(true, false) {
-					cluster.SleepControl(func() { <-release })
-				}
-				return nil, nil, false
-			})
+			// Forty passes. One pass still succeeds about half the time if the
+			// refreshCtx.Err() return after a periodic fetch is removed.
+			for i := range 40 {
+				c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+				release := make(chan struct{})
+				var blockNext atomic.Bool
+				blockNext.Store(true)
+				cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+					cluster.KeepControl()
+					// AgentPool.Refresh asks for every topic. kgo's own loop asks
+					// for brokers only, and blocking that request stalls the cluster.
+					if req.(*kmsg.MetadataRequest).Topics == nil && blockNext.CompareAndSwap(true, false) {
+						cluster.SleepControl(func() { <-release })
+					}
+					return nil, nil, false
+				})
 
-			time.Sleep(10 * time.Second)
-			synctest.Wait()
-			// Queue a nudge while a Metadata request may be in flight. The count
-			// below is taken after that nudge has either run or is still waiting
-			// behind the blocked request.
-			c.triggerRefresh()
-			synctest.Wait()
-			before := onDemandRefreshes(c)
+				time.Sleep(10 * time.Second)
+				synctest.Wait()
+				// Queue a nudge while a Metadata request may be in flight. The count
+				// below is taken after that nudge has either run or is still waiting
+				// behind the blocked request.
+				c.triggerRefresh()
+				synctest.Wait()
+				before := onDemandRefreshes(c)
 
-			go c.Close()
-			synctest.Wait()
-			close(release)
-			synctest.Wait()
+				go c.Close()
+				synctest.Wait()
+				close(release)
+				synctest.Wait()
 
-			assert.Equal(t, before, onDemandRefreshes(c))
+				assert.Equal(t, before, onDemandRefreshes(c), "iteration %d", i)
+			}
 		})
 	})
 }

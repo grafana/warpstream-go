@@ -30,7 +30,10 @@ franz-go uses:
 - **Unbuffered** fires before the caller observes a record's outcome. For `Produce` the
   promise is wrapped so the hook runs just before it, mirroring franz-go (unbuffered hook,
   then promise). For `ProduceSync` the hooks fire, in input order, on the calling goroutine —
-  after it has finalized every result.
+  after it has finalized every result. A call that rejects some records for routing and
+  produces the rest still fires unbuffered once per record, at that return. Spans for the
+  rejected records stay open until the accepted records finish. Rejected records do not
+  get an earlier unbuffered hook.
 
 Callers pass their tracer via the existing `WithHooks`, exactly as for a franz-go client,
 so this needs no new API and no OpenTelemetry dependency in the client — it relies only on
