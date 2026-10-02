@@ -290,40 +290,57 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	}
 
 	wg.Add(len(okRecords))
+	// Last input index for each pointer. Completions write that slot only.
 	indexOf := make(map[*kgo.Record]int, len(okRecords))
 	for _, idx := range okIndices {
 		indexOf[records[idx]] = idx
 	}
+	// A repeated pointer shares that slot's outcome. Copy it to the other
+	// positions on return, before the unbuffered hooks above.
+	if len(indexOf) < len(okRecords) {
+		defer func() {
+			for _, idx := range okIndices {
+				canon := indexOf[records[idx]]
+				if idx != canon {
+					results[idx] = results[canon]
+				}
+			}
+		}()
+	}
+	write := func(recs []*kgo.Record, err error) {
+		for _, r := range recs {
+			results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
+			wg.Done()
+		}
+	}
 
-	routed, err := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
+	routed, rejected := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
 		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, groupRecords, func(err error) {
 			if err != nil {
 				// Post-dispatch failure, resolved uniformly for the whole
 				// partition group; pre-dispatch rejections never reach here.
 				c.metrics.produceRecordsFailedTotal.Add(float64(len(groupRecords)))
 			}
-			for _, r := range groupRecords {
-				results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
-				wg.Done()
-			}
+			write(groupRecords, err)
 		})
 	})
-	if err != nil {
-		// One record had no known candidate. Fail the whole batch
-		// uniformly: every ok record gets the same error.
-		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(okIndices)))
-		for _, i := range okIndices {
-			results[i] = kgo.ProduceResult{Record: records[i], Err: err}
+
+	if len(rejected) > 0 {
+		for _, rg := range rejected {
+			c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(rg.records)))
+			write(rg.records, rg.err)
 		}
+	}
+	if len(routed) == 0 {
 		return results
 	}
 
-	// Stamp each record's produce time only after routing succeeds, so a failed
-	// produce leaves the caller's records unchanged. A single now keeps records
-	// buffered together on one produce timestamp. Mirrors franz-go's bufferRecord.
+	// Stamp only accepted records with unset timestamps, using one shared now.
 	now := time.Now()
-	for _, r := range okRecords {
-		ensureRecordTimestamp(r, now)
+	for _, g := range routed {
+		for _, r := range g.item.records {
+			ensureRecordTimestamp(r, now)
+		}
 	}
 
 	c.buffer.MultiAdd(ctx, routed)
@@ -540,43 +557,71 @@ func (c *WarpstreamClient) waitRefreshCooldown(delay, elapsed time.Duration) {
 	}
 }
 
-// routeRecords groups records by (topic, partition), stamps each group with
-// its initial destination NodeID and mints the per-group done callback.
-// Returns an error if any record's partition has no known candidate.
-func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]promised[routedTopicPartitionRecords], error) {
+type rejectedTopicPartitionRecords struct {
+	topicPartitionRecords
+	err error
+}
+
+// routeRecords routes each partition once. A partition with no candidate is
+// returned unsent. The first miss requests a metadata refresh.
+func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]promised[routedTopicPartitionRecords], []rejectedTopicPartitionRecords) {
 	groups := make(map[topicPartition]*promised[routedTopicPartitionRecords])
 	order := make([]topicPartition, 0)
+	var rejectedByKey map[topicPartition]int
+	var rejected []rejectedTopicPartitionRecords
+
 	for _, r := range records {
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
-		g, ok := groups[key]
-		if !ok {
-			cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
-			if len(cands) == 0 {
-				c.triggerRefresh()
-				return nil, fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition)
-			}
-			g = &promised[routedTopicPartitionRecords]{
-				item: routedTopicPartitionRecords{
-					topicPartitionRecords: topicPartitionRecords{
-						topic:     r.Topic,
-						partition: r.Partition,
-					},
-					nodeID:    cands[0].NodeID,
-					nodeState: cands[0].State,
-				},
-			}
-			groups[key] = g
-			order = append(order, key)
+		if g, ok := groups[key]; ok {
+			g.item.records = append(g.item.records, r)
+			continue
 		}
-		g.item.records = append(g.item.records, r)
+		if rejectedByKey != nil {
+			if i, ok := rejectedByKey[key]; ok {
+				rejected[i].records = append(rejected[i].records, r)
+				continue
+			}
+		}
+
+		cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
+		if len(cands) == 0 {
+			if rejectedByKey == nil {
+				rejectedByKey = make(map[topicPartition]int)
+				c.triggerRefresh()
+			}
+			rejectedByKey[key] = len(rejected)
+			rejected = append(rejected, rejectedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     r.Topic,
+					partition: r.Partition,
+					records:   []*kgo.Record{r},
+				},
+				err: fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition),
+			})
+			continue
+		}
+
+		groups[key] = &promised[routedTopicPartitionRecords]{
+			item: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     r.Topic,
+					partition: r.Partition,
+					records:   []*kgo.Record{r},
+				},
+				nodeID:    cands[0].NodeID,
+				nodeState: cands[0].State,
+			},
+		}
+		order = append(order, key)
 	}
+
 	out := make([]promised[routedTopicPartitionRecords], 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		g.done = doneFor(g.item.records)
 		out = append(out, *g)
 	}
-	return out, nil
+	return out, rejected
 }
 
 // routeRecord is the single-record specialisation of routeRecords: it

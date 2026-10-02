@@ -161,16 +161,87 @@ func TestWarpstreamClient_ProduceRecordHooks(t *testing.T) {
 			hook := &recordingHook{}
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1, WithHooks(hook))
 
-			// An unknown-topic record fails routing for the whole batch uniformly.
+			// The unknown topic is rejected on its own. The other record is produced.
 			r1 := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()}
 			r2 := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("b"), Timestamp: time.Now()}
+			results := c.ProduceSync(t.Context(), []*kgo.Record{r1, r2})
+			require.NoError(t, results[0].Err)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+
+			events := hook.snapshot()
+			require.Equal(t, []string{"buffered", "buffered", "unbuffered", "unbuffered"}, kindsOf(events))
+			assert.Same(t, r1, events[2].rec)
+			assert.Same(t, r2, events[3].rec)
+			assert.NoError(t, events[2].err)
+			assert.ErrorContains(t, events[3].err, "no agent assigned")
+		})
+	})
+
+	t.Run("ProduceSync all rejected fires unbuffered once per record at return", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			hook := &recordingHook{}
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1, WithHooks(hook))
+
+			r1 := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("a"), Timestamp: time.Now()}
+			r2 := &kgo.Record{Topic: "does-not-exist", Partition: 1, Value: []byte("b"), Timestamp: time.Now()}
 			results := c.ProduceSync(t.Context(), []*kgo.Record{r1, r2})
 			require.ErrorContains(t, results[0].Err, "no agent assigned")
 			require.ErrorContains(t, results[1].Err, "no agent assigned")
 
 			events := hook.snapshot()
 			require.Equal(t, []string{"buffered", "buffered", "unbuffered", "unbuffered"}, kindsOf(events))
-			assert.ErrorContains(t, events[2].err, "no agent assigned")
+			assert.Same(t, r1, events[2].rec)
+			assert.Same(t, r2, events[3].rec)
+		})
+	})
+
+	t.Run("ProduceSync repeated record pointer reports each position's error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			hook := &recordingHook{}
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1, WithHooks(hook))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			r := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("v"), Timestamp: time.Now()}
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("m"), Timestamp: time.Now()}
+			results := c.ProduceSync(ctx, []*kgo.Record{r, miss, r, miss})
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+			require.ErrorIs(t, results[2].Err, context.Canceled)
+			require.ErrorContains(t, results[3].Err, "no agent assigned")
+
+			events := hook.snapshot()
+			require.Equal(t, []string{
+				"buffered", "buffered", "buffered", "buffered",
+				"unbuffered", "unbuffered", "unbuffered", "unbuffered",
+			}, kindsOf(events))
+			assert.Same(t, r, events[4].rec)
+			assert.Same(t, miss, events[5].rec)
+			assert.Same(t, r, events[6].rec)
+			assert.Same(t, miss, events[7].rec)
+			assert.ErrorIs(t, events[4].err, context.Canceled)
+			assert.ErrorContains(t, events[5].err, "no agent assigned")
+			assert.ErrorIs(t, events[6].err, context.Canceled)
+			assert.ErrorContains(t, events[7].err, "no agent assigned")
+		})
+	})
+
+	t.Run("ProduceSync pre-canceled mixed call keeps each record's error", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			hook := &recordingHook{}
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1, WithHooks(hook))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			routed := &kgo.Record{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()}
+			miss := &kgo.Record{Topic: "does-not-exist", Partition: 0, Value: []byte("b"), Timestamp: time.Now()}
+			results := c.ProduceSync(ctx, []*kgo.Record{routed, miss})
+			require.ErrorIs(t, results[0].Err, context.Canceled)
+			require.ErrorContains(t, results[1].Err, "no agent assigned")
+
+			events := hook.snapshot()
+			require.Equal(t, []string{"buffered", "buffered", "unbuffered", "unbuffered"}, kindsOf(events))
+			assert.ErrorIs(t, events[2].err, context.Canceled)
 			assert.ErrorContains(t, events[3].err, "no agent assigned")
 		})
 	})
