@@ -253,7 +253,6 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			require.Error(t, results[0].Err)
 			assert.ErrorContains(t, results[0].Err, "no agent assigned")
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
-			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// A rejection is not a failure: produceRecordsFailedTotal stays 0.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -276,6 +275,11 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
+
+			// The caller cancel detaches this wait. The flush keeps its own
+			// deadline, and a successful background produce is not a Hedger failure.
+			synctest.Wait()
+			assertFinalOutcomes(t, c.metrics, nil)
 		})
 	})
 
@@ -305,7 +309,6 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
-			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// The oversized record is a rejection, not a failure; the ok record succeeds.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -1091,7 +1094,6 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "no agent assigned")
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
-			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned]))
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// A rejection is not a failure: produceRecordsFailedTotal stays 0.
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
@@ -1232,6 +1234,9 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 					// Returned at the write-timeout ceiling, not hanging.
 					assert.GreaterOrEqual(t, elapsed, writeTimeout)
 					assert.Less(t, elapsed, writeTimeout+time.Second)
+					assertFinalOutcomes(t, c.metrics, map[produceFinalOutcome]float64{
+						produceFinalOutcomeWriteTimeout: 1,
+					})
 				})
 			})
 
@@ -1249,6 +1254,9 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 					case <-time.After(5 * time.Second):
 						t.Fatal("Produce promise did not fire within the write-timeout bound")
 					}
+					assertFinalOutcomes(t, c.metrics, map[produceFinalOutcome]float64{
+						produceFinalOutcomeWriteTimeout: 1,
+					})
 				})
 			})
 		})

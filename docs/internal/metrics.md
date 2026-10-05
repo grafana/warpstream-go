@@ -52,6 +52,16 @@ and attempt accounting, and client-boundary record counters. They carry a
 `warpstream_` prefix so they never collide with franz-go/kprom names and are
 unambiguously backend-specific.
 
+Counters in this group are not numerators and denominators for each other.
+A hedge-trigger counter counts one logical fallback cascade, including a
+cascade that sends no request. A final-outcome counter counts one failed
+Hedger produce — one flush of logical primary work — and omits success and
+caller cancellation. Record rejected and failed counters count input record
+occurrences. Agent-pool churn counts NodeIDs added or removed on a successful
+live refresh. An initial routing miss stays on the record-rejection counter:
+that work never entered the Hedger, so it is not a final outcome. Help strings
+on the metrics are the contract for each series.
+
 ## 4. Build info — `warpstream_client_build_info`
 
 One gauge, `warpstream_client_build_info`, is not behavioural. It is always

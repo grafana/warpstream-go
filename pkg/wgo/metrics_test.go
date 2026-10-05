@@ -248,7 +248,7 @@ func TestNewMetrics_HedgeTriggers(t *testing.T) {
 	m.hedgeTriggers[hedgeTriggerDemotedProbe].Add(3)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_produce_hedge_triggers_total Why a produce fallback started: latency, primary_failure, or demoted_probe. One increment per fallback.
+		# HELP warpstream_produce_hedge_triggers_total Why a logical fallback cascade started: latency (hedge timer, or a healthy primary whose computed delay is already zero), primary_failure (the primary failed before the race), or demoted_probe (the routing-time primary was demoted). One increment per cascade entry, including a cascade that dispatches no request. Not a wire request or a hedge wave.
 		# TYPE warpstream_produce_hedge_triggers_total counter
 		warpstream_produce_hedge_triggers_total{trigger="demoted_probe"} 3
 		warpstream_produce_hedge_triggers_total{trigger="latency"} 1
@@ -260,18 +260,18 @@ func TestNewMetrics_ProduceFinalOutcome(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)
 
-	m.produceFinalOutcome[produceFinalOutcomeAllCandidatesExhausted].Inc()
-	m.produceFinalOutcome[produceFinalOutcomeHedgingSuppressed].Add(2)
-	m.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Add(3)
-	m.produceFinalOutcome[produceFinalOutcomeWriteTimeout].Add(4)
+	m.produceFinalOutcome[produceFinalOutcomeCandidatesExhausted].Inc()
+	m.produceFinalOutcome[produceFinalOutcomeTerminalError].Add(2)
+	m.produceFinalOutcome[produceFinalOutcomeWriteTimeout].Add(3)
+	m.produceFinalOutcome[produceFinalOutcomeInternalError].Add(4)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_produce_final_outcome_total Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, no_agent_assigned, or write_timeout. One increment per failed produce, not per record or wire attempt.
+		# HELP warpstream_produce_final_outcome_total Why one nonempty Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the Hedger work budget expired and that expiry is the returned failure), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is included here and excluded from warpstream_produce_requests_attempts.
 		# TYPE warpstream_produce_final_outcome_total counter
-		warpstream_produce_final_outcome_total{reason="all_candidates_exhausted"} 1
-		warpstream_produce_final_outcome_total{reason="hedging_suppressed_and_primary_failed"} 2
-		warpstream_produce_final_outcome_total{reason="no_agent_assigned"} 3
-		warpstream_produce_final_outcome_total{reason="write_timeout"} 4
+		warpstream_produce_final_outcome_total{reason="candidates_exhausted"} 1
+		warpstream_produce_final_outcome_total{reason="internal_error"} 4
+		warpstream_produce_final_outcome_total{reason="terminal_error"} 2
+		warpstream_produce_final_outcome_total{reason="write_timeout"} 3
 	`), "warpstream_produce_final_outcome_total"))
 }
 
@@ -285,7 +285,7 @@ func TestMetrics_ObserveAgentPoolChurn(t *testing.T) {
 	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2, 3}, []int32{1, 4}, nil)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_agentpool_agents_changed_total Agents added to or removed from the live AgentPool snapshot on a successful Metadata refresh, by direction. Constructor Refresh is not counted.
+		# HELP warpstream_agentpool_agents_changed_total NodeIDs added to or removed from the AgentPool on a successful live Metadata refresh, by direction. Constructor initialization is excluded. An address-only or leader-only change is not membership churn.
 		# TYPE warpstream_agentpool_agents_changed_total counter
 		warpstream_agentpool_agents_changed_total{direction="added"} 3
 		warpstream_agentpool_agents_changed_total{direction="removed"} 2

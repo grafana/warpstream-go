@@ -105,23 +105,24 @@ const (
 	metadataRefreshResultFailed            = "failed"
 )
 
-// produceFinalOutcome is why a logical produce ended in failure (not why one
-// wire attempt failed). Success is not counted.
+// produceFinalOutcome is why one nonempty Hedger produce failed. Success and
+// caller cancellation are not counted. One increment is one invocation, not
+// one public call, record, partition, or wire attempt.
 type produceFinalOutcome int8
 
 const (
-	produceFinalOutcomeAllCandidatesExhausted produceFinalOutcome = iota
-	produceFinalOutcomeHedgingSuppressed
-	produceFinalOutcomeNoAgentAssigned
+	produceFinalOutcomeCandidatesExhausted produceFinalOutcome = iota
+	produceFinalOutcomeTerminalError
 	produceFinalOutcomeWriteTimeout
+	produceFinalOutcomeInternalError
 	produceFinalOutcomeCount
 )
 
 const (
-	produceFinalOutcomeLabelAllCandidatesExhausted = "all_candidates_exhausted"
-	produceFinalOutcomeLabelHedgingSuppressed      = "hedging_suppressed_and_primary_failed"
-	produceFinalOutcomeLabelNoAgentAssigned        = "no_agent_assigned"
-	produceFinalOutcomeLabelWriteTimeout           = "write_timeout"
+	produceFinalOutcomeLabelCandidatesExhausted = "candidates_exhausted"
+	produceFinalOutcomeLabelTerminalError       = "terminal_error"
+	produceFinalOutcomeLabelWriteTimeout        = "write_timeout"
+	produceFinalOutcomeLabelInternalError       = "internal_error"
 )
 
 type agentpoolChurnDirection int8
@@ -215,17 +216,17 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	hedgeTriggers := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_hedge_triggers_total",
-		Help: "Why a produce fallback started: latency, primary_failure, or demoted_probe. One increment per fallback.",
+		Help: "Why a logical fallback cascade started: latency (hedge timer, or a healthy primary whose computed delay is already zero), primary_failure (the primary failed before the race), or demoted_probe (the routing-time primary was demoted). One increment per cascade entry, including a cascade that dispatches no request. Not a wire request or a hedge wave.",
 	}, []string{"trigger"})
 
 	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_final_outcome_total",
-		Help: "Why a logical produce ended in failure: all_candidates_exhausted, hedging_suppressed_and_primary_failed, no_agent_assigned, or write_timeout. One increment per failed produce, not per record or wire attempt.",
+		Help: "Why one nonempty Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the Hedger work budget expired and that expiry is the returned failure), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is included here and excluded from warpstream_produce_requests_attempts.",
 	}, []string{"reason"})
 
 	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_agentpool_agents_changed_total",
-		Help: "Agents added to or removed from the live AgentPool snapshot on a successful Metadata refresh, by direction. Constructor Refresh is not counted.",
+		Help: "NodeIDs added to or removed from the AgentPool on a successful live Metadata refresh, by direction. Constructor initialization is excluded. An address-only or leader-only change is not membership churn.",
 	}, []string{"direction"})
 
 	version, franzGoVersion := clientBuildInfo()
@@ -254,10 +255,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			hedgeTriggerDemotedProbe:   hedgeTriggers.WithLabelValues(hedgeTriggerLabelDemotedProbe),
 		},
 		produceFinalOutcome: [produceFinalOutcomeCount]prometheus.Counter{
-			produceFinalOutcomeAllCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelAllCandidatesExhausted),
-			produceFinalOutcomeHedgingSuppressed:      produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelHedgingSuppressed),
-			produceFinalOutcomeNoAgentAssigned:        produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelNoAgentAssigned),
-			produceFinalOutcomeWriteTimeout:           produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelWriteTimeout),
+			produceFinalOutcomeCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelCandidatesExhausted),
+			produceFinalOutcomeTerminalError:       produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelTerminalError),
+			produceFinalOutcomeWriteTimeout:        produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelWriteTimeout),
+			produceFinalOutcomeInternalError:       produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelInternalError),
 		},
 		agentpoolAgentsChanged: [agentpoolChurnCount]prometheus.Counter{
 			agentpoolChurnAdded:   agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelAdded),
