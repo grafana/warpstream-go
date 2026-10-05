@@ -681,7 +681,7 @@ func defaultCfg() cfg {
 		maxProduceInflight:  1,
 		compression:         []CompressionCodec{SnappyCompression(), NoCompression()},
 		maxRecordBatchBytes: func(string) int32 { return 1000012 }, // Kafka max.message.bytes default is 1000012
-		maxBufferedRecords:  10000,
+		maxBufferedRecords:  50000,
 		produceTimeout:      10 * time.Second,
 		recordRetries:       math.MaxInt64, // effectively unbounded
 		maxUnknownFailures:  4,
@@ -1336,7 +1336,7 @@ func ProducerBatchMaxBytesFn(fn func(string) int32) ProducerOpt {
 
 // MaxBufferedRecords sets the max amount of records the client will buffer,
 // blocking produces until records are finished if this limit is reached.
-// This overrides the default of 10,000.
+// This overrides the default of 50,000.
 func MaxBufferedRecords(n int) ProducerOpt {
 	return producerOpt{func(cfg *cfg) { cfg.maxBufferedRecords = int64(n) }}
 }
@@ -2009,6 +2009,12 @@ func ConsumerGroup(group string) GroupOpt {
 // IncrementalAlterConfigs with resource type GROUP. Without this, share
 // groups default to "latest" and only records produced after the group
 // begins consuming are delivered.
+//
+// The broker ties a share session to one connection and releases every
+// record you hold when that connection closes. If you hold records without
+// polling, ack or renew (AckRenew) them within ConnIdleTimeout, otherwise
+// the idle connection can be closed and the records delivered to another
+// member.
 func ShareGroup(group string) GroupOpt {
 	return groupOpt{func(cfg *cfg) { cfg.shareGroup = group }}
 }
