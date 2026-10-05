@@ -201,7 +201,7 @@ func TestWarpstreamClient_RouteRecords(t *testing.T) {
 			{topic: topic, partition: 0}: 3,
 		}, nil, map[topicPartition]struct{}{
 			{topic: topic, partition: 1}: {},
-		})
+		}, map[string]int32{topic: 10})
 		c := newRouteRecordsClient(strategy, make(chan struct{}, 4))
 		records := []*kgo.Record{
 			rec(topic, 0, "leader"),
@@ -220,7 +220,7 @@ func TestWarpstreamClient_RouteRecords(t *testing.T) {
 		assert.Equal(t, int32(1), rejected[0].partition)
 		assert.Equal(t, "never-seen", rejected[1].topic)
 
-		empty := newRouteRecordsClient(newDefaultPartitionAssignmentStrategy(nil, nil, nil, nil), make(chan struct{}, 1))
+		empty := newRouteRecordsClient(newDefaultPartitionAssignmentStrategy(nil, nil, nil, nil, nil), make(chan struct{}, 1))
 		routed, rejected = empty.routeRecords([]*kgo.Record{rec(topic, 0, "a")}, countAccepted(new(int)))
 		assert.Empty(t, routed)
 		require.Len(t, rejected, 1)
