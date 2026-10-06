@@ -1097,11 +1097,9 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 
 	t.Run("invokes promise with error when partition is beyond the topic's known partition count", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			// topic has 1 partition (index 0); 100 was never reported by
-			// Metadata at any partition count, so it must not fall back to
-			// a guessed agent — that guess is certain to fail and, before
-			// this fix, surfaced as kgo.ErrRecordTimeout instead of a fast
-			// "no agent assigned" rejection.
+			// Partition 100 doesn't exist (topic has 1); before this fix it
+			// guessed a fallback agent anyway, surfacing kgo.ErrRecordTimeout
+			// instead of a fast rejection.
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
 
 			input := &kgo.Record{Topic: topic, Partition: 100, Value: []byte("v"), Timestamp: time.Now()}

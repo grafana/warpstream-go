@@ -414,12 +414,13 @@ func BenchmarkNewDefaultPartitionAssignmentStrategy(b *testing.B) {
 			for p := int32(0); p < int32(cfg.partitions); p++ {
 				leaders[topicPartition{topic: "ingest", partition: p}] = agents[int(p)%len(agents)]
 			}
+			partitionCounts := map[string]int32{"ingest": int32(cfg.partitions)}
 			b.ResetTimer()
 			b.ReportAllocs()
 			// A package-level sink keeps these allocations in the reported count.
 			// Discarding the result lets the compiler elide them.
 			for range b.N {
-				sink = newDefaultPartitionAssignmentStrategy(agents, leaders, nil, nil, map[string]int32{"ingest": int32(cfg.partitions)})
+				sink = newDefaultPartitionAssignmentStrategy(agents, leaders, nil, nil, partitionCounts)
 			}
 		})
 	}
