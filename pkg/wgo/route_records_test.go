@@ -225,6 +225,25 @@ func TestWarpstreamClient_RouteRecords(t *testing.T) {
 		assert.Empty(t, routed)
 		require.Len(t, rejected, 1)
 	})
+
+	t.Run("out-of-range partition is rejected and still nudges a refresh", func(t *testing.T) {
+		agents := []int32{3}
+		nudge := make(chan struct{}, 1)
+		strategy := newDefaultPartitionAssignmentStrategy(agents, map[topicPartition]int32{
+			{topic: topic, partition: 0}: 3,
+		}, nil, nil, map[string]int32{topic: 10})
+		c := newRouteRecordsClient(strategy, nudge)
+
+		routed, rejected := c.routeRecords([]*kgo.Record{
+			rec(topic, 0, "leader"),
+			rec(topic, 100, "out-of-range"),
+		}, countAccepted(new(int)))
+
+		require.Len(t, routed, 1)
+		require.Len(t, rejected, 1)
+		assert.Equal(t, int32(100), rejected[0].partition)
+		assert.Len(t, nudge, 1)
+	})
 }
 
 func newRouteRecordsClient(strategy PartitionAssignmentStrategy, nudge chan struct{}) *WarpstreamClient {
