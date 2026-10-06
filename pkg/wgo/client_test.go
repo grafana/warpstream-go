@@ -376,7 +376,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				topicIDs: map[string][16]byte{topic: topicID},
 				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
 					{topic: topic, partition: 0}: leader,
-				}, nil, nil),
+				}, nil, nil, map[string]int32{topic: 2}),
 			})
 
 			// Partition 0 (healthy sibling) and partition 1 (dropped leader)
@@ -448,7 +448,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 				topicIDs: map[string][16]byte{topic: wipedID, other: otherID},
 				strategy: newDefaultPartitionAssignmentStrategy([]int32{leader}, map[topicPartition]int32{
 					{topic: other, partition: 0}: leader,
-				}, map[string]struct{}{topic: {}}, nil),
+				}, map[string]struct{}{topic: {}}, nil, map[string]int32{topic: 1}),
 			})
 
 			results := c.ProduceSync(t.Context(), []*kgo.Record{
@@ -782,7 +782,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 					{topic: topic, partition: 0}: leader,
 				}, nil, map[topicPartition]struct{}{
 					{topic: topic, partition: 1}: {},
-				}),
+				}, nil),
 			})
 
 			results := c.ProduceSync(t.Context(), []*kgo.Record{
@@ -815,7 +815,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
 			c.pool.state.Store(&poolState{
-				strategy: newDefaultPartitionAssignmentStrategy(nil, nil, nil, nil),
+				strategy: newDefaultPartitionAssignmentStrategy(nil, nil, nil, nil, nil),
 			})
 
 			results := c.ProduceSync(t.Context(), []*kgo.Record{
@@ -1091,6 +1091,28 @@ func TestWarpstreamClient_Produce(t *testing.T) {
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
 			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsTotal))
 			// A rejection is not a failure: produceRecordsFailedTotal stays 0.
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
+		})
+	})
+
+	t.Run("invokes promise with error when partition is beyond the topic's known partition count", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			// Partition 100 doesn't exist (topic has 1); before this fix it
+			// guessed a fallback agent anyway, surfacing kgo.ErrRecordTimeout
+			// instead of a fast rejection.
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			input := &kgo.Record{Topic: topic, Partition: 100, Value: []byte("v"), Timestamp: time.Now()}
+			done := make(chan error, 1)
+			c.Produce(t.Context(), input, func(_ *kgo.Record, err error) {
+				done <- err
+			})
+
+			err := <-done
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "no agent assigned")
+			assert.NotErrorIs(t, err, kgo.ErrRecordTimeout)
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned)))
 			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.produceRecordsFailedTotal))
 		})
 	})
