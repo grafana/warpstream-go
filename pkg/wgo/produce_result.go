@@ -23,10 +23,6 @@ var (
 type ProduceResult struct {
 	resp *kmsg.ProduceResponse
 	err  error
-
-	// compressionTypes is the compression type each partition's batch was encoded
-	// with.
-	compressionTypes map[topicPartition]uint8
 }
 
 // scopedProduceResult is a read-only view of one shared flush's result,

@@ -59,7 +59,7 @@ func BlockSizeOption(size BlockSize) Option {
 			return nil
 		case *CompressingReader:
 			size := uint32(size)
-			if !lz4block.Index(size).IsValid() { // never legacy, so no Block8Mb
+			if !lz4block.IsValid(size) {
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidBlockSize, size)
 			}
 			w.frame.Descriptor.Flags.BlockSizeIndexSet(lz4block.Index(size))
@@ -106,8 +106,7 @@ func ChecksumOption(flag bool) Option {
 }
 
 // SizeOption sets the size of the original uncompressed data (default=0). It is useful to know the size of the
-// whole uncompressed data stream. It must be exact: readers reject a frame whose data differs from it, so
-// closing a Writer, or reading to the end of a CompressingReader, fails with ErrInvalidContentSize if it does.
+// whole uncompressed data stream.
 func SizeOption(size uint64) Option {
 	return func(a applier) error {
 		switch w := a.(type) {
@@ -165,11 +164,6 @@ const (
 	Level9
 )
 
-// CCompatFast compresses with CompressorCCompat, whose output is that of the
-// reference implementation's LZ4_compress_fast. Fast suits most data better;
-// see CompressorCCompat.
-const CCompatFast CompressionLevel = 1
-
 // CompressionLevelOption defines the compression level (default=Fast).
 func CompressionLevelOption(level CompressionLevel) Option {
 	return func(a applier) error {
@@ -179,7 +173,7 @@ func CompressionLevelOption(level CompressionLevel) Option {
 			return lz4errors.Error(s)
 		case *Writer:
 			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
+			case Fast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
 			default:
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}
@@ -187,7 +181,7 @@ func CompressionLevelOption(level CompressionLevel) Option {
 			return nil
 		case *CompressingReader:
 			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
+			case Fast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
 			default:
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}

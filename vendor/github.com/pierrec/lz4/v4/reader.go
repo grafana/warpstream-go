@@ -36,7 +36,7 @@ type Reader struct {
 	src     io.Reader        // source reader
 	num     int              // concurrency level
 	frame   *lz4stream.Frame // frame being read
-	data    []byte           // block buffer allocated in non-concurrent mode
+	data    []byte           // block buffer allocated in non concurrent mode
 	reads   chan []byte      // pending data
 	idx     int              // size of pending data
 	handler func(int)
@@ -94,7 +94,7 @@ func (r *Reader) init() error {
 	}
 	r.reads = data
 	r.idx = 0
-	size := r.frame.BlockSizeIndex()
+	size := r.frame.Descriptor.Flags.BlockSizeIndex()
 	r.data = size.Get()
 	r.cum = 0
 	return nil
@@ -187,13 +187,9 @@ func (r *Reader) read(buf []byte) (int, error) {
 	var direct bool
 	dst := r.data[:cap(r.data)]
 	if len(buf) >= len(dst) {
-		// Decompress directly into buf.
-		// trim r.data as it is not needed now
-		r.data = r.data[:0]
+		// Uncompress directly into buf.
 		direct = true
-		// No more than a block, so that a block that decompresses to
-		// more than the frame's block size is rejected as it is otherwise.
-		dst = buf[:len(dst)]
+		dst = buf
 	}
 	dst, err = block.Uncompress(r.frame, dst, r.dict, true)
 	if err != nil {
@@ -238,11 +234,6 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 		return 0, r.state.err
 	case newState:
 		if err = r.init(); r.state.next(err) {
-			if err == io.EOF {
-				// An empty source is an empty stream; WriteTo reports
-				// success rather than io.EOF.
-				err = nil
-			}
 			return
 		}
 	default:
@@ -250,27 +241,19 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 	}
 	defer r.state.nextd(&err)
 
-	if r.idx > 0 {
-		// A previous Read left part of the current block unconsumed.
-		var bn int
-		bn, err = w.Write(r.data[r.idx:])
-		n += int64(bn)
-		r.idx = 0
-		if err != nil {
-			return
-		}
-		r.handler(bn)
+	var data []byte
+	if r.isNotConcurrent() {
+		size := r.frame.Descriptor.Flags.BlockSizeIndex()
+		data = size.Get()
+		defer lz4block.Put(data)
 	}
-
 	for {
 		var bn int
 		var dst []byte
 	read:
 		if r.isNotConcurrent() {
-			// Uncompress into r.data, which init sizes for every frame.
-			_, err = r.read(nil)
-			dst = r.data
-			bn = len(dst)
+			bn, err = r.read(data)
+			dst = data[:bn]
 		} else {
 			lz4block.Put(dst)
 			dst = <-r.reads

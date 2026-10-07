@@ -1,7 +1,6 @@
 package lz4
 
 import (
-	"fmt"
 	"io"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
@@ -65,26 +64,18 @@ func (w *Writer) isNotConcurrent() bool {
 
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
-	if !w.legacy && !w.frame.Descriptor.Flags.BlockSizeIndex().IsValid() {
-		// Block8Mb is only valid in legacy frames, and LegacyOption may be
-		// applied after BlockSizeOption.
-		return fmt.Errorf("%w: %d is only valid for legacy frames", lz4errors.ErrOptionInvalidBlockSize, lz4block.Block8Mb)
-	}
 	w.frame.InitW(w.src, w.num, w.legacy)
-	size := w.frame.BlockSizeIndex()
+	size := w.frame.Descriptor.Flags.BlockSizeIndex()
 	w.data = size.Get()
 	w.idx = 0
 	return w.frame.Descriptor.Write(w.frame, w.src)
 }
 
 func (w *Writer) Write(buf []byte) (n int, err error) {
-	if w.state.state == closedState {
-		return 0, lz4errors.ErrWriterClosed
-	}
 	defer w.state.check(&err)
 	switch w.state.state {
 	case writeState:
-	case errorState:
+	case closedState, errorState:
 		return 0, w.state.err
 	case newState:
 		if err = w.init(); w.state.next(err) {
@@ -121,7 +112,7 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 			return
 		}
 		if !w.isNotConcurrent() {
-			size := w.frame.BlockSizeIndex()
+			size := w.frame.Descriptor.Flags.BlockSizeIndex()
 			w.data = size.Get()
 		}
 		w.idx = 0
@@ -168,12 +159,9 @@ func (w *Writer) Flush() (err error) {
 	}
 
 	if w.idx > 0 {
-		if err = w.write(w.data[:w.idx], true); err != nil {
+		// Flush pending data, disable w.data freeing as it is done later on.
+		if err = w.write(w.data[:w.idx], false); err != nil {
 			return err
-		}
-		if !w.isNotConcurrent() {
-			size := w.frame.Descriptor.Flags.BlockSizeIndex()
-			w.data = size.Get()
 		}
 		w.idx = 0
 	}
@@ -183,9 +171,6 @@ func (w *Writer) Flush() (err error) {
 // Close closes the Writer, flushing any unwritten data to the underlying writer
 // without closing it.
 func (w *Writer) Close() error {
-	if w.state.state == closedState {
-		return nil
-	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
@@ -193,7 +178,6 @@ func (w *Writer) Close() error {
 	// It is now safe to free the buffer.
 	lz4block.Put(w.data)
 	w.data = nil
-	w.state.next(err)
 	return err
 }
 
@@ -214,9 +198,7 @@ func (w *Writer) Reset(writer io.Writer) {
 // ReadFrom efficiently reads from r and compressed into the Writer destination.
 func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 	switch w.state.state {
-	case closedState:
-		return 0, lz4errors.ErrWriterClosed
-	case errorState:
+	case closedState, errorState:
 		return 0, w.state.err
 	case newState:
 		if err = w.init(); w.state.next(err) {
@@ -227,7 +209,7 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 	}
 	defer w.state.check(&err)
 
-	size := w.frame.BlockSizeIndex()
+	size := w.frame.Descriptor.Flags.BlockSizeIndex()
 	var done bool
 	var rn int
 	data := size.Get()
