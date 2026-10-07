@@ -174,6 +174,17 @@ func TestScopedProduceResult_Error(t *testing.T) {
 
 		assert.ErrorIs(t, scoped.error(), kerr.KafkaStorageError)
 	})
+
+	t.Run("compressionTypes is shared, not scoped", func(t *testing.T) {
+		res := ProduceResult{
+			resp:             makeProduceResponse(11, 0, makeProduceResponseTopic("t", makeProduceResponseTopicPartition(0, kerrNoError))),
+			compressionTypes: map[topicPartition]uint8{tp0: 4, tp1: 7},
+		}
+
+		scoped := scopeProduceResultToPartitions(res, own)
+
+		assert.Equal(t, res.compressionTypes, scoped.raw.compressionTypes)
+	})
 }
 
 func TestGetProduceResultErr(t *testing.T) {
