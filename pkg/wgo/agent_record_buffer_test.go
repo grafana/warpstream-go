@@ -382,15 +382,15 @@ func TestAgentBuffer_Add(t *testing.T) {
 				for i := range records {
 					records[i] = makeRecord("t", 0, string(bytes.Repeat([]byte("x"), 200)))
 				}
-				adder.add(a, routedToWithDone(1, records, func(grp []*kgo.Record) func(ProduceResult) {
-					return perPartitionDone("t", 0, grp, func(err error) { caller1 <- err })
+				adder.add(a, routedToWithDone(1, records, func([]*kgo.Record) func(ProduceResult) {
+					return perPartitionDone("t", 0, func(err error) { caller1 <- err })
 				})[0])
 
 				// caller-2's done runs after caller-1's chunk in the shared flush,
 				// since the flush completes entries in the order they were added.
 				caller2 := make(chan error, 1)
-				adder.add(a, routedToWithDone(1, []*kgo.Record{makeRecord("t", 1, "v")}, func(grp []*kgo.Record) func(ProduceResult) {
-					return perPartitionDone("t", 1, grp, func(err error) {
+				adder.add(a, routedToWithDone(1, []*kgo.Record{makeRecord("t", 1, "v")}, func([]*kgo.Record) func(ProduceResult) {
+					return perPartitionDone("t", 1, func(err error) {
 						caller2 <- err
 						close(release)
 					})

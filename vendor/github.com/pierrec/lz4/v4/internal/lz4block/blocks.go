@@ -91,9 +91,4 @@ func Put(buf []byte) {
 
 type CompressionLevel uint32
 
-const (
-	Fast CompressionLevel = 0
-	// CCompatFast selects CompressorCCompat. The HC levels are powers of two from
-	// 1<<9, so it cannot be mistaken for one.
-	CCompatFast CompressionLevel = 1
-)
+const Fast CompressionLevel = 0

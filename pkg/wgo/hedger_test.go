@@ -50,7 +50,7 @@ func newResultCapture() *resultCapture {
 func (c *resultCapture) doneFor(topic string, partition int32) func(ProduceResult) {
 	return func(res ProduceResult) {
 		c.mu.Lock()
-		c.results[topicPartition{topic: topic, partition: partition}] = hedgerResult{resp: res.resp, err: res.err}
+		c.results[topicPartition{topic: topic, partition: partition}] = hedgerResult(res)
 		c.mu.Unlock()
 	}
 }
