@@ -2023,6 +2023,76 @@ func TestWarpstreamClient_OnDemandMetadataRefresh(t *testing.T) {
 	})
 }
 
+// TestWarpstreamClient_AgentPoolChurnOnLiveRefresh drives real membership
+// changes through the periodic refresh and checks the churn counters: the
+// constructor refresh and an unchanged refresh add nothing, an added Agent
+// counts once as added, and a removed Agent counts once as removed.
+func TestWarpstreamClient_AgentPoolChurnOnLiveRefresh(t *testing.T) {
+	const topic = "test-topic"
+
+	synctest.Test(t, func(t *testing.T) {
+		reg := prometheus.NewPedanticRegistry()
+		vnet := &kfake.VirtualNetwork{}
+		cluster, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet))
+		c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		churn := func() (added, removed float64) {
+			return testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnAdded]),
+				testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnRemoved])
+		}
+		refreshOnce := func() {
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+		}
+
+		// The constructor refresh is not churn.
+		added, removed := churn()
+		assert.Zero(t, added)
+		assert.Zero(t, removed)
+
+		refreshOnce()
+		added, removed = churn()
+		assert.Zero(t, added, "an unchanged refresh adds nothing")
+		assert.Zero(t, removed)
+
+		const newNode = int32(10)
+		_, _, err = cluster.AddNode(newNode, 9092+5)
+		require.NoError(t, err)
+		refreshOnce()
+		added, removed = churn()
+		assert.Equal(t, float64(1), added)
+		assert.Zero(t, removed)
+
+		// The first refresh after RemoveNode may fail while the client still
+		// holds a connection to the departed node. A failed refresh keeps the
+		// previous snapshot, so it must not count as churn. Refresh until the
+		// pool drops the node, then check the removal is counted exactly once.
+		require.NoError(t, cluster.RemoveNode(newNode))
+		for range 5 {
+			if !slices.Contains(c.pool.Agents(), newNode) {
+				break
+			}
+			refreshOnce()
+			if slices.Contains(c.pool.Agents(), newNode) {
+				_, removed = churn()
+				assert.Zero(t, removed, "no churn while the pool still holds the node")
+			}
+		}
+		require.NotContains(t, c.pool.Agents(), newNode)
+		added, removed = churn()
+		assert.Equal(t, float64(1), added)
+		assert.Equal(t, float64(1), removed)
+
+		// Further unchanged refreshes add nothing.
+		refreshOnce()
+		added, removed = churn()
+		assert.Equal(t, float64(1), added)
+		assert.Equal(t, float64(1), removed)
+	})
+}
+
 func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		reg := prometheus.NewPedanticRegistry()

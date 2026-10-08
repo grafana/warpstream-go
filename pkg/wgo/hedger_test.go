@@ -305,6 +305,8 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		// The fallback won the race; the canceled primary leg emits nothing.
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("primary fails with retriable error: cascade to secondary", func(t *testing.T) {
@@ -333,6 +335,8 @@ func TestHedger_ProduceSync(t *testing.T) {
 		count, sum := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), count)
 		assert.Equal(t, float64(2), sum)
+		// A failed primary that the cascade recovered is not a final failure.
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("hedge timer fires and secondary wins: hedgeWinsTotal incremented", func(t *testing.T) {
@@ -357,6 +361,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		}, time.Second, 10*time.Millisecond)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("hedge timer fires but primary wins the race: hedgeAttemptsTotal++ but no hedgeWinsTotal", func(t *testing.T) {
@@ -461,6 +466,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Contains(t, callIDs, secondaryB)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("single-agent cluster (no secondaries): primary error propagates", func(t *testing.T) {
@@ -709,6 +715,8 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 		require.NoError(t, capture.get(topic, partition).err,
 			"primary's slow but successful probe must be honoured even when the racing-variant fallback returned an empty result")
+		// The fallback's exhausted stop is dropped because the primary then succeeded.
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("both legs fail with retriable errors: surfaces the last error", func(t *testing.T) {
@@ -908,6 +916,10 @@ func TestHedger_ProduceSync(t *testing.T) {
 			"got %v", err)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		// Both legs failed: exactly one outcome, taken from the fallback's stop.
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeCandidatesExhausted: 1,
+		})
 	})
 
 	t.Run("racing path: fallback exhausts before primary returns → fallback kerr preserved", func(t *testing.T) {
@@ -934,6 +946,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.ErrorIs(t, err, kerr.NotLeaderForPartition, "got %v", err)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeCandidatesExhausted: 1,
+		})
 	})
 
 	t.Run("ctx canceled mid-fallback: result surfaces ctx err, not synthesized timeout", func(t *testing.T) {
@@ -1031,6 +1046,8 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}
 			return false
 		}, time.Second, 10*time.Millisecond, "primary leg was not canceled after fallback won")
+		// The canceled primary leg is a loser, not a failed produce.
+		assertFinalOutcomes(t, m, nil)
 	})
 
 	t.Run("returns error when a routed partition's nodeID disagrees with primaryID", func(t *testing.T) {

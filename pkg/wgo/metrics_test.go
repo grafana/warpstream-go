@@ -281,7 +281,8 @@ func TestMetrics_ObserveAgentPoolChurn(t *testing.T) {
 
 	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, nil, []int32{1, 2}, nil)
 	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2}, []int32{1, 2}, nil)
-	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, []int32{1}, []int32{1}, assert.AnError)
+	// A failed refresh reports no churn even if the sets happen to differ.
+	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, []int32{1}, []int32{1, 9}, assert.AnError)
 	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2, 3}, []int32{1, 4}, nil)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
