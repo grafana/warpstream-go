@@ -260,6 +260,9 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 
 			hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
 			result := selectProduceResult(primaryResult, hedged.result)
+			if hedged.result.succeeded() {
+				h.observeHedgeWin(hedgeTriggerPrimaryFailure)
+			}
 			observeAttempts(result, hedged.attempts, hedged.stop)
 			return result
 		case <-timer.C:
@@ -277,8 +280,19 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 
 	hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
 	result := selectProduceResult(primaryResult, hedged.result)
+	if hedged.result.succeeded() {
+		h.observeHedgeWin(hedgeTriggerPrimaryFailure)
+	}
 	observeAttempts(result, hedged.attempts, hedged.stop)
 	return result
+}
+
+// observeHedgeWin counts a cascade whose result was the one returned. It runs
+// in the owning invocation, after the winner is chosen, because a fallback that
+// finishes successfully can still lose the race to the primary.
+func (h *Hedger) observeHedgeWin(trigger hedgeTrigger) {
+	h.metrics.hedgeWinsTotal.Inc()
+	h.metrics.hedgeTriggerWins[trigger].Inc()
 }
 
 func (h *Hedger) observeProduceFinalOutcome(stop produceStop) {
@@ -321,6 +335,20 @@ func classifyProduceStop(terminal bool, terminalErr, ctxErr error, exhausted boo
 	return produceStopNone
 }
 
+// ctxStopErr is ctx.Err(), except that a deadline already reached counts even
+// if its timer has not fired yet. The write timeout and the per-attempt deadline
+// are equal by default, so a timed-out attempt can return just before the work
+// context reports its own expiry.
+func ctxStopErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []encodedTopicPartitionRecords) ProduceResult {
 	if res.err != nil {
 		return res
@@ -361,6 +389,9 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		// Primary failed; the fallback's view supersedes primary's
 		// (per-partition errors are equivalent or richer there).
 		fb := <-fallbackCh
+		if fb.result.succeeded() {
+			h.observeHedgeWin(trigger)
+		}
 		return hedgerProduceResult{
 			result:   selectProduceResult(primaryResult, fb.result),
 			attempts: fb.attempts,
@@ -368,19 +399,27 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		}
 	case fb := <-fallbackCh:
 		if fb.result.succeeded() {
+			h.observeHedgeWin(trigger)
 			return fb
 		}
 		// Fallback failed (e.g. exhausted candidates) — the primary may
 		// still produce a usable outcome, so let it finish. If the primary
 		// then succeeds it won on its single attempt (depth 1). When the
 		// fallback failed too the depth-1 label is best-effort: the
-		// fallback's wave count isn't surfaced on this branch. The stop is
-		// the fallback's and only matters if the merged result still fails.
-		return hedgerProduceResult{
-			result:   selectProduceResult(<-primaryCh, fb.result),
-			attempts: 1,
-			stop:     fb.stop,
+		// fallback's wave count isn't surfaced on this branch.
+		result := selectProduceResult(<-primaryCh, fb.result)
+		stop := fb.stop
+		// Exhausting candidates early leaves the primary running until the work
+		// context ends, and that ending, not the exhaustion, is why this failed.
+		if stop == produceStopCandidatesExhausted && !result.succeeded() {
+			switch err := ctxStopErr(workCtx); {
+			case errors.Is(err, context.DeadlineExceeded):
+				stop = produceStopWriteTimeout
+			case errors.Is(err, context.Canceled):
+				stop = produceStopCanceled
+			}
 		}
+		return hedgerProduceResult{result: result, attempts: 1, stop: stop}
 	}
 }
 
@@ -392,15 +431,6 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, trigger hedgeTrigger) (out hedgerProduceResult) {
 	h.metrics.hedgeAttemptsTotal.Inc()
 	h.metrics.hedgeTriggers[trigger].Inc()
-	// Count a win only when the result is successful AND we weren't
-	// preempted by ctx cancellation (e.g. the racing variant aborting
-	// the fallback because the primary won).
-	defer func() {
-		if out.result.succeeded() && workCtx.Err() == nil {
-			h.metrics.hedgeWinsTotal.Inc()
-			h.metrics.hedgeTriggerWins[trigger].Inc()
-		}
-	}()
 
 	acc, err := newProduceResultAccumulator(partitions)
 	if err != nil {
@@ -446,7 +476,7 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 		out.result.err = ctxErr
 	}
 	terminal, terminalErr := acc.terminalErr()
-	out.stop = classifyProduceStop(terminal, terminalErr, ctxErr, exhausted)
+	out.stop = classifyProduceStop(terminal, terminalErr, ctxStopErr(workCtx), exhausted)
 	return out
 }
 

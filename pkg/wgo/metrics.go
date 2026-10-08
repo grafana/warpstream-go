@@ -253,7 +253,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_final_outcome_total",
-		Help: "Why one nonempty Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the Hedger work budget expired and that expiry is the returned failure), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is included here and excluded from warpstream_produce_requests_attempts.",
+		Help: "Why a Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.",
 	}, []string{"reason"})
 
 	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
@@ -350,7 +350,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}, []string{"reason"}),
 		agentPoolExcludedLeaders: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "warpstream_agentpool_excluded_leaders",
-			Help: "Number of partitions whose named leader NodeID was absent from the broker list of the last successful Metadata refresh, so the AgentPool excluded that leader. While the pool has any agent, these partitions route to a stand-in; with an empty broker list they are rejected instead. 0 when no leader is excluded. Set on every successful refresh, including the constructor refresh; a failed refresh keeps the previous value. Topic-level Metadata errors and a partition Leader below 0 are not counted.",
+			Help: "Number of partitions whose named leader NodeID was absent from the broker list of the last successful Metadata refresh, so the AgentPool excluded that leader. Produces to these partitions go to a stand-in while the pool has any agent; with an empty broker list they are rejected instead. 0 when no leader is excluded. Set on every successful refresh, including the constructor refresh; a failed refresh keeps the previous value. Topic-level Metadata errors and a partition Leader below 0 are not counted.",
 		}),
 		metadataRefreshResultsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_metadata_refresh_results_total",

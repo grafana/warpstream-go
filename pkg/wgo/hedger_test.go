@@ -39,7 +39,7 @@ func assertFinalOutcomes(t *testing.T, m *metrics, want map[produceFinalOutcome]
 		produceFinalOutcomeInternalError,
 	}
 	for _, reason := range reasons {
-		assert.Equal(t, want[reason], testutil.ToFloat64(m.produceFinalOutcome[reason]))
+		assert.Equal(t, want[reason], testutil.ToFloat64(m.produceFinalOutcome[reason]), "final outcome reason %d", reason)
 	}
 }
 
@@ -1009,6 +1009,60 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assertTriggerWins(t, m, nil)
 	})
 
+	t.Run("racing path: fallback exhausts then the primary hits the work deadline is a write timeout", func(t *testing.T) {
+		// The fallback tries the one secondary and exhausts quickly, leaving
+		// the primary to run out the clock. The deadline is why this failed.
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 10 * time.Second
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		capture := newResultCapture()
+		runHedger(h, ctx, makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeWriteTimeout: 1,
+		})
+		assertTriggerWins(t, m, nil)
+	})
+
+	t.Run("racing path: fallback exhausts then the caller cancels while the primary runs: no final outcome", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 10 * time.Second
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// The secondary fails within milliseconds, so the cascade has
+		// exhausted its candidates well before the cancel.
+		time.AfterFunc(150*time.Millisecond, cancel)
+		capture := newResultCapture()
+		runHedger(h, ctx, makeReq(capture))
+
+		// The caller still sees the fallback's last error from the merged response.
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assertFinalOutcomes(t, m, nil)
+		assertTriggerWins(t, m, nil)
+	})
+
 	t.Run("ctx canceled mid-fallback: result surfaces ctx err, not synthesized timeout", func(t *testing.T) {
 		// Primary fails immediately so we cascade into runHedgingAttempts.
 		// The fallback agent blocks forever; cancelling the caller's ctx
@@ -1600,6 +1654,128 @@ func TestHedger_AttemptPayloadCountsMergedHedgeFlush(t *testing.T) {
 	assertAttemptPayload(t, m, sent[attemptPrimary], sent[attemptHedge])
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsHedgeTotal))
 	assert.Equal(t, float64(2), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+}
+
+// deadlineCtx reports a fixed deadline without ever arming its timer, like a
+// context whose deadline has been reached but whose timer has not fired yet.
+type deadlineCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c deadlineCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestCtxStopErr(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.NoError(t, ctxStopErr(context.Background()), "no deadline, not done")
+	assert.ErrorIs(t, ctxStopErr(canceled), context.Canceled)
+	assert.NoError(t, ctxStopErr(deadlineCtx{context.Background(), time.Now().Add(time.Hour)}), "deadline not reached")
+	assert.ErrorIs(t,
+		ctxStopErr(deadlineCtx{context.Background(), time.Now().Add(-time.Millisecond)}),
+		context.DeadlineExceeded, "deadline reached before its timer fired")
+	assert.ErrorIs(t, ctxStopErr(deadlineCtx{canceled, time.Now().Add(-time.Millisecond)}), context.Canceled,
+		"an explicit cancel is reported as a cancel, not a deadline")
+}
+
+// TestHedger_WinCountMatchesSelectedResult releases a primary and a fallback
+// that both succeed, one after the other in either order, and checks a win is
+// counted exactly when the returned result is the fallback's. The loser is held
+// inside the producer, ignoring the work context, so it finishes successfully
+// after the owner has returned and must not count.
+func TestHedger_WinCountMatchesSelectedResult(t *testing.T) {
+	const (
+		topic         = "t"
+		partition     = int32(0)
+		primary       = int32(100)
+		fallback      = int32(101)
+		primaryOffset = int64(1000)
+		fallbackOff   = int64(2000)
+	)
+	strategy := &mockPartitionAssignmentStrategy{
+		candidates: map[partitionKey][]Agent{{topic, partition}: {
+			{NodeID: primary, State: AgentStateDemoted},
+			{NodeID: fallback, State: AgentStateHealthy},
+		}},
+	}
+	tracker := NewAverageAgentStatsTracker()
+	nowNs := time.Now().UnixNano()
+	for _, id := range []int32{primary, fallback} {
+		seedFullWindow(tracker, id, nowNs, 20, 1, 0)
+	}
+	health := HealthCheckConfig{SlowMultiplier: 2.0, MaxSlowFraction: 0.3, FaultyThreshold: 0.05, MaxFaultyFraction: 0.3}
+	cfg := HedgerConfig{MinHedgeDelay: time.Hour, MaxHedgeAgents: 2}
+
+	for _, fallbackFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("fallbackFirst=%v", fallbackFirst), func(t *testing.T) {
+			gates := map[int32]chan struct{}{primary: make(chan struct{}), fallback: make(chan struct{})}
+			entered := map[int32]chan struct{}{primary: make(chan struct{}, 1), fallback: make(chan struct{}, 1)}
+
+			producer := newMockDirectProducer()
+			// respFn takes no context, so a held call completes successfully
+			// even after the work context is canceled.
+			producer.respFn = func(nodeID int32, _ []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) {
+				entered[nodeID] <- struct{}{}
+				<-gates[nodeID]
+				offset := primaryOffset
+				if nodeID == fallback {
+					offset = fallbackOff
+				}
+				return &kmsg.ProduceResponse{Topics: []kmsg.ProduceResponseTopic{{
+					Topic:      topic,
+					Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: partition, BaseOffset: offset}},
+				}}}, nil
+			}
+
+			m := newMetrics(prometheus.NewPedanticRegistry())
+			h := NewHedger(producer, tracker, strategy, health, cfg, 0, 1<<20, m, nil)
+			t.Cleanup(h.Close)
+
+			// A demoted primary starts the fallback immediately.
+			part := routedHedgeRecord(topic, partition, primary, "v", nil)
+			part.item.nodeState = AgentStateDemoted
+			resCh := make(chan ProduceResult, 1)
+			go func() {
+				resCh <- h.ProduceSync(context.Background(), primary, unpromise([]promised[routedEncodedTopicPartitionRecords]{part}))
+			}()
+
+			// Both legs are in flight before either is released.
+			for _, id := range []int32{primary, fallback} {
+				select {
+				case <-entered[id]:
+				case <-time.After(time.Second):
+					t.Fatalf("agent %d was never called", id)
+				}
+			}
+
+			winner, loser := primary, fallback
+			wantOffset, wantWins := primaryOffset, float64(0)
+			if fallbackFirst {
+				winner, loser = fallback, primary
+				wantOffset, wantWins = fallbackOff, 1
+			}
+			close(gates[winner])
+			res := <-resCh
+			require.NoError(t, res.error())
+			assert.Equal(t, wantOffset, res.resp.Topics[0].Partitions[0].BaseOffset)
+
+			// The loser now completes successfully, after the owner returned.
+			close(gates[loser])
+			require.Eventually(t, func() bool {
+				for _, call := range producer.recordedCalls() {
+					if call.nodeID == loser && call.err == nil {
+						return true
+					}
+				}
+				return false
+			}, time.Second, time.Millisecond, "the losing leg must finish successfully")
+			h.Close()
+
+			assert.Equal(t, wantWins, testutil.ToFloat64(m.hedgeWinsTotal))
+			assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerDemotedProbe: wantWins})
+		})
+	}
 }
 
 func TestMaxFractionFloor(t *testing.T) {
