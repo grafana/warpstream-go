@@ -47,9 +47,10 @@ identical without a duplicate registration.
 ## 3. Warpstream-specific metrics — `warpstream_` prefix
 
 Metrics with no franz-go counterpart describe behaviour unique to this client:
-hedging, agent demotion, direct-request and attempt accounting, and
-client-boundary record counters. They carry a `warpstream_` prefix so they never
-collide with franz-go/kprom names and are unambiguously backend-specific.
+hedging, agent demotion, leaders excluded from the broker list, direct-request
+and attempt accounting, and client-boundary record counters. They carry a
+`warpstream_` prefix so they never collide with franz-go/kprom names and are
+unambiguously backend-specific.
 
 ## 4. Build info — `warpstream_client_build_info`
 

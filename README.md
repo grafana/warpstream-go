@@ -26,7 +26,7 @@ This client has been designed around the following non-negotiable assumptions:
 1. **Warpstream-specific.** Hedging the same batch across agents only works because any agent can serve any partition. Pointed at vanilla Kafka, the secondary leg would fail with `NotLeaderForPartition`.
 2. **At-least-once delivery only.** Duplicates are tolerable. Any code that assumes exactly-once or in-partition record ordering must stay on franz-go.
 3. **No transactional or idempotent producer support.** `DisableIdempotentWrite()` semantics are baked in — no `producerId`/`producerEpoch`/`baseSequence` handshake.
-4. **Produce never blocks on Metadata.** The agent pool is refreshed on a timer and also on-demand when routing finds no candidate. The current Produce call still fails immediately rather than waiting for the fetch; a later Produce can use the updated pool. On-demand refreshes are coalesced and paced by `OnDemandMetadataRefreshInterval` (default 1s) to avoid request storms.
+4. **Produce never blocks on Metadata.** The agent pool is refreshed on a timer and also on demand. A routing miss fails that Produce immediately and asks for a refresh; a later Produce can use the updated pool. A refresh that excluded a leader asks for another fetch on its own, with no Produce in flight. Those follow-ups start at `OnDemandMetadataRefreshInterval` (default 1s) and double up to `MetadataRefreshInterval` (default 10s) while the exclusion continues. The chain stops when a refresh excludes nobody: that fetch does not ask for another, the periodic refresh runs, and the gap returns to the floor. Neither the Produce nor the follow-up waits on the fetch. On-demand refreshes are coalesced.
 5. **No custom partitioner.** wgo has no default partitioning logic and does not accept a custom `kgo.Partitioner`. The caller must set `record.Partition` on every record before calling Produce. An unset `Partition` field silently routes to partition 0.
 
 ## How it works
@@ -49,18 +49,24 @@ For every record the client asks a `PartitionAssignmentStrategy` for an ordered 
 - **Deterministic.** Given the same Metadata view, every client instance picks the same primary and the same secondary for a given partition. Hedge load is predictable and analysable instead of randomly smeared across agents.
 - **State-aware.** A wrapper around the base strategy (the **Demoter**, see below) can mark an agent as demoted so it's elided from the candidate list or surfaced as a probe.
 
+A partition's leader can briefly go missing from that map during a Metadata refresh, even though nothing is actually wrong. When the topic is known and the partition is within the range Metadata has actually reported for that topic, the client picks a live agent for that partition instead of treating it as unroutable — any agent can serve any partition that exists. That call succeeds without waiting. The refresh that excluded the leader asks for another fetch on its own, even when no Produce is in flight. Further exclusions double the wait from `OnDemandMetadataRefreshInterval` up to `MetadataRefreshInterval`. Repeated routing misses climb the same way. While on-demand refreshes keep being requested, the periodic refresh does not run, so the gap stays at the ceiling until they stop. A refresh that excludes nobody stops the follow-ups, and the next periodic refresh puts the wait back. A topic is known when another partition still has a leader, and also when this refresh listed the topic's partitions and kept none of the leaders it named. A partition Metadata reported with no leader (`Leader` below 0) is left unroutable, including when a sibling partition still has one, so that produce fails and still gets an on-demand refresh. A topic that has never appeared in Metadata, or that came back with an error, is left alone for the same reason. A partition index Metadata has never reported at any partition count for that topic — negative, or genuinely nonexistent — is left unroutable too, rather than guessed: no agent anywhere owns a partition that doesn't exist, so guessing there would only cost a wire round trip certain to fail, and that rejection still asks for an on-demand refresh like the cases above. A later refresh that grows the topic's partition count (for example via WarpStream's partition auto-scaler) makes that index routable the same way a newly-created topic becomes known.
+
+`Produce` rejects only the record whose partition has no candidate. `ProduceSync` does the same within one call: a partition with a candidate is buffered and the call waits for it, and a partition with no candidate is rejected on its own and is not sent. That rejection does not fail the other records.
+
 ### Buffering: linger by destination agent, not by partition
 
 Records are buffered through a `ClusterRecordBuffer`, which bins them by the destination agent picked at routing time, then through a per-agent `AgentRecordBuffer`, which applies a configurable linger window before flushing. Each flush ships one Produce request to one agent carrying batches for as many partitions as the buffer accumulated.
 
 Linger by agent (not by partition) is what lets a single wire request fan out across many partitions, and what makes the hedge cascade efficient: a hedge wave sends one request per fallback-agent too, not one per partition.
 
+One `ProduceSync` call that puts more than `BatchMaxBytes` on a single partition is split across flushes and completed once. The call fails if any of those flushes fails that partition. Another partition in the same flush does not decide it.
+
 ### Hedger: race the primary against a fallback
 
 When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which decides whether to race the primary against a secondary agent. Per call it produces one of three outcomes:
 
 - **Primary wins outright.** The primary leg returns first with a clean result; we surface it and the secondary never fires.
-- **Primary fails, cascade retries.** A leg counts as failed if *any* partition in its response errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling fails). The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
+- **Primary fails, cascade retries.** A leg counts as failed if *any* partition it sent errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling from the same call fails). Hedge legs from concurrent calls to the same agent can share one flush; each leg reads only the partitions it sent, so another call's outcome never resolves or fails it. The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
 - **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins, and the loser is cancelled.
 
 Before accepting a primary response, the Hedger checks that it includes every requested topic-partition. An incomplete response triggers the existing retry path and logs a warning with the agent ID and first missing topic-partition, even if a retry succeeds. Partitions still unacknowledged after retries are exhausted are reported as failed.
@@ -101,8 +107,10 @@ The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequ
 
 The client accepts [franz-go hooks](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Hook)
 via `WithHooks`, so you can attach your own metrics, tracing, or connection
-instrumentation. Some produce hooks are intentionally not invoked — see
-[Known differences from franz-go](#known-differences-from-franz-go).
+instrumentation. However, the following hooks are currently **not supported**:
+
+- `HookProduceBatchWritten`
+- `HookProduceRecordPartitioned`
 
 ### Tracing
 
@@ -113,17 +121,6 @@ tracer starts a producer span and injects the trace-context header into the reco
 record carries the trace to downstream consumers; the span ends when the produce is
 acknowledged or fails. Consume-side tracing works through the embedded client with no extra
 wiring. See [`docs/internal/tracing.md`](docs/internal/tracing.md) for the design.
-
-## Known differences from franz-go
-
-`wgo` aims to be a drop-in for a franz-go producer on the produce path, but currently a few
-known behaviours differ:
-
-| Area | Difference |
-| --- | --- |
-| Produce hooks | `HookProduceBatchWritten` and `HookProduceRecordPartitioned` are never invoked. |
-| `Record.Offset` | Not populated on the returned record (left `0`); franz-go stamps the assigned offset on a successful produce. |
-| `Record.Attrs` compression type | `Record.Attrs.CompressionType()` reflects the compression chosen when the record was first encoded, which can differ from the batch it was actually written in: batches are split when a single `ProduceSync` call exceeds `BatchMaxBytes` for one partition, and a hedge attempt can re-merge concurrent same-partition batches and re-encode. The timestamp type is always accurate. |
 
 ## FAQ
 

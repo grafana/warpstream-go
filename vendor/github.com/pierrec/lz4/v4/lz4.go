@@ -154,6 +154,4 @@ const (
 	ErrOptionNotApplicable = lz4errors.ErrOptionNotApplicable
 	// ErrWriterNotClosed is returned when attempting to reset an unclosed writer.
 	ErrWriterNotClosed = lz4errors.ErrWriterNotClosed
-	// ErrWriterClosed is returned when writing to a closed writer.
-	ErrWriterClosed = lz4errors.ErrWriterClosed
 )

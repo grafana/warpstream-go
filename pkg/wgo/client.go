@@ -121,7 +121,8 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 
 	m := newMetrics(reg)
 	pool := NewAgentPool(kgoClient)
-	if _, err := pool.Refresh(context.Background()); err != nil {
+	_, dropped, err := pool.refresh(context.Background())
+	if err != nil {
 		kgoClient.Close()
 		return nil, fmt.Errorf("initial agent pool refresh: %w", err)
 	}
@@ -150,6 +151,9 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		refreshCancel:  refreshCancel,
 		refreshNowCh:   make(chan struct{}, 1),
 	}
+	// Count a dropped leader and do not nudge: the refresh goroutine starts below.
+	// The periodic tick fetches the next snapshot.
+	c.noteLeaderDrops(dropped, false)
 	// Demoter sits on top of the lazy pool strategy so refresh-driven
 	// agent-pool changes flow through transparently while the Demoter's
 	// per-agent probe-timing state persists across refreshes.
@@ -178,19 +182,16 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	// Seed the record's parent context (like franz-go).
 	ensureRecordContext(record, ctx)
 
-	// Fire the buffered hook (which may inject a trace header) before any rejection.
+	// Fire the buffered hook (which may inject a trace header) before any rejection,
+	// and wrap the promise so the unbuffered hook fires just before the caller sees
+	// the outcome on every path.
 	if c.produceHooks.enabled() {
 		c.produceHooks.fireBuffered(record)
-	}
-
-	// Wrap the promise once: every path below invokes it, so this stamps the
-	// produce-result fields and fires the unbuffered hook on every completion.
-	// Order matches franz-go: set fields, then unbuffered hook, then user promise.
-	userPromise := promise
-	promise = func(r *kgo.Record, err error) {
-		setProducedRecordFields(r)
-		c.produceHooks.fireUnbuffered(r, err)
-		userPromise(r, err)
+		userPromise := promise
+		promise = func(r *kgo.Record, err error) {
+			c.produceHooks.fireUnbuffered(r, err)
+			userPromise(r, err)
+		}
 	}
 
 	c.metrics.produceRecordsTotal.Inc()
@@ -202,12 +203,10 @@ func (c *WarpstreamClient) Produce(ctx context.Context, record *kgo.Record, prom
 	}
 
 	routed, err := c.routeRecord(record, func(res ProduceResult) {
+		// Post-dispatch failure counts on any non-nil error; the pre-dispatch
+		// rejections are counted by produceRecordsRejectedTotal.
 		resErr := recordErrFromResult(res, record.Topic, record.Partition)
-		if resErr == nil {
-			record.Attrs = producedRecordAttrs(res, record.Topic, record.Partition)
-		} else {
-			// Post-dispatch failure counts on any non-nil error; the pre-dispatch
-			// rejections are counted by produceRecordsRejectedTotal.
+		if resErr != nil {
 			c.metrics.produceRecordsFailedTotal.Inc()
 		}
 		promise(record, resErr)
@@ -253,20 +252,17 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 
 	results := make(kgo.ProduceResults, len(records))
 
-	// Set the produce-result fields on every record and fire the unbuffered hook
-	// (when set) from this goroutine, in input order, just before returning.
-	//
-	// Every return path below fully populates results first, so there's no race
-	// accessing the "results" slice, and the error set for each record is a terminal
-	// one.
-	defer func() {
-		for i, r := range records {
-			setProducedRecordFields(r)
-			if hasProduceHooks {
+	// Fire the unbuffered hook for each record from this goroutine, in input order,
+	// just before returning. Every return path below fully populates results first
+	// (wg.Wait blocks until the async completions have run), so the terminal error
+	// is final here. Mirrors franz-go's "unbuffered hook, then the record's outcome".
+	if hasProduceHooks {
+		defer func() {
+			for i, r := range records {
 				c.produceHooks.fireUnbuffered(r, results[i].Err)
 			}
-		}
-	}()
+		}()
+	}
 
 	var (
 		okRecords []*kgo.Record
@@ -287,41 +283,58 @@ func (c *WarpstreamClient) ProduceSync(ctx context.Context, records []*kgo.Recor
 	}
 
 	wg.Add(len(okRecords))
+	// Last input index for each pointer. Completions write that slot only.
 	indexOf := make(map[*kgo.Record]int, len(okRecords))
 	for _, idx := range okIndices {
 		indexOf[records[idx]] = idx
 	}
+	// A repeated pointer shares that slot's outcome. Copy it to the other
+	// positions on return, before the unbuffered hooks above.
+	if len(indexOf) < len(okRecords) {
+		defer func() {
+			for _, idx := range okIndices {
+				canon := indexOf[records[idx]]
+				if idx != canon {
+					results[idx] = results[canon]
+				}
+			}
+		}()
+	}
+	write := func(recs []*kgo.Record, err error) {
+		for _, r := range recs {
+			results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
+			wg.Done()
+		}
+	}
 
-	routed, err := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
-		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, groupRecords, func(err error) {
+	routed, rejected := c.routeRecords(okRecords, func(groupRecords []*kgo.Record) func(ProduceResult) {
+		return perPartitionDone(groupRecords[0].Topic, groupRecords[0].Partition, func(err error) {
 			if err != nil {
 				// Post-dispatch failure, resolved uniformly for the whole
 				// partition group; pre-dispatch rejections never reach here.
 				c.metrics.produceRecordsFailedTotal.Add(float64(len(groupRecords)))
 			}
-			for _, r := range groupRecords {
-				results[indexOf[r]] = kgo.ProduceResult{Record: r, Err: err}
-				wg.Done()
-			}
+			write(groupRecords, err)
 		})
 	})
-	if err != nil {
-		// One record had no known candidate. Fail the whole batch
-		// uniformly: every ok record gets the same error.
-		c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(okIndices)))
-		c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Inc()
-		for _, i := range okIndices {
-			results[i] = kgo.ProduceResult{Record: records[i], Err: err}
+
+	if len(rejected) > 0 {
+		for _, rg := range rejected {
+			c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned).Add(float64(len(rg.records)))
+			c.metrics.produceFinalOutcome[produceFinalOutcomeNoAgentAssigned].Inc()
+			write(rg.records, rg.err)
 		}
+	}
+	if len(routed) == 0 {
 		return results
 	}
 
-	// Stamp each record's produce time only after routing succeeds, so a failed
-	// produce leaves the caller's records unchanged. A single now keeps records
-	// buffered together on one produce timestamp. Mirrors franz-go's bufferRecord.
+	// Stamp only accepted records with unset timestamps, using one shared now.
 	now := time.Now()
-	for _, r := range okRecords {
-		ensureRecordTimestamp(r, now)
+	for _, g := range routed {
+		for _, r := range g.item.records {
+			ensureRecordTimestamp(r, now)
+		}
 	}
 
 	c.buffer.MultiAdd(ctx, routed)
@@ -350,22 +363,7 @@ func (c *WarpstreamClient) flushBatch(ctx context.Context, nodeID int32, partiti
 
 	flushCtx, cancel := context.WithTimeout(ctx, c.cfg.WriteTimeout)
 	defer cancel()
-	res := c.hedger.ProduceSync(flushCtx, nodeID, encoded)
-
-	// Attach each partition's compression type so the completion path can set
-	// Record.Attrs.
-	//
-	// Record.Attrs are NOT here to avoid a race condition: a ctx-cancel fires
-	// the Produce promise from another goroutine while this flush goroutine could
-	// still run, so writing the record here would race.
-	if len(encoded) > 0 {
-		res.compressionTypes = make(map[topicPartition]uint8, len(encoded))
-		for _, e := range encoded {
-			res.compressionTypes[topicPartition{topic: e.topic, partition: e.partition}] = e.compressionType
-		}
-	}
-
-	return res
+	return c.hedger.ProduceSync(flushCtx, nodeID, encoded)
 }
 
 // BufferedProduceBytes returns the bytes of all records awaiting ack.
@@ -398,6 +396,35 @@ func (c *WarpstreamClient) Close() {
 	})
 }
 
+// refreshBackoff paces on-demand Metadata fetches. The delay starts at floor,
+// grows after each on-demand fetch up to ceiling, and returns to floor when a
+// periodic fetch runs.
+type refreshBackoff struct {
+	floor   time.Duration
+	ceiling time.Duration
+	delay   time.Duration
+}
+
+func newRefreshBackoff(floor, ceiling time.Duration) refreshBackoff {
+	return refreshBackoff{floor: floor, ceiling: ceiling, delay: floor}
+}
+
+func (b *refreshBackoff) current() time.Duration { return b.delay }
+
+func (b *refreshBackoff) advance() {
+	// time.Duration is an int64. Doubling past MaxInt64 wraps negative.
+	// At or below half the ceiling, delay*2 still fits and stays within it.
+	if b.delay > b.ceiling/2 {
+		b.delay = b.ceiling
+		return
+	}
+	b.delay *= 2
+}
+
+func (b *refreshBackoff) reset() {
+	b.delay = b.floor
+}
+
 // startBackgroundRefresh owns every post-startup AgentPool.Refresh: the
 // periodic ticker and on-demand nudges from triggerRefresh. One owner means
 // Refresh is never concurrent. refreshCtx (cancelled by Close) stops the loop,
@@ -410,20 +437,42 @@ func (c *WarpstreamClient) startBackgroundRefresh() {
 		defer c.refreshWG.Done()
 		ticker := time.NewTicker(c.cfg.MetadataRefreshInterval)
 		defer ticker.Stop()
+		backoff := newRefreshBackoff(c.cfg.OnDemandMetadataRefreshInterval, c.cfg.MetadataRefreshInterval)
 		for {
+			periodic := false
 			select {
 			case <-c.refreshCtx.Done():
 				return
 			case <-c.refreshNowCh:
-				ticker.Reset(c.cfg.MetadataRefreshInterval)
-				startedAt := time.Now()
-				c.refreshPool(metadataRefreshTriggerOnDemand)
-				if !c.waitRefreshCooldown(time.Since(startedAt)) {
+			case <-ticker.C:
+				// A nudge queued at the same instant wins. At the ceiling the
+				// cooldown ends as the tick lands, and taking the tick would
+				// reset the delay.
+				select {
+				case <-c.refreshNowCh:
+				default:
+					periodic = true
+				}
+			}
+
+			if periodic {
+				c.refreshPool(metadataRefreshTriggerPeriodic)
+				// A nudge queued during this fetch must not start another after Close.
+				if c.refreshCtx.Err() != nil {
 					return
 				}
-			case <-ticker.C:
-				c.refreshPool(metadataRefreshTriggerPeriodic)
+				backoff.reset()
+				continue
 			}
+			ticker.Reset(c.cfg.MetadataRefreshInterval)
+			startedAt := time.Now()
+			c.refreshPool(metadataRefreshTriggerOnDemand)
+			c.waitRefreshCooldown(backoff.current(), time.Since(startedAt))
+			// Return before select can take the nudge the fetch just queued.
+			if c.refreshCtx.Err() != nil {
+				return
+			}
+			backoff.advance()
 		}
 	}()
 }
@@ -441,7 +490,7 @@ func (c *WarpstreamClient) triggerRefresh() {
 // and leave the previous snapshot in place.
 func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	before := c.pool.Agents()
-	removed, err := c.pool.Refresh(c.refreshCtx)
+	removed, dropped, err := c.pool.refresh(c.refreshCtx)
 	c.metrics.observeMetadataRefresh(trigger, before, c.pool.Agents(), err)
 	if err != nil {
 		log(c.logger, kgo.LogLevelWarn, "warpstream client metadata refresh failed", "err", err)
@@ -451,63 +500,107 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 		c.tracker.PurgeAgents(removed)
 	}
 	c.demoter.Refresh(c.pool.Agents())
+	// Nudge so a stand-in does not wait for the next periodic tick. Produce does
+	// not block. The refresh loop paces the follow-up.
+	c.noteLeaderDrops(dropped, true)
 }
 
-// waitRefreshCooldown enforces the configured minimum between on-demand
-// refresh start times. Time spent fetching already counts toward the interval.
-// Returns false during close so the refresh loop exits without spinning.
-func (c *WarpstreamClient) waitRefreshCooldown(elapsed time.Duration) bool {
-	remaining := c.cfg.OnDemandMetadataRefreshInterval - elapsed
+// noteLeaderDrops counts and logs excluded leaders. nudge asks for another fetch.
+func (c *WarpstreamClient) noteLeaderDrops(dropped leaderDrops, nudge bool) {
+	if dropped.Count == 0 {
+		return
+	}
+	c.metrics.agentPoolLeaderDroppedTotal.Add(float64(dropped.Count))
+	log(c.logger, kgo.LogLevelWarn, "warpstream agentpool: leaders excluded from map",
+		"count", dropped.Count,
+		"first_topic", dropped.Topic,
+		"first_partition", dropped.Partition,
+		"first_node_id", dropped.NodeID)
+	if nudge {
+		c.triggerRefresh()
+	}
+}
+
+// waitRefreshCooldown sleeps out the rest of delay. Time already spent
+// fetching counts. Close cancels refreshCtx and the wait returns.
+func (c *WarpstreamClient) waitRefreshCooldown(delay, elapsed time.Duration) {
+	remaining := delay - elapsed
 	if remaining <= 0 {
-		return c.refreshCtx.Err() == nil
+		return
 	}
 	t := time.NewTimer(remaining)
 	defer t.Stop()
 	select {
 	case <-c.refreshCtx.Done():
-		return false
 	case <-t.C:
-		return true
 	}
 }
 
-// routeRecords groups records by (topic, partition), stamps each group with
-// its initial destination NodeID and mints the per-group done callback.
-// Returns an error if any record's partition has no known candidate.
-func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]promised[routedTopicPartitionRecords], error) {
+type rejectedTopicPartitionRecords struct {
+	topicPartitionRecords
+	err error
+}
+
+// routeRecords routes each partition once. A partition with no candidate is
+// returned unsent. The first miss requests a metadata refresh.
+func (c *WarpstreamClient) routeRecords(records []*kgo.Record, doneFor func(groupRecords []*kgo.Record) func(ProduceResult)) ([]promised[routedTopicPartitionRecords], []rejectedTopicPartitionRecords) {
 	groups := make(map[topicPartition]*promised[routedTopicPartitionRecords])
 	order := make([]topicPartition, 0)
+	var rejectedByKey map[topicPartition]int
+	var rejected []rejectedTopicPartitionRecords
+
 	for _, r := range records {
 		key := topicPartition{topic: r.Topic, partition: r.Partition}
-		g, ok := groups[key]
-		if !ok {
-			cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
-			if len(cands) == 0 {
-				c.triggerRefresh()
-				return nil, fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition)
-			}
-			g = &promised[routedTopicPartitionRecords]{
-				item: routedTopicPartitionRecords{
-					topicPartitionRecords: topicPartitionRecords{
-						topic:     r.Topic,
-						partition: r.Partition,
-					},
-					nodeID:    cands[0].NodeID,
-					nodeState: cands[0].State,
-				},
-			}
-			groups[key] = g
-			order = append(order, key)
+		if g, ok := groups[key]; ok {
+			g.item.records = append(g.item.records, r)
+			continue
 		}
-		g.item.records = append(g.item.records, r)
+		if rejectedByKey != nil {
+			if i, ok := rejectedByKey[key]; ok {
+				rejected[i].records = append(rejected[i].records, r)
+				continue
+			}
+		}
+
+		cands := c.demoter.Candidates(r.Topic, r.Partition, 1)
+		if len(cands) == 0 {
+			if rejectedByKey == nil {
+				rejectedByKey = make(map[topicPartition]int)
+				c.triggerRefresh()
+			}
+			rejectedByKey[key] = len(rejected)
+			rejected = append(rejected, rejectedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     r.Topic,
+					partition: r.Partition,
+					records:   []*kgo.Record{r},
+				},
+				err: fmt.Errorf("no agent assigned for topic %q partition %d", r.Topic, r.Partition),
+			})
+			continue
+		}
+
+		groups[key] = &promised[routedTopicPartitionRecords]{
+			item: routedTopicPartitionRecords{
+				topicPartitionRecords: topicPartitionRecords{
+					topic:     r.Topic,
+					partition: r.Partition,
+					records:   []*kgo.Record{r},
+				},
+				nodeID:    cands[0].NodeID,
+				nodeState: cands[0].State,
+			},
+		}
+		order = append(order, key)
 	}
+
 	out := make([]promised[routedTopicPartitionRecords], 0, len(order))
 	for _, key := range order {
 		g := groups[key]
 		g.done = doneFor(g.item.records)
 		out = append(out, *g)
 	}
-	return out, nil
+	return out, rejected
 }
 
 // routeRecord is the single-record specialisation of routeRecords: it
@@ -534,23 +627,10 @@ func (c *WarpstreamClient) routeRecord(record *kgo.Record, done func(ProduceResu
 }
 
 // perPartitionDone adapts a batch-wide ProduceResult callback to a
-// per-partition outcome for one (topic, partition). On success it sets Attrs on
-// records.
-func perPartitionDone(topic string, partition int32, records []*kgo.Record, user func(error)) func(ProduceResult) {
+// per-partition outcome for one (topic, partition).
+func perPartitionDone(topic string, partition int32, user func(error)) func(ProduceResult) {
 	return func(res ProduceResult) {
-		err := recordErrFromResult(res, topic, partition)
-		if err == nil {
-			// We set one compression type for the whole group. A group split across
-			// batches (a single call's records for one partition exceeding
-			// BatchMaxBytes) may span batches that compressed differently; that
-			// mismatch is an accepted difference compared to franz-go (see README
-			// "Known differences").
-			attrs := producedRecordAttrs(res, topic, partition)
-			for _, r := range records {
-				r.Attrs = attrs
-			}
-		}
-		user(err)
+		user(recordErrFromResult(res, topic, partition))
 	}
 }
 
@@ -562,12 +642,7 @@ func recordErrFromResult(res ProduceResult, topic string, partition int32) error
 	// a partition that actually succeeded must report success even
 	// when res.err says some peer partition failed.
 	if res.resp == nil {
-		if res.err != nil {
-			return res.err
-		}
-		// No response and no error is not a success; treat it as the empty
-		// result the rest of the package rejects (see ProduceResult.error).
-		return errEmptyProduceResult
+		return res.err
 	}
 	err := partitionErrorFromResp(res.resp, topic, partition)
 	// A retriable kerr surfaced here means the Hedger exhausted its

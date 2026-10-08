@@ -862,7 +862,7 @@ func BenchmarkDemoter_Candidates(b *testing.B) {
 			for p := int32(0); p < sc.numPartitions; p++ {
 				leaders[topicPartition{topic, p}] = p % sc.numAgents
 			}
-			inner := newDefaultPartitionAssignmentStrategy(agents, leaders)
+			inner := newDefaultPartitionAssignmentStrategy(agents, leaders, nil, nil, nil)
 
 			d, _ := newTestDemoter(inner, tracker, health, cfg)
 
