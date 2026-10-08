@@ -40,8 +40,8 @@ const (
 	hedgeTriggerLabelDemotedProbe   = "demoted_probe"
 )
 
-// hedgeCause is why a proactive race is eligible. primary_failure is not a
-// shouldHedge cause; it is assigned when the primary fails before the race.
+// hedgeCause is why shouldHedge allows a proactive race. A cascade that follows
+// a primary failure is not proactive, so it has no cause here.
 type hedgeCause int8
 
 const (
@@ -49,8 +49,8 @@ const (
 	hedgeCauseDemotedProbe
 )
 
-// hedgeDecision is one shouldHedge result: whether a proactive race may
-// start, the delay before it, and which of the two proactive causes applies.
+// hedgeDecision is the result of shouldHedge: whether a proactive race may
+// start, how long to wait before it, and why.
 type hedgeDecision struct {
 	delay    time.Duration
 	eligible bool
@@ -64,9 +64,8 @@ func (d hedgeDecision) trigger() hedgeTrigger {
 	return hedgeTriggerLatency
 }
 
-// produceStop is why a Hedger invocation stopped. It travels with the hedge
-// result and is classified once by the owning ProduceSync. Canceled and none
-// emit no final outcome.
+// produceStop is why a hedge cascade ended. Cancellation is a stop but not a
+// final-outcome reason: the produce still returns the cancel error.
 type produceStop int8
 
 const (
@@ -92,12 +91,11 @@ const (
 //  2. Primary returns first with a failure or partial result → call
 //     runHedgingAttempts, which retries the partitions across other
 //     agents.
-//  3. the hedge decision's delay is already 0, or the hedge timer fires
-//     before the primary returns → call runHedgingAttemptsAndRaceWithPrimary,
-//     which runs the fallback waves alongside the still-in-flight primary
-//     and merges whichever finishes first. A zero delay is either a
-//     demoted-primary probe or a computed delay that landed on zero; the
-//     trigger label comes from the decision, not from the delay value.
+//  3. the hedge decision's delay is 0, or the hedge timer fires before the
+//     primary returns → call runHedgingAttemptsAndRaceWithPrimary, which
+//     runs the fallback waves alongside the still-in-flight primary and
+//     merges whichever finishes first. A zero delay does not imply a probe,
+//     so the trigger is read from the decision.
 //
 // Per-partition fanout lives inside runHedgingAttempt: each wave picks
 // the next per-partition candidate (so partitions whose strategy
@@ -111,10 +109,9 @@ const (
 //     SlowMultiplier). shouldHedge returns eligible=false only when a
 //     suppression gate trips: no agent stats, no cluster stats, or the
 //     cluster slow/faulty fraction is too high to hedge safely.
-//   - shouldHedge's leading check forces an eligible delay of 0 when routing
-//     surfaced primaryID as AgentStateDemoted (a probe). The cause is
-//     demoted_probe, distinct from a healthy primary whose computed delay
-//     is already zero.
+//   - shouldHedge's leading check forces delay=0 with cause demoted_probe: when
+//     routing surfaced primaryID as AgentStateDemoted (a probe), we expect
+//     it to fail, so we don't pay the full delay before the fallback.
 //
 // hedge_wins_total counts every produce whose winning response came from
 // the secondary fanout — both the timer-fired race and cascade retries
@@ -181,9 +178,9 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	}
 
 	// All routed partitions in one call must share primaryID — the buffer
-	// bins by destination nodeID. A mismatch is a routing bug. Count it
-	// once and return before any dispatch or probe consumption. This
-	// failure is excluded from the attempt histogram: no attempt ran.
+	// bins by destination nodeID. A mismatch is a routing bug: fail before
+	// dispatching or consuming a probe, and keep it out of the attempt
+	// histogram since no attempt ran.
 	for _, p := range routedPartitions {
 		if p.nodeID != primaryID {
 			h.metrics.produceFinalOutcome[produceFinalOutcomeInternalError].Inc()
@@ -195,7 +192,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 
 	// observeAttempts records the attempt depth of a resolved produce call,
 	// split by outcome: 1 = resolved on the primary, N = resolved after N-1
-	// hedge waves. A failure emits one final outcome for this invocation.
+	// hedge waves.
 	observeAttempts := func(result ProduceResult, attempts int, stop produceStop) {
 		if result.succeeded() {
 			h.metrics.produceRequestsAttemptsSuccess.Observe(float64(attempts))
@@ -299,10 +296,10 @@ func (h *Hedger) observeProduceFinalOutcome(stop produceStop) {
 	h.metrics.produceFinalOutcome[reason].Inc()
 }
 
-// classifyProduceStop labels the cascade's stop. An already-terminal broker
-// or unknown error wins over a context that expires afterward. Explicit
-// cancellation emits nothing. A deadline counts only when it is the returned
-// failure, which the caller has already written onto the result.
+// classifyProduceStop picks why a cascade ended. A terminal broker or unknown
+// error wins over a context that expires afterward, explicit cancellation is
+// not a final-outcome reason, and an expired deadline outranks candidate
+// exhaustion.
 func classifyProduceStop(terminal bool, terminalErr, ctxErr error, exhausted bool) produceStop {
 	if terminal && !errors.Is(terminalErr, context.Canceled) {
 		return produceStopTerminalError
@@ -375,8 +372,8 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		// still produce a usable outcome, so let it finish. If the primary
 		// then succeeds it won on its single attempt (depth 1). When the
 		// fallback failed too the depth-1 label is best-effort: the
-		// fallback's wave count isn't surfaced on this branch. The stop
-		// stays on this result; a successful primary makes the caller skip it.
+		// fallback's wave count isn't surfaced on this branch. The stop is
+		// the fallback's and only matters if the merged result still fails.
 		return hedgerProduceResult{
 			result:   selectProduceResult(<-primaryCh, fb.result),
 			attempts: 1,
@@ -438,9 +435,9 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 
 	// If the caller's ctx was canceled mid-loop, surface that directly:
 	// the work was preempted, not exhausted. We still want the merged
-	// per-partition state, so we keep acc.result()'s resp. The stop cause
-	// is classified separately so a later deadline does not relabel an
-	// error the accumulator already aborted on.
+	// per-partition state, so we keep acc.result()'s resp. The stop is
+	// classified from the accumulator and the context separately so a
+	// deadline that expires after an abort doesn't hide the abort's cause.
 	out.result = acc.result()
 	ctxErr := workCtx.Err()
 	if ctxErr != nil {
@@ -457,8 +454,8 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 // pending or a partition exhausted its candidates). canRetry reports
 // whether the caller should iterate again — false when no further work
 // would change the outcome (every partition resolved, accumulator aborted,
-// a partition exhausted candidates, or ctx canceled mid-wave). exhausted
-// is set only for the candidate-budget stop, not for an abort or a cancel.
+// a partition exhausted candidates, or ctx canceled mid-wave). exhausted is
+// set only for the candidate-budget stop.
 func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAccumulator, tried map[topicPartition][]int32, candidates *hedgerCandidates) (dispatched, canRetry, exhausted bool) {
 	pending := acc.remaining()
 	if len(pending) == 0 {
@@ -546,9 +543,8 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 	return true, true, false
 }
 
-// shouldHedge returns the hedge decision for primaryID. The cause is taken
-// from the routing-time AgentState already on the partitions; this does not
-// query Candidates or consume a probe slot.
+// shouldHedge returns the hedge decision for primaryID, reading the cause from
+// the routing-time AgentState instead of re-querying Candidates.
 func (h *Hedger) shouldHedge(now time.Time, primaryID int32, partitions []routedEncodedTopicPartitionRecords) hedgeDecision {
 	// Probe routing: trust the routing-time nodeState. Re-querying the
 	// strategy would consume another probe slot through the Demoter.
@@ -616,8 +612,8 @@ func (h *Hedger) shouldHedge(now time.Time, primaryID int32, partitions []routed
 type hedgerProduceResult struct {
 	result   ProduceResult
 	attempts int
-	// stop is why this cascade ended. The owning ProduceSync reads it
-	// after selecting the winner; a losing leg's stop is not emitted.
+	// stop is this cascade's own cause. It can be set even when the merged
+	// result succeeds through the primary, so read it only for a failed result.
 	stop produceStop
 }
 

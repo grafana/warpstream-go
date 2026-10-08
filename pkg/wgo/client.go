@@ -151,7 +151,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		refreshCancel:  refreshCancel,
 		refreshNowCh:   make(chan struct{}, 1),
 	}
-	// Count a dropped leader and do not nudge: the refresh goroutine starts below.
+	// Publish the excluded-leader count and do not nudge: the refresh goroutine starts below.
 	// The periodic tick fetches the next snapshot.
 	c.noteLeaderDrops(dropped, false)
 	// Demoter sits on top of the lazy pool strategy so refresh-driven
@@ -503,12 +503,14 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 	c.noteLeaderDrops(dropped, true)
 }
 
-// noteLeaderDrops counts and logs excluded leaders. nudge asks for another fetch.
+// noteLeaderDrops publishes the excluded-leader count and logs it when it is
+// above zero. nudge asks for another fetch. The gauge is set even at zero so it
+// clears when the exclusion does.
 func (c *WarpstreamClient) noteLeaderDrops(dropped leaderDrops, nudge bool) {
+	c.metrics.agentPoolExcludedLeaders.Set(float64(dropped.Count))
 	if dropped.Count == 0 {
 		return
 	}
-	c.metrics.agentPoolLeaderDroppedTotal.Add(float64(dropped.Count))
 	log(c.logger, kgo.LogLevelWarn, "warpstream agentpool: leaders excluded from map",
 		"count", dropped.Count,
 		"first_topic", dropped.Topic,

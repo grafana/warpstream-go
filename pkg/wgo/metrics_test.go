@@ -256,6 +256,24 @@ func TestNewMetrics_HedgeTriggers(t *testing.T) {
 	`), "warpstream_produce_hedge_triggers_total"))
 }
 
+func TestNewMetrics_AgentPoolExcludedLeaders(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	// 0 before any refresh publishes a value.
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_agentpool_excluded_leaders"), 0)
+
+	m.agentPoolExcludedLeaders.Set(3)
+	require.InDelta(t, 3.0, gaugeValue(t, reg, "warpstream_agentpool_excluded_leaders"), 0)
+
+	// The old counter is gone: it was never deployed.
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		assert.NotEqual(t, "warpstream_agentpool_leader_dropped_total", f.GetName())
+	}
+}
+
 func TestNewMetrics_HedgeTriggerWins(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)

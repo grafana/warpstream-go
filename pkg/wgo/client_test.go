@@ -2129,7 +2129,7 @@ func TestWarpstreamClient_NoteLeaderDrops(t *testing.T) {
 	}
 
 	c.noteLeaderDrops(leaderDrops{}, true)
-	assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 	select {
 	case <-c.refreshNowCh:
 		t.Fatal("clean refresh nudged")
@@ -2137,19 +2137,29 @@ func TestWarpstreamClient_NoteLeaderDrops(t *testing.T) {
 	}
 
 	c.noteLeaderDrops(leaderDrops{Count: 2, Topic: "ingest", Partition: 35, NodeID: 99}, true)
-	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 	select {
 	case <-c.refreshNowCh:
 	default:
 		t.Fatal("refresh that excluded leaders did not nudge")
 	}
 
-	// Constructor path counts the drop and does not fill the nudge channel.
+	// Constructor path publishes the count and does not fill the nudge channel.
+	// The gauge holds the latest count; it does not accumulate across refreshes.
 	c.noteLeaderDrops(leaderDrops{Count: 1, Topic: "ingest", Partition: 0, NodeID: 7}, false)
-	assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 	select {
 	case <-c.refreshNowCh:
 		t.Fatal("constructor refresh nudged")
+	default:
+	}
+
+	// A clean refresh clears the gauge and does not nudge.
+	c.noteLeaderDrops(leaderDrops{}, true)
+	assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
+	select {
+	case <-c.refreshNowCh:
+		t.Fatal("clean refresh nudged")
 	default:
 	}
 }
@@ -2256,7 +2266,7 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 			c.triggerRefresh()
 			synctest.Wait()
 			assertOnDemandRefresh(t, c, 1, 0)
-			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 			assertMissingLeader(t, c, topic)
 
 			results := c.ProduceSync(t.Context(), []*kgo.Record{
@@ -2273,7 +2283,9 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 				synctest.Wait()
 				assertOnDemandRefresh(t, c, float64(i+2), 0)
 			}
-			assert.Equal(t, float64(6), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+			// Six refreshes later the gauge still reads one excluded leader: it is
+			// state, not a running total, so the backoff does not move it.
+			assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 
 			time.Sleep(time.Second)
 			synctest.Wait()
@@ -2283,7 +2295,8 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 			time.Sleep(9 * time.Second)
 			synctest.Wait()
 			assertOnDemandRefresh(t, c, 7, 0)
-			assert.Equal(t, float64(6), testutil.ToFloat64(c.metrics.agentPoolLeaderDroppedTotal))
+			// The clean fetch clears the gauge.
+			assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders))
 			assertLeaderRestored(t, c, topic, leader)
 
 			restored := c.ProduceSync(t.Context(), []*kgo.Record{
@@ -2466,6 +2479,71 @@ func TestWarpstreamClient_OnDemandRefreshBackoff(t *testing.T) {
 				assert.Equal(t, before, onDemandRefreshes(c), "iteration %d", i)
 			}
 		})
+	})
+}
+
+// TestWarpstreamClient_ExcludedLeadersGaugeAcrossRefreshes checks the gauge
+// follows the latest successful snapshot: set while a leader is excluded,
+// unchanged by a failed refresh, and back to zero once a clean refresh lands.
+func TestWarpstreamClient_ExcludedLeadersGaugeAcrossRefreshes(t *testing.T) {
+	const topic = "test-topic"
+
+	synctest.Test(t, func(t *testing.T) {
+		vnet := &kfake.VirtualNetwork{}
+		cluster, clusterAddr := testkafka.CreateCluster(t, 1, topic,
+			testkafka.WithVirtualNetwork(vnet), testkafka.WithNumBrokers(3))
+		c, err := NewWarpstreamClient(nil, prometheus.NewPedanticRegistry(), append(
+			testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		gauge := func() float64 { return testutil.ToFloat64(c.metrics.agentPoolExcludedLeaders) }
+		// The constructor refresh saw a healthy cluster.
+		assert.Zero(t, gauge())
+
+		raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+		require.NoError(t, err)
+		template := raw.(*kmsg.MetadataResponse)
+
+		var poison, fail atomic.Bool
+		cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+			cluster.KeepControl()
+			switch {
+			case fail.Load():
+				// A response error fails the fetch in one round trip.
+				resp := cloneMetadataResponse(template, req.GetVersion())
+				resp.ErrorCode = kerr.UnknownServerError.Code
+				return resp, nil, true
+			case poison.Load():
+				return metadataWithMissingLeaders(template, 99, req.GetVersion()), nil, true
+			}
+			return nil, nil, false
+		})
+
+		// A refresh that excludes a leader publishes it.
+		poison.Store(true)
+		time.Sleep(time.Nanosecond)
+		c.triggerRefresh()
+		synctest.Wait()
+		assert.Equal(t, float64(1), gauge())
+		assertMissingLeader(t, c, topic)
+
+		// A failed refresh keeps the previous snapshot and the previous value.
+		fail.Store(true)
+		c.triggerRefresh()
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		assert.GreaterOrEqual(t, failedOnDemandRefreshes(c), float64(1))
+		assert.Equal(t, float64(1), gauge(), "a failed refresh must not move the gauge")
+		assertMissingLeader(t, c, topic)
+
+		// A clean refresh clears it.
+		fail.Store(false)
+		poison.Store(false)
+		c.triggerRefresh()
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		assert.Zero(t, gauge())
 	})
 }
 

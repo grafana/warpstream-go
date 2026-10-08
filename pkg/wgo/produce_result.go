@@ -277,7 +277,7 @@ func (a *produceResultAccumulator) accumulate(res scopedProduceResult) {
 }
 
 // terminalErr reports whether the abort policy stopped retries, and the error
-// that tripped it. A false aborted flag means retries may continue.
+// that tripped it.
 func (a *produceResultAccumulator) terminalErr() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

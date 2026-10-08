@@ -54,7 +54,7 @@ type metrics struct {
 	produceRecordsFailedTotal   prometheus.Counter
 	produceRecordsRejectedTotal *prometheus.CounterVec
 
-	agentPoolLeaderDroppedTotal prometheus.Counter
+	agentPoolExcludedLeaders    prometheus.Gauge
 	metadataRefreshResultsTotal *prometheus.CounterVec
 
 	clusterStatsAvailable     prometheus.Gauge
@@ -106,9 +106,8 @@ const (
 	metadataRefreshResultFailed            = "failed"
 )
 
-// produceFinalOutcome is why one nonempty Hedger produce failed. Success and
-// caller cancellation are not counted. One increment is one invocation, not
-// one public call, record, partition, or wire attempt.
+// produceFinalOutcome is why a Hedger produce failed. One increment is one
+// failed invocation, not a record, partition or wire attempt.
 type produceFinalOutcome int8
 
 const (
@@ -314,9 +313,9 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "warpstream_produce_records_rejected_total",
 			Help: "Total number of records rejected by the client before any wire dispatch, by reason (record_too_large, no_agent_assigned).",
 		}, []string{"reason"}),
-		agentPoolLeaderDroppedTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Name: "warpstream_agentpool_leader_dropped_total",
-			Help: "Partition leaders excluded from the assignment map because their NodeID was absent from that Metadata response's broker list. One increment per excluded leader, including the constructor refresh. Topic-level Metadata errors are not counted. A partition Leader below 0 is not counted.",
+		agentPoolExcludedLeaders: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "warpstream_agentpool_excluded_leaders",
+			Help: "Number of partitions whose named leader NodeID was absent from the broker list of the last successful Metadata refresh, so the AgentPool excluded that leader. While the pool has any agent, these partitions route to a stand-in; with an empty broker list they are rejected instead. 0 when no leader is excluded. Set on every successful refresh, including the constructor refresh; a failed refresh keeps the previous value. Topic-level Metadata errors and a partition Leader below 0 are not counted.",
 		}),
 		metadataRefreshResultsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_metadata_refresh_results_total",
