@@ -12,6 +12,7 @@ import (
 
 func main() {
 	reportFilepath := flag.String("report-filepath", "", "if set, write the Markdown report to this file path")
+	jsonReportFilepath := flag.String("json-report-filepath", "", "if set, write scenario names and success rates as JSON to this file path")
 	timeout := flag.Duration("timeout", 20*time.Minute, "overall timeout for the whole simulation")
 	flag.Parse()
 
@@ -30,6 +31,17 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("wrote report to %s\n", *reportFilepath)
+	}
+	if *jsonReportFilepath != "" {
+		data, err := newResultsReport(res).generateJSON()
+		if err == nil {
+			err = os.WriteFile(*jsonReportFilepath, data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "write JSON report %q: %v\n", *jsonReportFilepath, err)
+			os.Exit(1)
+		}
+		fmt.Printf("wrote JSON report to %s\n", *jsonReportFilepath)
 	}
 
 	printSummary(os.Stdout, res)

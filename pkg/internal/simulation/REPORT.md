@@ -46,16 +46,16 @@ kgo-only:
 | Scenario | wgo success | kgo success | success Δ | wgo slow | wgo p99 | kgo p99 | hedge surge |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | all healthy | 120/120 (100.0%) | 120/120 (100.0%) | n/a | n/a | 1.0s | 1.0s | +0.0% |
-| 1 dropped leader | 120/120 (100.0%) | 19/120 (15.8%) | +84.2 pts | n/a | 1.0s | 10.0s | +0.0% |
+| 1 dropped leader | 120/120 (100.0%) | 19/120 (15.8%) | +84.2 pts | n/a | 1.0s | 9.5s | +0.0% |
 | 25% dropped leaders | 120/120 (100.0%) | 19/120 (15.8%) | +84.2 pts | n/a | 1.0s | 9.5s | +0.0% |
-| 1 fast-failing agent | 120/120 (100.0%) | 0/120 (0.0%) | +100.0 pts | n/a | 1.0s | 10.0s | +0.8% |
+| 1 fast-failing agent | 120/120 (100.0%) | 0/120 (0.0%) | +100.0 pts | n/a | 1.0s | 9.5s | +0.8% |
 | 1 slow agent | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 0.0% (≤10.0% >2s) | 1.9s | 2.9s | +1.6% |
 | 2 fast-failing agents | 120/120 (100.0%) | 0/120 (0.0%) | +100.0 pts | n/a | 1.1s | 9.5s | +1.7% |
 | 2 slow agents | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 0.0% (≤15.0% >2s) | 1.9s | 2.9s | +3.1% |
 | 1% failure rate across all agents | 120/120 (100.0%) | 4/120 (3.3%) | +96.7 pts | n/a | 1.5s | 9.5s | +1.1% |
-| 1% timeouts across all agents | 120/120 (100.0%) | 64/120 (53.3%) | +46.7 pts | n/a | 1.8s | 5.0s | +0.9% |
-| 1% slow bursts across all agents | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 0.0% (≤10.0% >2s) | 1.8s | 3.9s | +0.9% |
-| 25% slow agents | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 11.7% (≤35.0% >2.5s) | 2.8s | 3.0s | +19.2% |
+| 1% timeouts across all agents | 120/120 (100.0%) | 64/120 (53.3%) | +46.7 pts | n/a | 1.9s | 5.0s | +0.9% |
+| 1% slow bursts across all agents | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 0.0% (≤10.0% >2s) | 1.9s | 3.9s | +0.9% |
+| 25% slow agents | 120/120 (100.0%) | 120/120 (100.0%) | n/a | 14.2% (≤35.0% >2.5s) | 2.8s | 3.0s | +19.3% |
 | GCS slow outage (10% bad, 40% moderate) | 114/120 (95.0%) | 27/120 (22.5%) | +72.5 pts | n/a | 5.0s | 5.0s | +6.2% |
 
 ## all healthy
@@ -69,29 +69,29 @@ Every agent at healthy latency. Every record should succeed via the primary; no 
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.1s |
+| 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.0s |
 | 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.0s |
 | 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.0s |
-| 30s–40s | 20/20 (100%) | 0.9s | 1.1s | 0/1000 (+0%) | 20/20 (100%) | 1.0s | 1.0s |
-| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 21/21 (100%) | 0.9s | 1.0s |
-| 50s–60s | 20/20 (100%) | 1.0s | 1.0s | 0/1000 (+0%) | 19/19 (100%) | 0.9s | 1.0s |
+| 30s–40s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 1.0s | 1.0s |
+| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.0s |
+| 50s–60s | 19/19 (100%) | 1.0s | 1.0s | 0/1000 (+0%) | 20/20 (100%) | 0.9s | 1.0s |
 
 ## 1 dropped leader
 
 Metadata omits broker 1 but still names it as partition 1's leader throughout the observed phase. All agents accept writes at healthy latency. Each event includes the affected partition and 49 healthy siblings. wgo must fall back to a live agent; kgo loses its destination when Metadata refreshes.
 
 - app requests (wgo): success=120/120 (100.0%) mean=0.9s p50=0.9s p99=1.0s
-- app requests (kgo): success=19/120 (15.8%) mean=4.5s p50=4.6s p99=10.0s
+- app requests (kgo): success=19/120 (15.8%) mean=4.4s p50=4.3s p99=9.5s
 - wgo-kgo success delta: +84.2 pts (want ≥ 50.0 pts)
 - hedge surge: 5899 primary + 0 hedge wire requests (+0.0% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 0/999 (+0%) | 19/21 (90%) | 1.8s | 10.0s |
-| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.4s | 10.0s |
+| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
 | 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
-| 30s–40s | 20/20 (100%) | 0.9s | 1.1s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
-| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
+| 30s–40s | 19/19 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
+| 40s–50s | 21/21 (100%) | 0.9s | 1.0s | 0/980 (+0%) | 0/20 (0%) | 5.0s | 9.5s |
 | 50s–60s | 19/19 (100%) | 1.0s | 1.0s | 0/980 (+0%) | 0/19 (0%) | 4.8s | 9.0s |
 
 | error | wgo | kgo |
@@ -103,15 +103,15 @@ Metadata omits broker 1 but still names it as partition 1's leader throughout th
 Metadata omits 12 of 50 brokers but retains their partition leaders throughout the observed phase. Every event mixes affected partitions with healthy siblings; omitted agents still accept writes, isolating the inconsistent Metadata view from transport failures.
 
 - app requests (wgo): success=120/120 (100.0%) mean=0.9s p50=0.9s p99=1.0s
-- app requests (kgo): success=19/120 (15.8%) mean=4.5s p50=4.7s p99=9.5s
+- app requests (kgo): success=19/120 (15.8%) mean=4.5s p50=4.8s p99=9.5s
 - wgo-kgo success delta: +84.2 pts (want ≥ 50.0 pts)
 - hedge surge: 4788 primary + 0 hedge wire requests (+0.0% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 0/988 (+0%) | 19/21 (90%) | 1.8s | 10.0s |
-| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/19 (0%) | 4.9s | 9.0s |
-| 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/21 (0%) | 5.3s | 9.5s |
+| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/20 (0%) | 5.2s | 9.5s |
+| 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/20 (0%) | 5.1s | 9.5s |
 | 30s–40s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/20 (0%) | 5.2s | 9.5s |
 | 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/20 (0%) | 5.1s | 9.5s |
 | 50s–60s | 19/19 (100%) | 0.9s | 1.0s | 0/760 (+0%) | 0/19 (0%) | 4.9s | 9.0s |
@@ -125,18 +125,18 @@ Metadata omits 12 of 50 brokers but retains their partition leaders throughout t
 Broker 1 returns NotLeaderForPartition immediately; the cascade path retries on another agent.
 
 - app requests (wgo): success=120/120 (100.0%) mean=0.9s p50=0.9s p99=1.0s
-- app requests (kgo): success=0/120 (0.0%) mean=5.3s p50=5.5s p99=10.0s
+- app requests (kgo): success=0/120 (0.0%) mean=4.8s p50=5.0s p99=9.5s
 - wgo-kgo success delta: +100.0 pts (want ≥ 50.0 pts)
-- hedge surge: 5929 primary + 50 hedge wire requests (+0.8% extra)
+- hedge surge: 5928 primary + 48 hedge wire requests (+0.8% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 10/990 (+1%) | 0/21 (0%) | 5.5s | 10.0s |
-| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 9/989 (+1%) | 0/20 (0%) | 5.3s | 10.0s |
-| 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 7/987 (+1%) | 0/20 (0%) | 5.3s | 10.0s |
-| 30s–40s | 20/20 (100%) | 0.9s | 1.1s | 9/988 (+1%) | 0/20 (0%) | 5.3s | 10.0s |
-| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 7/987 (+1%) | 0/20 (0%) | 5.3s | 10.0s |
-| 50s–60s | 19/19 (100%) | 1.0s | 1.0s | 8/988 (+1%) | 0/19 (0%) | 5.0s | 10.0s |
+| 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 10/990 (+1%) | 0/21 (0%) | 5.1s | 9.5s |
+| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 8/988 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
+| 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 8/988 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
+| 30s–40s | 20/20 (100%) | 0.9s | 1.0s | 7/987 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
+| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 8/988 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
+| 50s–60s | 19/19 (100%) | 1.0s | 1.0s | 7/987 (+1%) | 0/19 (0%) | 4.6s | 9.0s |
 
 | error | wgo | kgo |
 | --- | --- | --- |
@@ -154,12 +154,12 @@ Broker 1's latency jumps to avg 1.5s (max 3s). The Hedger flags the primary as s
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 1.3s | 1.7s | 12/1000 (+1%) | 20/20 (100%) | 1.9s | 2.9s |
-| 10s–20s | 20/20 (100%) | 1.3s | 1.7s | 17/1000 (+2%) | 20/20 (100%) | 1.8s | 2.7s |
+| 0s–10s | 21/21 (100%) | 1.2s | 1.7s | 12/1000 (+1%) | 21/21 (100%) | 1.9s | 2.9s |
+| 10s–20s | 20/20 (100%) | 1.3s | 1.7s | 17/1000 (+2%) | 20/20 (100%) | 1.7s | 2.7s |
 | 20s–30s | 20/20 (100%) | 1.3s | 2.0s | 16/1000 (+2%) | 20/20 (100%) | 1.3s | 2.3s |
-| 30s–40s | 20/20 (100%) | 1.4s | 1.9s | 18/1000 (+2%) | 20/20 (100%) | 1.6s | 2.6s |
-| 40s–50s | 20/20 (100%) | 1.4s | 1.7s | 17/1000 (+2%) | 20/20 (100%) | 1.7s | 2.8s |
-| 50s–60s | 20/20 (100%) | 1.2s | 1.6s | 15/1000 (+2%) | 20/20 (100%) | 1.7s | 3.0s |
+| 30s–40s | 20/20 (100%) | 1.4s | 1.9s | 18/1000 (+2%) | 20/20 (100%) | 1.7s | 2.6s |
+| 40s–50s | 20/20 (100%) | 1.3s | 1.7s | 17/1000 (+2%) | 20/20 (100%) | 1.6s | 2.8s |
+| 50s–60s | 19/19 (100%) | 1.2s | 1.6s | 15/1000 (+2%) | 19/19 (100%) | 1.7s | 3.0s |
 
 ## 2 fast-failing agents
 
@@ -168,16 +168,16 @@ Brokers 1 and 2 fail; cascade retries on healthy agents.
 - app requests (wgo): success=120/120 (100.0%) mean=0.9s p50=1.0s p99=1.1s
 - app requests (kgo): success=0/120 (0.0%) mean=4.8s p50=5.0s p99=9.5s
 - wgo-kgo success delta: +100.0 pts (want ≥ 50.0 pts)
-- hedge surge: 5858 primary + 99 hedge wire requests (+1.7% extra)
+- hedge surge: 5860 primary + 102 hedge wire requests (+1.7% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 0.9s | 1.0s | 20/980 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
-| 10s–20s | 21/21 (100%) | 0.9s | 1.0s | 15/975 (+2%) | 0/21 (0%) | 5.1s | 9.5s |
-| 20s–30s | 20/20 (100%) | 0.9s | 1.1s | 14/974 (+1%) | 0/19 (0%) | 4.6s | 9.0s |
-| 30s–40s | 20/20 (100%) | 0.9s | 1.1s | 19/978 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
-| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 14/974 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
-| 50s–60s | 19/19 (100%) | 1.0s | 1.1s | 17/977 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
+| 0s–10s | 21/21 (100%) | 0.9s | 1.0s | 20/980 (+2%) | 0/21 (0%) | 5.0s | 9.5s |
+| 10s–20s | 20/20 (100%) | 0.9s | 1.0s | 18/978 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
+| 20s–30s | 20/20 (100%) | 0.9s | 1.0s | 14/974 (+1%) | 0/20 (0%) | 4.8s | 9.5s |
+| 30s–40s | 20/20 (100%) | 1.0s | 1.1s | 17/976 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
+| 40s–50s | 20/20 (100%) | 0.9s | 1.0s | 16/976 (+2%) | 0/20 (0%) | 4.8s | 9.5s |
+| 50s–60s | 19/19 (100%) | 1.0s | 1.1s | 17/976 (+2%) | 0/19 (0%) | 4.6s | 9.0s |
 
 | error | wgo | kgo |
 | --- | --- | --- |
@@ -187,18 +187,18 @@ Brokers 1 and 2 fail; cascade retries on healthy agents.
 
 Brokers 1 and 2 are slow; the hedge fires for both and the fallbacks win.
 
-- app requests (wgo): success=120/120 (100.0%) mean=1.4s p50=1.5s p99=1.9s
-- app requests (kgo): success=120/120 (100.0%) mean=1.9s p50=1.9s p99=2.9s
+- app requests (wgo): success=120/120 (100.0%) mean=1.4s p50=1.4s p99=1.9s
+- app requests (kgo): success=120/120 (100.0%) mean=2.0s p50=1.9s p99=2.9s
 - wgo-kgo success delta: n/a
 - wgo slow fraction: 0.0% of requests slower than 2s (ceiling 15.0%)
-- hedge surge: 6000 primary + 187 hedge wire requests (+3.1% extra)
+- hedge surge: 6000 primary + 188 hedge wire requests (+3.1% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0s–10s | 21/21 (100%) | 1.4s | 1.7s | 26/1000 (+3%) | 21/21 (100%) | 2.0s | 2.9s |
 | 10s–20s | 20/20 (100%) | 1.4s | 1.7s | 32/1000 (+3%) | 20/20 (100%) | 2.0s | 2.8s |
 | 20s–30s | 20/20 (100%) | 1.5s | 2.0s | 32/1000 (+3%) | 20/20 (100%) | 1.6s | 2.3s |
-| 30s–40s | 20/20 (100%) | 1.5s | 1.9s | 31/1000 (+3%) | 20/20 (100%) | 2.1s | 2.8s |
+| 30s–40s | 20/20 (100%) | 1.5s | 1.9s | 32/1000 (+3%) | 20/20 (100%) | 2.1s | 2.8s |
 | 40s–50s | 20/20 (100%) | 1.4s | 1.8s | 33/1000 (+3%) | 20/20 (100%) | 1.9s | 2.8s |
 | 50s–60s | 19/19 (100%) | 1.4s | 1.8s | 32/1000 (+3%) | 19/19 (100%) | 2.0s | 3.0s |
 | 60s+ drain | — | — | — | 1/0 (n/a) | — | — | — |
@@ -214,12 +214,12 @@ Every agent has a 1% random hard-failure probability on top of healthy latency.
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 1.0s | 1.3s | 8/1000 (+1%) | 1/20 (5%) | 4.7s | 9.0s |
-| 10s–20s | 20/20 (100%) | 1.0s | 1.5s | 8/1000 (+1%) | 0/20 (0%) | 5.5s | 10.0s |
-| 20s–30s | 20/20 (100%) | 1.0s | 1.6s | 17/1000 (+2%) | 0/20 (0%) | 5.1s | 9.5s |
-| 30s–40s | 20/20 (100%) | 1.0s | 1.4s | 7/1000 (+1%) | 0/20 (0%) | 5.1s | 9.5s |
+| 0s–10s | 21/21 (100%) | 1.0s | 1.4s | 8/1000 (+1%) | 1/21 (5%) | 4.9s | 9.5s |
+| 10s–20s | 20/20 (100%) | 1.0s | 1.5s | 9/1000 (+1%) | 0/20 (0%) | 5.5s | 10.0s |
+| 20s–30s | 20/20 (100%) | 1.0s | 1.6s | 16/1000 (+2%) | 0/20 (0%) | 5.1s | 9.5s |
+| 30s–40s | 20/20 (100%) | 1.0s | 1.1s | 7/1000 (+1%) | 1/20 (5%) | 4.7s | 9.0s |
 | 40s–50s | 20/20 (100%) | 1.0s | 1.5s | 13/1000 (+1%) | 2/20 (10%) | 4.3s | 8.5s |
-| 50s–60s | 20/20 (100%) | 1.0s | 1.3s | 13/1000 (+1%) | 1/20 (5%) | 4.7s | 9.0s |
+| 50s–60s | 19/19 (100%) | 1.0s | 1.2s | 13/1000 (+1%) | 0/19 (0%) | 4.9s | 9.0s |
 
 | error | wgo | kgo |
 | --- | --- | --- |
@@ -229,19 +229,19 @@ Every agent has a 1% random hard-failure probability on top of healthy latency.
 
 Every agent has a 1% per-request chance of an extra ~10s delay (= WriteTimeout). The burst matches the flush deadline, so a hit on the primary can't be recovered within budget. With 50 partitions per request, P(no partition trips a burst) = 0.99^50 ≈ 0.605, so app success sits ~60%.
 
-- app requests (wgo): success=120/120 (100.0%) mean=1.1s p50=1.0s p99=1.8s
+- app requests (wgo): success=120/120 (100.0%) mean=1.1s p50=1.0s p99=1.9s
 - app requests (kgo): success=64/120 (53.3%) mean=2.8s p50=1.0s p99=5.0s
 - wgo-kgo success delta: +46.7 pts (want ≥ 20.0 pts)
-- hedge surge: 6000 primary + 53 hedge wire requests (+0.9% extra)
+- hedge surge: 6000 primary + 56 hedge wire requests (+0.9% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 1.1s | 1.7s | 8/1000 (+1%) | 13/20 (65%) | 2.4s | 5.0s |
-| 10s–20s | 20/20 (100%) | 1.3s | 1.8s | 13/1000 (+1%) | 8/20 (40%) | 3.4s | 5.0s |
-| 20s–30s | 20/20 (100%) | 1.2s | 1.7s | 11/1000 (+1%) | 9/20 (45%) | 3.2s | 5.0s |
-| 30s–40s | 20/20 (100%) | 1.1s | 2.0s | 7/1000 (+1%) | 9/20 (45%) | 3.2s | 5.0s |
-| 40s–50s | 20/20 (100%) | 1.1s | 1.8s | 10/1000 (+1%) | 15/20 (75%) | 1.9s | 5.0s |
-| 50s–60s | 20/20 (100%) | 1.0s | 1.5s | 3/1000 (+0%) | 10/20 (50%) | 3.0s | 5.0s |
+| 0s–10s | 21/21 (100%) | 1.1s | 1.7s | 9/1000 (+1%) | 14/21 (67%) | 2.3s | 5.0s |
+| 10s–20s | 20/20 (100%) | 1.3s | 1.8s | 14/1000 (+1%) | 8/20 (40%) | 3.4s | 5.0s |
+| 20s–30s | 20/20 (100%) | 1.2s | 1.7s | 11/1000 (+1%) | 8/20 (40%) | 3.4s | 5.0s |
+| 30s–40s | 20/20 (100%) | 1.1s | 2.0s | 7/1000 (+1%) | 10/20 (50%) | 3.0s | 5.0s |
+| 40s–50s | 20/20 (100%) | 1.1s | 1.8s | 11/1000 (+1%) | 14/20 (70%) | 2.2s | 5.0s |
+| 50s–60s | 19/19 (100%) | 1.0s | 1.5s | 3/1000 (+0%) | 10/19 (53%) | 2.9s | 5.0s |
 | 60s+ drain | — | — | — | 1/0 (n/a) | — | — | — |
 
 | error | wgo | kgo |
@@ -252,20 +252,20 @@ Every agent has a 1% per-request chance of an extra ~10s delay (= WriteTimeout).
 
 Every agent has a 1% per-request chance of an extra ~3s slow burst (within the per-attempt deadline but slow enough that the hedge timer fires).
 
-- app requests (wgo): success=120/120 (100.0%) mean=1.1s p50=1.0s p99=1.8s
+- app requests (wgo): success=120/120 (100.0%) mean=1.1s p50=1.0s p99=1.9s
 - app requests (kgo): success=120/120 (100.0%) mean=2.1s p50=1.0s p99=3.9s
 - wgo-kgo success delta: n/a
 - wgo slow fraction: 0.0% of requests slower than 2s (ceiling 10.0%)
-- hedge surge: 6000 primary + 53 hedge wire requests (+0.9% extra)
+- hedge surge: 6000 primary + 56 hedge wire requests (+0.9% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 20/20 (100%) | 1.1s | 1.7s | 8/1000 (+1%) | 20/20 (100%) | 1.8s | 3.6s |
-| 10s–20s | 20/20 (100%) | 1.3s | 1.8s | 13/1000 (+1%) | 20/20 (100%) | 2.5s | 3.8s |
-| 20s–30s | 20/20 (100%) | 1.2s | 1.7s | 11/1000 (+1%) | 20/20 (100%) | 2.4s | 3.9s |
+| 0s–10s | 21/21 (100%) | 1.1s | 1.7s | 9/1000 (+1%) | 20/20 (100%) | 1.8s | 3.6s |
+| 10s–20s | 20/20 (100%) | 1.3s | 1.8s | 14/1000 (+1%) | 20/20 (100%) | 2.5s | 3.8s |
+| 20s–30s | 19/19 (100%) | 1.2s | 1.7s | 11/1000 (+1%) | 20/20 (100%) | 2.3s | 3.9s |
 | 30s–40s | 20/20 (100%) | 1.1s | 2.0s | 7/1000 (+1%) | 20/20 (100%) | 2.4s | 3.9s |
-| 40s–50s | 21/21 (100%) | 1.1s | 1.8s | 10/1000 (+1%) | 20/20 (100%) | 1.5s | 3.6s |
-| 50s–60s | 19/19 (100%) | 1.0s | 1.5s | 3/1000 (+0%) | 20/20 (100%) | 2.2s | 3.7s |
+| 40s–50s | 20/20 (100%) | 1.1s | 1.8s | 11/1000 (+1%) | 20/20 (100%) | 1.5s | 3.6s |
+| 50s–60s | 20/20 (100%) | 1.0s | 1.5s | 3/1000 (+0%) | 20/20 (100%) | 2.2s | 3.7s |
 | 60s+ drain | — | — | — | 1/0 (n/a) | — | — | — |
 
 ## 25% slow agents
@@ -275,18 +275,18 @@ A quarter of agents are permanently slow (avg 1.5s, max 3s); the hedge fallback 
 - app requests (wgo): success=120/120 (100.0%) mean=2.1s p50=2.1s p99=2.8s
 - app requests (kgo): success=120/120 (100.0%) mean=2.5s p50=2.5s p99=3.0s
 - wgo-kgo success delta: n/a
-- wgo slow fraction: 11.7% of requests slower than 2.5s (ceiling 35.0%)
-- hedge surge: 6000 primary + 1151 hedge wire requests (+19.2% extra)
+- wgo slow fraction: 14.2% of requests slower than 2.5s (ceiling 35.0%)
+- hedge surge: 6000 primary + 1157 hedge wire requests (+19.3% extra)
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 21/21 (100%) | 2.2s | 2.6s | 177/1000 (+18%) | 20/20 (100%) | 2.6s | 3.0s |
-| 10s–20s | 20/20 (100%) | 2.2s | 2.7s | 198/1000 (+20%) | 21/21 (100%) | 2.5s | 2.9s |
-| 20s–30s | 20/20 (100%) | 2.1s | 2.7s | 187/1000 (+19%) | 19/19 (100%) | 2.4s | 2.7s |
-| 30s–40s | 19/19 (100%) | 2.0s | 2.3s | 201/1000 (+20%) | 20/20 (100%) | 2.5s | 2.9s |
-| 40s–50s | 21/21 (100%) | 2.1s | 2.8s | 188/1000 (+19%) | 20/20 (100%) | 2.5s | 2.9s |
-| 50s–60s | 19/19 (100%) | 2.2s | 2.8s | 181/1000 (+18%) | 20/20 (100%) | 2.4s | 3.0s |
-| 60s+ drain | — | — | — | 19/0 (n/a) | — | — | — |
+| 0s–10s | 20/20 (100%) | 2.2s | 2.6s | 176/1000 (+18%) | 21/21 (100%) | 2.6s | 3.0s |
+| 10s–20s | 20/20 (100%) | 2.1s | 2.7s | 199/1000 (+20%) | 19/19 (100%) | 2.5s | 2.9s |
+| 20s–30s | 20/20 (100%) | 2.0s | 2.7s | 190/1000 (+19%) | 20/20 (100%) | 2.4s | 2.7s |
+| 30s–40s | 20/20 (100%) | 2.0s | 2.6s | 204/1000 (+20%) | 20/20 (100%) | 2.5s | 2.9s |
+| 40s–50s | 21/21 (100%) | 2.0s | 2.5s | 187/1000 (+19%) | 20/20 (100%) | 2.5s | 2.9s |
+| 50s–60s | 19/19 (100%) | 2.2s | 2.8s | 183/1000 (+18%) | 20/20 (100%) | 2.4s | 3.0s |
+| 60s+ drain | — | — | — | 18/0 (n/a) | — | — | — |
 
 ## GCS slow outage (10% bad, 40% moderate)
 
@@ -299,12 +299,12 @@ Models asymmetric object-storage degradation: 50% healthy, 40% avg ≈ 700ms/max
 
 | bucket | wgo success | wgo mean | wgo p99 | wgo surge (hedge/prim) | kgo success | kgo mean | kgo p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0s–10s | 19/20 (95%) | 2.0s | 5.0s | 49/1000 (+5%) | 5/20 (25%) | 4.5s | 5.0s |
-| 10s–20s | 20/21 (95%) | 2.2s | 5.0s | 57/1000 (+6%) | 6/20 (30%) | 4.4s | 5.0s |
-| 20s–30s | 19/20 (95%) | 2.2s | 5.0s | 63/1000 (+6%) | 4/20 (20%) | 4.6s | 5.0s |
+| 0s–10s | 20/21 (95%) | 2.0s | 5.0s | 49/1000 (+5%) | 5/20 (25%) | 4.5s | 5.0s |
+| 10s–20s | 19/20 (95%) | 2.3s | 5.0s | 57/1000 (+6%) | 6/21 (29%) | 4.5s | 5.0s |
+| 20s–30s | 19/20 (95%) | 2.2s | 5.0s | 63/1000 (+6%) | 4/19 (21%) | 4.6s | 5.0s |
 | 30s–40s | 19/20 (95%) | 1.9s | 5.0s | 61/1000 (+6%) | 4/20 (20%) | 4.6s | 5.0s |
-| 40s–50s | 19/20 (95%) | 2.2s | 5.0s | 70/1000 (+7%) | 2/21 (10%) | 4.8s | 5.0s |
-| 50s–60s | 18/19 (95%) | 2.8s | 5.0s | 67/1000 (+7%) | 6/19 (32%) | 4.4s | 5.0s |
+| 40s–50s | 19/20 (95%) | 2.2s | 5.0s | 70/1000 (+7%) | 2/20 (10%) | 4.8s | 5.0s |
+| 50s–60s | 18/19 (95%) | 2.8s | 5.0s | 67/1000 (+7%) | 6/20 (30%) | 4.4s | 5.0s |
 | 60s+ drain | — | — | — | 8/0 (n/a) | — | — | — |
 
 | error | wgo | kgo |

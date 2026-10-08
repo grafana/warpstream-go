@@ -1,6 +1,8 @@
 package main
 
 import (
+	"cmp"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -21,6 +23,26 @@ type resultsReport struct {
 
 func newResultsReport(r scenarioResults) *resultsReport {
 	return &resultsReport{results: r}
+}
+
+func (rr *resultsReport) generateJSON() ([]byte, error) {
+	type scenarioSuccess struct {
+		Scenario       string  `json:"scenario"`
+		WgoSuccessRate float64 `json:"wgo_success_rate"`
+		KgoSuccessRate float64 `json:"kgo_success_rate"`
+	}
+	results := make([]scenarioSuccess, 0, len(rr.results.entries))
+	for _, res := range rr.results.entries {
+		results = append(results, scenarioSuccess{
+			Scenario: res.sc.name, WgoSuccessRate: res.successRate(), KgoSuccessRate: res.kgoSuccessRate(),
+		})
+	}
+	slices.SortFunc(results, func(a, b scenarioSuccess) int { return cmp.Compare(a.Scenario, b.Scenario) })
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }
 
 // generateMarkdown renders the full comparison report.
