@@ -256,6 +256,23 @@ func TestNewMetrics_HedgeTriggers(t *testing.T) {
 	`), "warpstream_produce_hedge_triggers_total"))
 }
 
+func TestNewMetrics_HedgeTriggerWins(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.hedgeTriggerWins[hedgeTriggerLatency].Inc()
+	m.hedgeTriggerWins[hedgeTriggerPrimaryFailure].Add(2)
+	m.hedgeTriggerWins[hedgeTriggerDemotedProbe].Add(3)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_hedge_trigger_wins_total Logical fallback cascades whose result won, by the trigger that started the cascade (latency, primary_failure, demoted_probe). Counted at the same point as warpstream_hedge_wins_total, so the series sum to it. Divide by warpstream_produce_hedge_triggers_total for the win rate of each trigger.
+		# TYPE warpstream_produce_hedge_trigger_wins_total counter
+		warpstream_produce_hedge_trigger_wins_total{trigger="demoted_probe"} 3
+		warpstream_produce_hedge_trigger_wins_total{trigger="latency"} 1
+		warpstream_produce_hedge_trigger_wins_total{trigger="primary_failure"} 2
+	`), "warpstream_produce_hedge_trigger_wins_total"))
+}
+
 func TestNewMetrics_ProduceFinalOutcome(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)

@@ -399,6 +399,7 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 	defer func() {
 		if out.result.succeeded() && workCtx.Err() == nil {
 			h.metrics.hedgeWinsTotal.Inc()
+			h.metrics.hedgeTriggerWins[trigger].Inc()
 		}
 	}()
 

@@ -27,6 +27,7 @@ type metrics struct {
 	hedgeWinsTotal               prometheus.Counter
 	hedgeAttemptsSuppressedTotal *prometheus.CounterVec
 	hedgeTriggers                [hedgeTriggerCount]prometheus.Counter
+	hedgeTriggerWins             [hedgeTriggerCount]prometheus.Counter
 	produceFinalOutcome          [produceFinalOutcomeCount]prometheus.Counter
 	agentpoolAgentsChanged       [agentpoolChurnCount]prometheus.Counter
 
@@ -219,6 +220,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		Help: "Why a logical fallback cascade started: latency (hedge timer, or a healthy primary whose computed delay is already zero), primary_failure (the primary failed before the race), or demoted_probe (the routing-time primary was demoted). One increment per cascade entry, including a cascade that dispatches no request. Not a wire request or a hedge wave.",
 	}, []string{"trigger"})
 
+	hedgeTriggerWins := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_hedge_trigger_wins_total",
+		Help: "Logical fallback cascades whose result won, by the trigger that started the cascade (latency, primary_failure, demoted_probe). Counted at the same point as warpstream_hedge_wins_total, so the series sum to it. Divide by warpstream_produce_hedge_triggers_total for the win rate of each trigger.",
+	}, []string{"trigger"})
+
 	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_final_outcome_total",
 		Help: "Why one nonempty Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the Hedger work budget expired and that expiry is the returned failure), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is included here and excluded from warpstream_produce_requests_attempts.",
@@ -253,6 +259,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			hedgeTriggerLatency:        hedgeTriggers.WithLabelValues(hedgeTriggerLabelLatency),
 			hedgeTriggerPrimaryFailure: hedgeTriggers.WithLabelValues(hedgeTriggerLabelPrimaryFailure),
 			hedgeTriggerDemotedProbe:   hedgeTriggers.WithLabelValues(hedgeTriggerLabelDemotedProbe),
+		},
+		hedgeTriggerWins: [hedgeTriggerCount]prometheus.Counter{
+			hedgeTriggerLatency:        hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelLatency),
+			hedgeTriggerPrimaryFailure: hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelPrimaryFailure),
+			hedgeTriggerDemotedProbe:   hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelDemotedProbe),
 		},
 		produceFinalOutcome: [produceFinalOutcomeCount]prometheus.Counter{
 			produceFinalOutcomeCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelCandidatesExhausted),
