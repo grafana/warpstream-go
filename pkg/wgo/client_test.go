@@ -2121,6 +2121,59 @@ func TestWarpstreamClient_AgentPoolChurnOnLiveRefresh(t *testing.T) {
 	})
 }
 
+// TestWarpstreamClient_DuplicateBrokerInMetadata checks a NodeID listed twice in
+// one Metadata response is one agent: the pool holds it once and the response
+// appearing and disappearing is not membership churn.
+func TestWarpstreamClient_DuplicateBrokerInMetadata(t *testing.T) {
+	const topic = "test-topic"
+
+	synctest.Test(t, func(t *testing.T) {
+		c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
+		agents := slices.Clone(c.pool.Agents())
+		require.NotEmpty(t, agents)
+
+		raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+		require.NoError(t, err)
+		template := raw.(*kmsg.MetadataResponse)
+
+		var duplicate atomic.Bool
+		cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+			cluster.KeepControl()
+			if !duplicate.Load() {
+				return nil, nil, false
+			}
+			resp := cloneMetadataResponse(template, req.GetVersion())
+			resp.Brokers = append(resp.Brokers, resp.Brokers[0])
+			return resp, nil, true
+		})
+
+		refresh := func() {
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+		}
+		churn := func() (added, removed float64) {
+			return testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnAdded]),
+				testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnRemoved])
+		}
+
+		duplicate.Store(true)
+		refresh()
+		assert.Equal(t, agents, c.pool.Agents())
+		added, removed := churn()
+		assert.Zero(t, added)
+		assert.Zero(t, removed)
+
+		duplicate.Store(false)
+		refresh()
+		assert.Equal(t, agents, c.pool.Agents())
+		added, removed = churn()
+		assert.Zero(t, added)
+		assert.Zero(t, removed)
+		assert.Zero(t, testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+			string(metadataRefreshTriggerPeriodic), metadataRefreshResultMembershipChanged)))
+	})
+}
+
 func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		reg := prometheus.NewPedanticRegistry()

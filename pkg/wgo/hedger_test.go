@@ -1009,6 +1009,65 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assertTriggerWins(t, m, nil)
 	})
 
+	t.Run("primary fails non-retriably and the candidate budget is one: terminal error", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		one := cfg
+		one.MaxHedgeAgents = 1
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, one, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID}, producer.recordedCallNodeIDs())
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeTerminalError: 1,
+		})
+	})
+
+	t.Run("primary fails non-retriably and it is the only candidate: terminal error", func(t *testing.T) {
+		onlyPrimary := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), onlyPrimary, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeTerminalError: 1,
+		})
+	})
+
+	t.Run("racing path: fallback exhausts then the primary fails non-retriably: terminal error", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 50 * time.Millisecond
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assertFinalOutcomes(t, m, map[produceFinalOutcome]float64{
+			produceFinalOutcomeTerminalError: 1,
+		})
+		assertTriggerWins(t, m, nil)
+	})
+
 	t.Run("racing path: fallback exhausts then the primary hits the work deadline is a write timeout", func(t *testing.T) {
 		// The fallback tries the one secondary and exhausts quickly, leaving
 		// the primary to run out the clock. The deadline is why this failed.
@@ -1849,6 +1908,41 @@ func TestHedgerCandidates_fetch(t *testing.T) {
 		assert.Len(t, got, 2)
 		assert.Equal(t, 2, strategy.lastMaxCandidates(topic, 0))
 	})
+}
+
+func TestHedger_FinalStop(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired := deadlineCtx{context.Background(), time.Now().Add(-time.Millisecond)}
+
+	failed := ProduceResult{err: kerr.RequestTimedOut}
+	succeeded := ProduceResult{resp: &kmsg.ProduceResponse{}}
+
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		primary ProduceResult
+		result  ProduceResult
+		stop    produceStop
+		want    produceStop
+	}{
+		{"a successful result is left alone", context.Background(), failed, succeeded, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
+		{"a settled terminal stop is left alone", expired, failed, failed, produceStopTerminalError, produceStopTerminalError},
+		{"a settled write timeout is left alone", context.Background(), failed, failed, produceStopWriteTimeout, produceStopWriteTimeout},
+		{"a write timeout after a non-retriable primary error is terminal", expired, ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopWriteTimeout, produceStopTerminalError},
+		{"a write timeout after a canceled primary stays a write timeout", expired, ProduceResult{err: context.Canceled}, failed, produceStopWriteTimeout, produceStopWriteTimeout},
+		{"exhausted stays exhausted while the context is live", context.Background(), failed, failed, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
+		{"exhausted after a non-retriable primary error is terminal", context.Background(), ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
+		{"a non-retriable primary error outranks an expired deadline", expired, ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
+		{"exhausted with an expired deadline is a write timeout", expired, failed, failed, produceStopCandidatesExhausted, produceStopWriteTimeout},
+		{"exhausted with a canceled context emits no outcome", canceled, failed, failed, produceStopCandidatesExhausted, produceStopCanceled},
+		{"a canceled primary is a cancel, not a terminal error", canceled, ProduceResult{err: context.Canceled}, failed, produceStopCandidatesExhausted, produceStopCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, finalStop(tt.ctx, tt.primary, tt.result, tt.stop))
+		})
+	}
 }
 
 func TestHedger_ClassifyProduceStop(t *testing.T) {

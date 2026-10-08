@@ -263,7 +263,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 			if hedged.result.succeeded() {
 				h.observeHedgeWin(hedgeTriggerPrimaryFailure)
 			}
-			observeAttempts(result, hedged.attempts, hedged.stop)
+			observeAttempts(result, hedged.attempts, finalStop(workCtx, primaryResult, result, hedged.stop))
 			return result
 		case <-timer.C:
 			return raceWithPrimary(hedgeTriggerLatency)
@@ -283,7 +283,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	if hedged.result.succeeded() {
 		h.observeHedgeWin(hedgeTriggerPrimaryFailure)
 	}
-	observeAttempts(result, hedged.attempts, hedged.stop)
+	observeAttempts(result, hedged.attempts, finalStop(workCtx, primaryResult, result, hedged.stop))
 	return result
 }
 
@@ -333,6 +333,31 @@ func classifyProduceStop(terminal bool, terminalErr, ctxErr error, exhausted boo
 		return produceStopTerminalError
 	}
 	return produceStopNone
+}
+
+// finalStop settles why a failed produce stopped once the primary's result is
+// known. The cascade only sees its own attempts, so a terminal primary error
+// that no other agent could work around is the cause even when the cascade
+// stopped as exhausted or, with the work context already done, as a write
+// timeout. A work context that ended while the primary was still running is
+// also the cause of an exhausted stop. Other stops are already settled.
+func finalStop(workCtx context.Context, primary, result ProduceResult, stop produceStop) produceStop {
+	if (stop != produceStopCandidatesExhausted && stop != produceStopWriteTimeout) || result.succeeded() {
+		return stop
+	}
+	if err := primary.error(); err != nil && !errors.Is(err, context.Canceled) && !getProduceResultErr(err).retriable {
+		return produceStopTerminalError
+	}
+	if stop == produceStopWriteTimeout {
+		return stop
+	}
+	switch err := ctxStopErr(workCtx); {
+	case errors.Is(err, context.DeadlineExceeded):
+		return produceStopWriteTimeout
+	case errors.Is(err, context.Canceled):
+		return produceStopCanceled
+	}
+	return stop
 }
 
 // ctxStopErr is ctx.Err(), except that a deadline already reached counts even
@@ -392,10 +417,11 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		if fb.result.succeeded() {
 			h.observeHedgeWin(trigger)
 		}
+		result := selectProduceResult(primaryResult, fb.result)
 		return hedgerProduceResult{
-			result:   selectProduceResult(primaryResult, fb.result),
+			result:   result,
 			attempts: fb.attempts,
-			stop:     fb.stop,
+			stop:     finalStop(workCtx, primaryResult, result, fb.stop),
 		}
 	case fb := <-fallbackCh:
 		if fb.result.succeeded() {
@@ -407,19 +433,9 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 		// then succeeds it won on its single attempt (depth 1). When the
 		// fallback failed too the depth-1 label is best-effort: the
 		// fallback's wave count isn't surfaced on this branch.
-		result := selectProduceResult(<-primaryCh, fb.result)
-		stop := fb.stop
-		// Exhausting candidates early leaves the primary running until the work
-		// context ends, and that ending, not the exhaustion, is why this failed.
-		if stop == produceStopCandidatesExhausted && !result.succeeded() {
-			switch err := ctxStopErr(workCtx); {
-			case errors.Is(err, context.DeadlineExceeded):
-				stop = produceStopWriteTimeout
-			case errors.Is(err, context.Canceled):
-				stop = produceStopCanceled
-			}
-		}
-		return hedgerProduceResult{result: result, attempts: 1, stop: stop}
+		primaryResult := <-primaryCh
+		result := selectProduceResult(primaryResult, fb.result)
+		return hedgerProduceResult{result: result, attempts: 1, stop: finalStop(workCtx, primaryResult, result, fb.stop)}
 	}
 }
 
