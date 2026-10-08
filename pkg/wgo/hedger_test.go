@@ -1665,7 +1665,7 @@ type deadlineCtx struct {
 
 func (c deadlineCtx) Deadline() (time.Time, bool) { return c.deadline, true }
 
-func TestCtxStopErr(t *testing.T) {
+func TestHedger_CtxStopErr(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -1851,7 +1851,7 @@ func TestHedgerCandidates_fetch(t *testing.T) {
 	})
 }
 
-func TestClassifyProduceStop(t *testing.T) {
+func TestHedger_ClassifyProduceStop(t *testing.T) {
 	brokerErr := kerr.MessageTooLarge
 	unknownErr := errors.New("boom")
 

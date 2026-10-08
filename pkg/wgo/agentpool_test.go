@@ -366,7 +366,7 @@ func TestBuildLeadersAndTopicIDs(t *testing.T) {
 
 func stringPtr(s string) *string { return &s }
 
-func TestDiffAgentMembership(t *testing.T) {
+func TestAgentPool_DiffAgentMembership(t *testing.T) {
 	tests := map[string]struct {
 		old         []int32
 		new         []int32
