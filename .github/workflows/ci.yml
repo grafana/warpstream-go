@@ -47,7 +47,7 @@ jobs:
           go run ./pkg/internal/simulation -timeout 3m
           -report-filepath "$RUNNER_TEMP/simulation-report.md"
           -json-report-filepath "$RUNNER_TEMP/simulation-report.json"
-      - name: Verify scenario names and success rates
+      - name: Verify scenario names and attempt/pass counts
         run: diff -u pkg/internal/simulation/REPORT.json "$RUNNER_TEMP/simulation-report.json"
       - name: Publish simulation report
         if: always()

@@ -26,15 +26,21 @@ func newResultsReport(r scenarioResults) *resultsReport {
 }
 
 func (rr *resultsReport) generateJSON() ([]byte, error) {
+	type clientResults struct {
+		Attempts int `json:"attempts"`
+		Passes   int `json:"passes"`
+	}
 	type scenarioSuccess struct {
-		Scenario       string  `json:"scenario"`
-		WgoSuccessRate float64 `json:"wgo_success_rate"`
-		KgoSuccessRate float64 `json:"kgo_success_rate"`
+		Scenario string        `json:"scenario"`
+		Wgo      clientResults `json:"wgo"`
+		Kgo      clientResults `json:"kgo"`
 	}
 	results := make([]scenarioSuccess, 0, len(rr.results.entries))
 	for _, res := range rr.results.entries {
 		results = append(results, scenarioSuccess{
-			Scenario: res.sc.name, WgoSuccessRate: res.successRate(), KgoSuccessRate: res.kgoSuccessRate(),
+			Scenario: res.sc.name,
+			Wgo:      clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
+			Kgo:      clientResults{Attempts: res.kgoSummary.total, Passes: res.kgoSummary.successes},
 		})
 	}
 	slices.SortFunc(results, func(a, b scenarioSuccess) int { return cmp.Compare(a.Scenario, b.Scenario) })
@@ -113,6 +119,7 @@ func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 	b.WriteString("| Partitioner | Manual — fixed leader per partition, never reroutes |\n")
 	fmt.Fprintf(b, "| Max produce requests in-flight per broker | %d |\n", clientMaxInflight)
 	b.WriteString("| Record retries | unlimited (bounded only by the delivery timeout above) |\n")
+	b.WriteString("| Retry backoff | 250ms exponential, capped at 5s, without jitter |\n")
 	b.WriteString("| Max buffered records / bytes | unlimited |\n")
 	b.WriteString("\n")
 }
