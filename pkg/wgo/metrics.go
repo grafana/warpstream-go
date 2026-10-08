@@ -50,6 +50,9 @@ type metrics struct {
 	produceRequestsPrimaryTotal prometheus.Counter
 	produceRequestsHedgeTotal   prometheus.Counter
 
+	produceAttemptRecords [attemptRoleCount]prometheus.Counter
+	produceAttemptBytes   [attemptRoleCount]prometheus.Counter
+
 	produceRecordsTotal         prometheus.Counter
 	produceRecordsFailedTotal   prometheus.Counter
 	produceRecordsRejectedTotal *prometheus.CounterVec
@@ -104,6 +107,20 @@ const (
 	metadataRefreshResultMembershipChanged = "membership_changed"
 	metadataRefreshResultUnchanged         = "unchanged"
 	metadataRefreshResultFailed            = "failed"
+)
+
+// attemptRole is which side of the hedge a Produce attempt is on.
+type attemptRole int8
+
+const (
+	attemptPrimary attemptRole = iota
+	attemptHedge
+	attemptRoleCount
+)
+
+const (
+	attemptLabelPrimary = "primary"
+	attemptLabelHedge   = "hedge"
 )
 
 // produceFinalOutcome is why a Hedger produce failed. One increment is one
@@ -224,6 +241,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		Help: "Logical fallback cascades whose result won, by the trigger that started the cascade (latency, primary_failure, demoted_probe). Counted at the same point as warpstream_hedge_wins_total, so the series sum to it. Divide by warpstream_produce_hedge_triggers_total for the win rate of each trigger.",
 	}, []string{"trigger"})
 
+	produceAttemptRecords := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_attempt_records_total",
+		Help: "Records handed to the direct producer, by attempt role (primary, hedge). Counted at dispatch whether or not the attempt succeeds, including a losing leg that is canceled afterwards. This is attempted work, not records confirmed on the wire; compare with produce_records_total, which counts only acked requests.",
+	}, []string{"attempt"})
+
+	produceAttemptBytes := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_attempt_bytes_total",
+		Help: "Compressed record bytes handed to the direct producer, by attempt role (primary, hedge). Same boundary as warpstream_produce_attempt_records_total; compare with produce_compressed_bytes_total, which counts only acked requests.",
+	}, []string{"attempt"})
+
 	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_final_outcome_total",
 		Help: "Why one nonempty Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error stopped retries), write_timeout (the Hedger work budget expired and that expiry is the returned failure), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is included here and excluded from warpstream_produce_requests_attempts.",
@@ -258,6 +285,14 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			hedgeTriggerLatency:        hedgeTriggers.WithLabelValues(hedgeTriggerLabelLatency),
 			hedgeTriggerPrimaryFailure: hedgeTriggers.WithLabelValues(hedgeTriggerLabelPrimaryFailure),
 			hedgeTriggerDemotedProbe:   hedgeTriggers.WithLabelValues(hedgeTriggerLabelDemotedProbe),
+		},
+		produceAttemptRecords: [attemptRoleCount]prometheus.Counter{
+			attemptPrimary: produceAttemptRecords.WithLabelValues(attemptLabelPrimary),
+			attemptHedge:   produceAttemptRecords.WithLabelValues(attemptLabelHedge),
+		},
+		produceAttemptBytes: [attemptRoleCount]prometheus.Counter{
+			attemptPrimary: produceAttemptBytes.WithLabelValues(attemptLabelPrimary),
+			attemptHedge:   produceAttemptBytes.WithLabelValues(attemptLabelHedge),
 		},
 		hedgeTriggerWins: [hedgeTriggerCount]prometheus.Counter{
 			hedgeTriggerLatency:        hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelLatency),
@@ -385,6 +420,11 @@ func (m *metrics) observeMetadataRefresh(trigger metadataRefreshTrigger, before,
 	if removed > 0 {
 		m.agentpoolAgentsChanged[agentpoolChurnRemoved].Add(float64(removed))
 	}
+}
+
+func (m *metrics) observeAttempt(role attemptRole, stats produceRequestStats) {
+	m.produceAttemptRecords[role].Add(float64(stats.records))
+	m.produceAttemptBytes[role].Add(float64(stats.compressedBytes))
 }
 
 // observeClusterStats records one ClusterStats compute. Without a view the

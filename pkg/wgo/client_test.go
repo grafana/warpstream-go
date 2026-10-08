@@ -82,6 +82,30 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32, op
 func TestWarpstreamClient_ProduceSync(t *testing.T) {
 	const topic = "test-topic"
 
+	t.Run("attempted payload equals the wire counters when every produce succeeds", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, _, _, _ := newTestWarpstreamClient(t, topic, 1)
+
+			// Three records for one partition go out as one merged batch.
+			results := c.ProduceSync(t.Context(), []*kgo.Record{
+				{Topic: topic, Partition: 0, Value: []byte("a"), Timestamp: time.Now()},
+				{Topic: topic, Partition: 0, Value: []byte("b"), Timestamp: time.Now()},
+				{Topic: topic, Partition: 0, Value: []byte("c"), Timestamp: time.Now()},
+			})
+			require.Len(t, results, 3)
+			for _, res := range results {
+				require.NoError(t, res.Err)
+			}
+
+			assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.produceAttemptRecords[attemptPrimary]))
+			assert.Equal(t, testutil.ToFloat64(c.metrics.produceWireRecordsTotal), testutil.ToFloat64(c.metrics.produceAttemptRecords[attemptPrimary]))
+			assert.Equal(t, testutil.ToFloat64(c.metrics.produceWireCompressedBytesTotal), testutil.ToFloat64(c.metrics.produceAttemptBytes[attemptPrimary]))
+			assert.Positive(t, testutil.ToFloat64(c.metrics.produceAttemptBytes[attemptPrimary]))
+			assert.Zero(t, testutil.ToFloat64(c.metrics.produceAttemptRecords[attemptHedge]))
+			assert.Zero(t, testutil.ToFloat64(c.metrics.produceAttemptBytes[attemptHedge]))
+		})
+	})
+
 	t.Run("single record produces and is consumable", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			c, _, clusterAddr, vnet := newTestWarpstreamClient(t, topic, 1)
@@ -1237,6 +1261,10 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 					assertFinalOutcomes(t, c.metrics, map[produceFinalOutcome]float64{
 						produceFinalOutcomeWriteTimeout: 1,
 					})
+					// The stuck attempt was dispatched, so it counts as attempted,
+					// but nothing was acked on the wire.
+					assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.produceAttemptRecords[attemptPrimary]))
+					assert.Zero(t, testutil.ToFloat64(c.metrics.produceWireRecordsTotal))
 				})
 			})
 

@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"fmt"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -274,6 +275,26 @@ func TestNewMetrics_AgentPoolExcludedLeaders(t *testing.T) {
 	}
 }
 
+func TestNewMetrics_ProduceAttemptPayload(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.observeAttempt(attemptPrimary, produceRequestStats{records: 3, batches: 2, uncompressedBytes: 900, compressedBytes: 300})
+	m.observeAttempt(attemptHedge, produceRequestStats{records: 1, batches: 1, uncompressedBytes: 90, compressedBytes: 40})
+	m.observeAttempt(attemptHedge, produceRequestStats{records: 2, batches: 1, uncompressedBytes: 60, compressedBytes: 20})
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_attempt_records_total Records handed to the direct producer, by attempt role (primary, hedge). Counted at dispatch whether or not the attempt succeeds, including a losing leg that is canceled afterwards. This is attempted work, not records confirmed on the wire; compare with produce_records_total, which counts only acked requests.
+		# TYPE warpstream_produce_attempt_records_total counter
+		warpstream_produce_attempt_records_total{attempt="hedge"} 3
+		warpstream_produce_attempt_records_total{attempt="primary"} 3
+		# HELP warpstream_produce_attempt_bytes_total Compressed record bytes handed to the direct producer, by attempt role (primary, hedge). Same boundary as warpstream_produce_attempt_records_total; compare with produce_compressed_bytes_total, which counts only acked requests.
+		# TYPE warpstream_produce_attempt_bytes_total counter
+		warpstream_produce_attempt_bytes_total{attempt="hedge"} 60
+		warpstream_produce_attempt_bytes_total{attempt="primary"} 300
+	`), "warpstream_produce_attempt_records_total", "warpstream_produce_attempt_bytes_total"))
+}
+
 func TestNewMetrics_HedgeTriggerWins(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)
@@ -326,6 +347,25 @@ func TestMetrics_ObserveAgentPoolChurn(t *testing.T) {
 		warpstream_agentpool_agents_changed_total{direction="added"} 3
 		warpstream_agentpool_agents_changed_total{direction="removed"} 2
 	`), "warpstream_agentpool_agents_changed_total"))
+}
+
+// BenchmarkMetrics_ObserveAttempt measures the per-dispatch cost of the
+// attempted-payload counters for a many-partition payload.
+func BenchmarkMetrics_ObserveAttempt(b *testing.B) {
+	for _, partitions := range []int{1, 32, 256, 1024} {
+		b.Run(fmt.Sprintf("partitions=%d", partitions), func(b *testing.B) {
+			m := newMetrics(prometheus.NewRegistry())
+			parts := make([]routedEncodedTopicPartitionRecords, partitions)
+			for i := range parts {
+				parts[i].encodedStats = produceRequestStats{records: 10, batches: 1, uncompressedBytes: 1000, compressedBytes: 400}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.observeAttempt(attemptPrimary, sumEncodedStats(parts))
+			}
+		})
+	}
 }
 
 func BenchmarkMetrics_HedgeTriggerInc(b *testing.B) {

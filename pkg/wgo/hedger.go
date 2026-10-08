@@ -154,6 +154,7 @@ func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy Partitio
 		// covering multiple partitions). The companion primary counter is
 		// incremented in ProduceSync.
 		m.produceRequestsHedgeTotal.Inc()
+		m.observeAttempt(attemptHedge, sumEncodedStats(parts))
 
 		// DirectProducer takes unrouted partitions (the target Agent is specified
 		// separately), so we strip the routing.
@@ -223,6 +224,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	primaryCh := make(chan ProduceResult, 1)
 	go func() {
 		h.metrics.produceRequestsPrimaryTotal.Inc()
+		h.metrics.observeAttempt(attemptPrimary, sumEncodedStats(routedPartitions))
 		primaryCh <- h.withCoverageCheck(h.inner.ProduceSync(workCtx, agentFromRouted(primaryID, routedPartitions), partitions), primaryID, partitions)
 	}()
 
