@@ -79,6 +79,29 @@ func scenarios() []scenario {
 			expect: scenarioExpectations{minWgoSuccessRate: 1.0},
 		},
 		{
+			name: "1 dropped leader",
+			description: "Metadata omits broker 1 but still names it as partition 1's leader throughout the observed phase. " +
+				"All agents accept writes at healthy latency. Each event includes the affected partition and 49 healthy siblings. " +
+				"wgo must fall back to a live agent; kgo loses its destination when Metadata refreshes.",
+			behaviours: missingBrokerBehaviours(1),
+			expect:     scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.5)},
+		},
+		func() scenario {
+			count := agentCount("25% dropped", 1, 4)
+			ids := make([]int32, count)
+			for i := range ids {
+				ids[i] = int32(i)
+			}
+			return scenario{
+				name: "25% dropped leaders",
+				description: "Metadata omits 12 of 50 brokers but retains their partition leaders throughout the observed phase. " +
+					"Every event mixes affected partitions with healthy siblings; omitted agents still accept writes, " +
+					"isolating the inconsistent Metadata view from transport failures.",
+				behaviours: missingBrokerBehaviours(ids...),
+				expect:     scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.5)},
+			}
+		}(),
+		{
 			name:        "1 fast-failing agent",
 			description: "Broker 1 returns NotLeaderForPartition immediately; the cascade path retries on another agent.",
 			behaviours:  failingBehavioursFor(1),
@@ -225,11 +248,11 @@ func scenarios() []scenario {
 			}
 			return scenario{
 				name: "GCS slow outage (10% bad, 40% moderate)",
-				description: "Reproduces an incident where object storage degraded asymmetrically: 50% healthy, 40% avg ≈ 700ms/max ≈ 4s, 10% avg ≈ 2.65s/max ≈ 10s. " +
+				description: "Models asymmetric object-storage degradation: 50% healthy, 40% avg ≈ 700ms/max ≈ 4s, 10% avg ≈ 2.65s/max ≈ 10s. " +
 					"We expect a large initial failure spike; the Demoter should kick in within ~30s and reroute away from the worst offenders. The threshold is intentionally loose.",
 				behaviours: bh,
 				// The absolute floor is deliberately loose (this is an
-				// incident scenario, not a clean pass/fail), and a
+				// asymmetric degradation scenario), and a
 				// non-rerouting client can still clear it by chance — the
 				// delta vs. kgo (measured in the same run) is what proves
 				// the Demoter/Hedger actually helped here.

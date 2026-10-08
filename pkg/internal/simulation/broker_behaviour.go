@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,7 +33,8 @@ type brokerBehaviour struct {
 // brokersBehaviour holds the Produce behaviour for every broker in the cluster,
 // keyed by node ID.
 type brokersBehaviour struct {
-	byBroker map[int32]brokerBehaviour
+	byBroker       map[int32]brokerBehaviour
+	missingBrokers []int32
 }
 
 // forBroker returns the behaviour for nodeID, and whether one is configured.
@@ -41,8 +43,8 @@ func (b brokersBehaviour) forBroker(nodeID int32) (brokerBehaviour, bool) {
 	return bh, ok
 }
 
-// healthyBehaviours returns a baseline where every broker runs at production-like
-// healthy latency. Scenarios mutate a copy.
+// healthyBehaviours returns a baseline where every broker runs at healthy
+// latency. Scenarios mutate a copy.
 func healthyBehaviours() brokersBehaviour {
 	byBroker := map[int32]brokerBehaviour{}
 	for i := range clusterSize {
@@ -107,7 +109,7 @@ func newBrokersBehaviourProvider(initial brokersBehaviour) *brokersBehaviourProv
 // set swaps in a copy of b's map so a caller that keeps mutating its own map can't
 // race the concurrent produce paths reading the live behaviour.
 func (p *brokersBehaviourProvider) set(b brokersBehaviour) {
-	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker)})
+	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers)})
 }
 
 func (p *brokersBehaviourProvider) get() brokersBehaviour {
