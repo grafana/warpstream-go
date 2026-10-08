@@ -58,15 +58,11 @@ func (rr *resultsReport) generateMarkdown() string {
 	return b.String()
 }
 
-// writeConfigSection renders the client configuration the run used: settings
-// shared by both clients (mirroring production, per newKgoClient's doc
-// comment), plus each client's own knobs with no equivalent on the other
-// side. Printed so a reader can judge whether a result reflects the
-// scenario's behaviour or just this run's particular timeout/hedge/linger
-// values, without having to go read environment.go.
+// Include settings so readers can distinguish scenario effects from client
+// configuration differences.
 func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 	b.WriteString("## Client configuration\n\n")
-	b.WriteString("Shared by both clients (mirrors production `pkg/storage/ingest/writer_client.go`):\n\n")
+	b.WriteString("Shared by both clients:\n\n")
 	b.WriteString("| Setting | Value |\n| --- | --- |\n")
 	fmt.Fprintf(b, "| Dial timeout | %s |\n", clientDialTimeout)
 	fmt.Fprintf(b, "| Write / delivery timeout | %s |\n", clientWriteTimeout)
@@ -78,7 +74,7 @@ func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 
 	b.WriteString("wgo-only — this simulation's own values, shown against `pkg/wgo`'s library " +
 		"defaults for comparison (a value need not match its default; it's what this run actually " +
-		"used, not a claim about what production configures):\n\n")
+		"used):\n\n")
 	b.WriteString("| Setting | Value | pkg/wgo default |\n| --- | --- | --- |\n")
 	fmt.Fprintf(b, "| Hedger: min hedge delay | %s | %s |\n", wgoHedgerMinHedgeDelay, wgo.DefaultHedgerMinHedgeDelay)
 	fmt.Fprintf(b, "| Hedger: max hedge agents | %d | %d |\n", wgoHedgerMaxHedgeAgents, wgo.DefaultHedgerMaxHedgeAgents)
@@ -177,7 +173,13 @@ func (rr *resultsReport) writeBucketTable(b *strings.Builder, res scenarioResult
 			d.primary += x.primary
 			d.hedge += x.hedge
 		}
-		fmt.Fprintf(b, "| %ds+ drain | — | — | — | %s | — | — | — |\n", n*secs, rr.bucketSurgeCell(d))
+		if d.primary != 0 || d.hedge != 0 {
+			surge := rr.bucketSurgeCell(d)
+			if d.primary == 0 {
+				surge = fmt.Sprintf("%d/0 (n/a)", d.hedge)
+			}
+			fmt.Fprintf(b, "| %ds+ drain | — | — | — | %s | — | — | — |\n", n*secs, surge)
+		}
 	}
 }
 

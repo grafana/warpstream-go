@@ -11,6 +11,32 @@ import (
 	"github.com/grafana/warpstream-go/pkg/wgo"
 )
 
+func TestResultsReport_WriteBucketTableDrain(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		drain []counterBucketDelta
+		want  string
+	}{
+		{name: "empty intervals", drain: []counterBucketDelta{{}, {}}},
+		{name: "primary only", drain: []counterBucketDelta{{}, {primary: 2}}, want: "| 10s+ drain | — | — | — | 0/2 (+0%) | — | — | — |"},
+		{name: "hedge only", drain: []counterBucketDelta{{hedge: 1}, {}}, want: "| 10s+ drain | — | — | — | 1/0 (n/a) | — | — | — |"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var b strings.Builder
+			(&resultsReport{}).writeBucketTable(&b, scenarioResult{
+				wgoBuckets:    []observationsSummary{{total: 1, successes: 1}},
+				produceDeltas: append([]counterBucketDelta{{primary: 1}}, tc.drain...),
+			})
+			if tc.want == "" {
+				assert.NotContains(t, b.String(), "+ drain")
+			} else {
+				assert.Contains(t, b.String(), tc.want)
+			}
+		})
+	}
+}
+
 func TestResultsReport_FormatDuration(t *testing.T) {
 	t.Parallel()
 	rr := &resultsReport{}
