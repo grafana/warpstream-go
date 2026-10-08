@@ -1,0 +1,62 @@
+[
+  {
+    "scenario": "1 dropped leader",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0.15833333333333333
+  },
+  {
+    "scenario": "1 fast-failing agent",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0
+  },
+  {
+    "scenario": "1 slow agent",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 1
+  },
+  {
+    "scenario": "1% failure rate across all agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0.03333333333333333
+  },
+  {
+    "scenario": "1% slow bursts across all agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 1
+  },
+  {
+    "scenario": "1% timeouts across all agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0.5333333333333333
+  },
+  {
+    "scenario": "2 fast-failing agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0
+  },
+  {
+    "scenario": "2 slow agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 1
+  },
+  {
+    "scenario": "25% dropped leaders",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 0.15833333333333333
+  },
+  {
+    "scenario": "25% slow agents",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 1
+  },
+  {
+    "scenario": "GCS slow outage (10% bad, 40% moderate)",
+    "wgo_success_rate": 0.95,
+    "kgo_success_rate": 0.225
+  },
+  {
+    "scenario": "all healthy",
+    "wgo_success_rate": 1,
+    "kgo_success_rate": 1
+  }
+]

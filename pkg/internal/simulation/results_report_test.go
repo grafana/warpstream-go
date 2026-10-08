@@ -7,9 +7,31 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/warpstream-go/pkg/wgo"
 )
+
+func TestResultsReport_GenerateJSON(t *testing.T) {
+	t.Parallel()
+	results := scenarioResults{entries: []scenarioResult{
+		{sc: scenario{name: "b"}, wgoSummary: observationsSummary{total: 4, successes: 3}, kgoSummary: observationsSummary{total: 4, successes: 1}},
+		{sc: scenario{name: "a"}, wgoSummary: observationsSummary{total: 4, successes: 4}, kgoSummary: observationsSummary{total: 4, successes: 0}},
+	}}
+	data, err := newResultsReport(results).generateJSON()
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{"scenario":"a","wgo_success_rate":1,"kgo_success_rate":0},
+		{"scenario":"b","wgo_success_rate":0.75,"kgo_success_rate":0.25}
+	]`, string(data))
+
+	results.entries[0], results.entries[1] = results.entries[1], results.entries[0]
+	results.entries[0].wgoSummary.p99Latency = time.Hour
+	results.entries[0].totalHedge = 99
+	reordered, err := newResultsReport(results).generateJSON()
+	require.NoError(t, err)
+	assert.Equal(t, data, reordered)
+}
 
 func TestResultsReport_WriteBucketTableDrain(t *testing.T) {
 	t.Parallel()
