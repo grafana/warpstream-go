@@ -21,8 +21,8 @@ func TestResultsReport_GenerateJSON(t *testing.T) {
 	data, err := newResultsReport(results).generateJSON()
 	require.NoError(t, err)
 	assert.JSONEq(t, `[
-		{"scenario":"a","wgo_success_rate":1,"kgo_success_rate":0},
-		{"scenario":"b","wgo_success_rate":0.75,"kgo_success_rate":0.25}
+		{"scenario":"a","wgo":{"attempts":4,"passes":4},"kgo":{"attempts":4,"passes":0}},
+		{"scenario":"b","wgo":{"attempts":4,"passes":3},"kgo":{"attempts":4,"passes":1}}
 	]`, string(data))
 
 	results.entries[0], results.entries[1] = results.entries[1], results.entries[0]
@@ -31,6 +31,12 @@ func TestResultsReport_GenerateJSON(t *testing.T) {
 	reordered, err := newResultsReport(results).generateJSON()
 	require.NoError(t, err)
 	assert.Equal(t, data, reordered)
+
+	results.entries[0].wgoSummary.total = 8
+	results.entries[0].wgoSummary.successes = 8
+	moreAttempts, err := newResultsReport(results).generateJSON()
+	require.NoError(t, err)
+	assert.NotEqual(t, data, moreAttempts)
 }
 
 func TestResultsReport_WriteBucketTableDrain(t *testing.T) {

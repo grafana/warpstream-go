@@ -328,6 +328,8 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 
 		// Bound retries by delivery time rather than a fixed attempt count.
 		kgo.RecordRetries(math.MaxInt64),
+		// Retry jitter changes the fault draws consumed before the app deadline.
+		kgo.RetryBackoffFn(simulationRetryBackoff),
 		kgo.RecordDeliveryTimeout(clientWriteTimeout),
 		kgo.ProduceRequestTimeout(clientProduceRequestTimeout),
 		kgo.RequestTimeoutOverhead(clientRequestTimeoutOverhead),
@@ -338,4 +340,16 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 		kgo.MaxVersions(v),
 	}
 	return kgo.NewClient(opts...)
+}
+
+func simulationRetryBackoff(failures int) time.Duration {
+	const minBackoff = 250 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+	if failures <= 1 {
+		return minBackoff
+	}
+	if failures > 5 {
+		return maxBackoff
+	}
+	return min(minBackoff*time.Duration(1<<(failures-1)), maxBackoff)
 }

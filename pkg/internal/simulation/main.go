@@ -12,7 +12,7 @@ import (
 
 func main() {
 	reportFilepath := flag.String("report-filepath", "", "if set, write the Markdown report to this file path")
-	jsonReportFilepath := flag.String("json-report-filepath", "", "if set, write scenario names and success rates as JSON to this file path")
+	jsonReportFilepath := flag.String("json-report-filepath", "", "if set, write scenario names and attempt/pass counts as JSON to this file path")
 	timeout := flag.Duration("timeout", 20*time.Minute, "overall timeout for the whole simulation")
 	flag.Parse()
 
