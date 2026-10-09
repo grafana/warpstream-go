@@ -15,7 +15,9 @@ read it when planning changes to the areas it covers, and keep it current:
 
 - [`docs/internal/metrics.md`](docs/internal/metrics.md) — how metrics are split
   (transport vs producer-state vs warpstream-specific) and the franz-go/`kprom`
-  drop-in-compatibility contract. Update it when changing metrics.
+  drop-in-compatibility contract. Update it when that categorization or parity
+  contract changes. Do not catalog individual custom metrics here; their
+  Prometheus help strings are the source of truth.
 - [`docs/internal/tracing.md`](docs/internal/tracing.md) — how the client drives
   franz-go's produce-record hooks on its own produce path to support tracing (e.g.
   `kotel`) as a drop-in. Update it when changing hook or tracing behaviour.

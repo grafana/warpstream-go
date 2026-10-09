@@ -1,6 +1,7 @@
 package wgo
 
 import (
+	"fmt"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -237,6 +238,144 @@ func TestMetrics_ObserveClusterStats(t *testing.T) {
 	require.InDelta(t, 10, gaugeValue(t, reg, "warpstream_cluster_slow_contributors"), 0)
 	require.InDelta(t, 0.2, gaugeValue(t, reg, "warpstream_cluster_faulty_fraction"), 1e-9)
 	require.InDelta(t, 5, gaugeValue(t, reg, "warpstream_cluster_faulty_contributors"), 0)
+}
+
+func TestNewMetrics_HedgeTriggers(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.hedgeTriggers[hedgeTriggerLatency].Inc()
+	m.hedgeTriggers[hedgeTriggerPrimaryFailure].Add(2)
+	m.hedgeTriggers[hedgeTriggerDemotedProbe].Add(3)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_hedge_triggers_total Why a logical fallback cascade started: latency (hedge timer, or a healthy primary whose computed delay is already zero), primary_failure (the primary failed before the race), or demoted_probe (the routing-time primary was demoted). One increment per cascade entry, including a cascade that dispatches no request. Not a wire request or a hedge wave.
+		# TYPE warpstream_produce_hedge_triggers_total counter
+		warpstream_produce_hedge_triggers_total{trigger="demoted_probe"} 3
+		warpstream_produce_hedge_triggers_total{trigger="latency"} 1
+		warpstream_produce_hedge_triggers_total{trigger="primary_failure"} 2
+	`), "warpstream_produce_hedge_triggers_total"))
+}
+
+func TestNewMetrics_AgentPoolExcludedLeaders(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	// 0 before any refresh publishes a value.
+	require.InDelta(t, 0.0, gaugeValue(t, reg, "warpstream_agentpool_excluded_leaders"), 0)
+
+	m.agentPoolExcludedLeaders.Set(3)
+	require.InDelta(t, 3.0, gaugeValue(t, reg, "warpstream_agentpool_excluded_leaders"), 0)
+
+	// The old counter is gone: it was never deployed.
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		assert.NotEqual(t, "warpstream_agentpool_leader_dropped_total", f.GetName())
+	}
+}
+
+func TestNewMetrics_ProduceAttemptPayload(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.observeAttempt(attemptPrimary, produceRequestStats{records: 3, batches: 2, uncompressedBytes: 900, compressedBytes: 300})
+	m.observeAttempt(attemptHedge, produceRequestStats{records: 1, batches: 1, uncompressedBytes: 90, compressedBytes: 40})
+	m.observeAttempt(attemptHedge, produceRequestStats{records: 2, batches: 1, uncompressedBytes: 60, compressedBytes: 20})
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_attempt_records_total Records handed to the direct producer, by attempt role (primary, hedge). Counted at dispatch whether or not the attempt succeeds, including a losing leg that is canceled afterwards. This is attempted work, not records confirmed on the wire; compare with produce_records_total, which counts only acked requests.
+		# TYPE warpstream_produce_attempt_records_total counter
+		warpstream_produce_attempt_records_total{attempt="hedge"} 3
+		warpstream_produce_attempt_records_total{attempt="primary"} 3
+		# HELP warpstream_produce_attempt_bytes_total Compressed record bytes handed to the direct producer, by attempt role (primary, hedge). Same boundary as warpstream_produce_attempt_records_total; compare with produce_compressed_bytes_total, which counts only acked requests.
+		# TYPE warpstream_produce_attempt_bytes_total counter
+		warpstream_produce_attempt_bytes_total{attempt="hedge"} 60
+		warpstream_produce_attempt_bytes_total{attempt="primary"} 300
+	`), "warpstream_produce_attempt_records_total", "warpstream_produce_attempt_bytes_total"))
+}
+
+func TestNewMetrics_HedgeTriggerWins(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.hedgeTriggerWins[hedgeTriggerLatency].Inc()
+	m.hedgeTriggerWins[hedgeTriggerPrimaryFailure].Add(2)
+	m.hedgeTriggerWins[hedgeTriggerDemotedProbe].Add(3)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_hedge_trigger_wins_total Logical fallback cascades whose result won, by the trigger that started the cascade (latency, primary_failure, demoted_probe). Counted at the same point as warpstream_hedge_wins_total, so the series sum to it. Divide by warpstream_produce_hedge_triggers_total for the win rate of each trigger.
+		# TYPE warpstream_produce_hedge_trigger_wins_total counter
+		warpstream_produce_hedge_trigger_wins_total{trigger="demoted_probe"} 3
+		warpstream_produce_hedge_trigger_wins_total{trigger="latency"} 1
+		warpstream_produce_hedge_trigger_wins_total{trigger="primary_failure"} 2
+	`), "warpstream_produce_hedge_trigger_wins_total"))
+}
+
+func TestNewMetrics_ProduceRequestsFailed(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.produceRequestsFailed[produceFailureReasonCandidatesExhausted].Inc()
+	m.produceRequestsFailed[produceFailureReasonTerminalError].Add(2)
+	m.produceRequestsFailed[produceFailureReasonWriteTimeout].Add(3)
+	m.produceRequestsFailed[produceFailureReasonInternalError].Add(4)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_produce_requests_failed_total Why a Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.
+		# TYPE warpstream_produce_requests_failed_total counter
+		warpstream_produce_requests_failed_total{reason="candidates_exhausted"} 1
+		warpstream_produce_requests_failed_total{reason="internal_error"} 4
+		warpstream_produce_requests_failed_total{reason="terminal_error"} 2
+		warpstream_produce_requests_failed_total{reason="write_timeout"} 3
+	`), "warpstream_produce_requests_failed_total"))
+}
+
+func TestMetrics_ObserveAgentPoolChurn(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, nil, []int32{1, 2}, nil)
+	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2}, []int32{1, 2}, nil)
+	// A failed refresh reports no churn even if the sets happen to differ.
+	m.observeMetadataRefresh(metadataRefreshTriggerOnDemand, []int32{1}, []int32{1, 9}, assert.AnError)
+	m.observeMetadataRefresh(metadataRefreshTriggerPeriodic, []int32{1, 2, 3}, []int32{1, 4}, nil)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_agentpool_agents_changed_total NodeIDs added to or removed from the AgentPool on a successful live Metadata refresh, by direction. Constructor initialization is excluded. An address-only or leader-only change is not membership churn.
+		# TYPE warpstream_agentpool_agents_changed_total counter
+		warpstream_agentpool_agents_changed_total{direction="added"} 3
+		warpstream_agentpool_agents_changed_total{direction="removed"} 2
+	`), "warpstream_agentpool_agents_changed_total"))
+}
+
+// BenchmarkMetrics_ObserveAttempt measures the per-dispatch cost of the
+// attempted-payload counters for a many-partition payload.
+func BenchmarkMetrics_ObserveAttempt(b *testing.B) {
+	for _, partitions := range []int{1, 32, 256, 1024} {
+		b.Run(fmt.Sprintf("partitions=%d", partitions), func(b *testing.B) {
+			m := newMetrics(prometheus.NewRegistry())
+			parts := make([]routedEncodedTopicPartitionRecords, partitions)
+			for i := range parts {
+				parts[i].encodedStats = produceRequestStats{records: 10, batches: 1, uncompressedBytes: 1000, compressedBytes: 400}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.observeAttempt(attemptPrimary, sumEncodedStats(parts))
+			}
+		})
+	}
+}
+
+func BenchmarkMetrics_HedgeTriggerInc(b *testing.B) {
+	m := newMetrics(prometheus.NewRegistry())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.hedgeAttemptsTotal.Inc()
+		m.hedgeTriggers[hedgeTriggerLatency].Inc()
+	}
 }
 
 func BenchmarkMetrics_DirectRequestAccounting(b *testing.B) {

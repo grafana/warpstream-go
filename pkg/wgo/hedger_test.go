@@ -28,6 +28,47 @@ func histogramCountSum(t *testing.T, h prometheus.Histogram) (uint64, float64) {
 	return m.GetHistogram().GetSampleCount(), m.GetHistogram().GetSampleSum()
 }
 
+// assertProduceFailures checks every failure-reason series. Reasons omitted from
+// want are asserted at zero, so a nil want means the invocation emitted none.
+func assertProduceFailures(t *testing.T, m *metrics, want map[produceFailureReason]float64) {
+	t.Helper()
+	reasons := []produceFailureReason{
+		produceFailureReasonCandidatesExhausted,
+		produceFailureReasonTerminalError,
+		produceFailureReasonWriteTimeout,
+		produceFailureReasonInternalError,
+	}
+	for _, reason := range reasons {
+		assert.Equal(t, want[reason], testutil.ToFloat64(m.produceRequestsFailed[reason]), "failure reason %d", reason)
+	}
+}
+
+// assertTriggerWins checks every hedge-trigger win series. Triggers omitted
+// from want are asserted at zero. It also checks the two invariants of the
+// family: the series sum to hedgeWinsTotal, and a trigger never wins more
+// cascades than it started.
+func assertTriggerWins(t *testing.T, m *metrics, want map[hedgeTrigger]float64) {
+	t.Helper()
+	var sum float64
+	for trigger := hedgeTrigger(0); trigger < hedgeTriggerCount; trigger++ {
+		got := testutil.ToFloat64(m.hedgeTriggerWins[trigger])
+		assert.Equal(t, want[trigger], got, "trigger %d wins", trigger)
+		assert.LessOrEqual(t, got, testutil.ToFloat64(m.hedgeTriggers[trigger]), "trigger %d wins exceed its triggers", trigger)
+		sum += got
+	}
+	assert.Equal(t, testutil.ToFloat64(m.hedgeWinsTotal), sum, "trigger wins must sum to hedgeWinsTotal")
+}
+
+// assertAttemptPayload checks the attempted-payload counters of both roles
+// against the producer-state counts the test expects each role to have sent.
+func assertAttemptPayload(t *testing.T, m *metrics, primary, hedge produceRequestStats) {
+	t.Helper()
+	for role, want := range map[attemptRole]produceRequestStats{attemptPrimary: primary, attemptHedge: hedge} {
+		assert.Equal(t, float64(want.records), testutil.ToFloat64(m.produceAttemptRecords[role]), "role %d records", role)
+		assert.Equal(t, float64(want.compressedBytes), testutil.ToFloat64(m.produceAttemptBytes[role]), "role %d bytes", role)
+	}
+}
+
 // hedgerResult captures one partition's terminal outcome as fired by the
 // Hedger's per-partition done callback.
 type hedgerResult struct {
@@ -202,6 +243,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		}, nil
 	}
 
+	// reqStats is the payload makeReq sends; makeReq encodes deterministically.
+	reqStats := sumEncodedStats(unpromise(makeReq(newResultCapture())))
+
 	t.Run("no hedge decision: only primary is called", func(t *testing.T) {
 		producer := newMockDirectProducer()
 		producer.respFn = successResp
@@ -218,10 +262,12 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertProduceFailures(t, m, nil)
 		// Primary won → one success observation of attempt depth 1.
 		count, sum := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), count)
 		assert.Equal(t, float64(1), sum)
+		assertAttemptPayload(t, m, reqStats, produceRequestStats{})
 	})
 
 	t.Run("empty input is trivially successful", func(t *testing.T) {
@@ -235,6 +281,13 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.True(t, res.succeeded())
 		assert.NoError(t, res.error())
 		assert.Empty(t, producer.recordedCalls())
+		assertProduceFailures(t, m, nil)
+		successCount, _ := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
+		failureCount, _ := histogramCountSum(t, m.produceRequestsAttemptsFailure.(prometheus.Histogram))
+		assert.Equal(t, uint64(0), successCount)
+		assert.Equal(t, uint64(0), failureCount)
+		// Nothing was dispatched, so nothing was attempted.
+		assertAttemptPayload(t, m, produceRequestStats{}, produceRequestStats{})
 	})
 
 	t.Run("hedging suppressed when primary has no agent stats yet", func(t *testing.T) {
@@ -279,8 +332,16 @@ func TestHedger_ProduceSync(t *testing.T) {
 		}
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		// The fallback won the race; the canceled primary leg emits nothing.
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerLatency: 1})
+		// The blocked primary was dispatched and lost, and still counts.
+		assertAttemptPayload(t, m, reqStats, reqStats)
 	})
 
 	t.Run("primary fails with retriable error: cascade to secondary", func(t *testing.T) {
@@ -300,12 +361,20 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Contains(t, callIDs, secondaryID)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
 		// Primary failed, one hedge wave resolved it → success attempt depth 2.
 		count, sum := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), count)
 		assert.Equal(t, float64(2), sum)
+		// A failed primary that the cascade recovered is not a final failure.
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerPrimaryFailure: 1})
+		// The failed primary and the retry both count.
+		assertAttemptPayload(t, m, reqStats, reqStats)
 	})
 
 	t.Run("hedge timer fires and secondary wins: hedgeWinsTotal incremented", func(t *testing.T) {
@@ -330,6 +399,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		}, time.Second, 10*time.Millisecond)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerLatency: 1})
+		assertAttemptPayload(t, m, reqStats, reqStats)
 	})
 
 	t.Run("hedge timer fires but primary wins the race: hedgeAttemptsTotal++ but no hedgeWinsTotal", func(t *testing.T) {
@@ -367,6 +439,12 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assertProduceFailures(t, m, nil)
+		// The cascade started but lost: a trigger without a win.
+		assertTriggerWins(t, m, nil)
+		// The losing hedge leg was dispatched before the primary won.
+		assertAttemptPayload(t, m, reqStats, reqStats)
 	})
 
 	t.Run("hedge decision but primary wins before timer: no hedgeAttemptsTotal increment", func(t *testing.T) {
@@ -381,8 +459,12 @@ func TestHedger_ProduceSync(t *testing.T) {
 		require.NoError(t, capture.get(topic, partition).err)
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertAttemptPayload(t, m, reqStats, produceRequestStats{})
 	})
 
 	t.Run("per-partition fanout: each partition resolves independently", func(t *testing.T) {
@@ -429,6 +511,12 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Contains(t, callIDs, secondaryB)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerPrimaryFailure: 1})
+		// Two partitions go out together on the primary, then to two different
+		// fallback agents: the hedge total is the same payload split across flushes.
+		both := sumEncodedStats(unpromise(req))
+		assertAttemptPayload(t, m, both, both)
 	})
 
 	t.Run("single-agent cluster (no secondaries): primary error propagates", func(t *testing.T) {
@@ -452,11 +540,58 @@ func TestHedger_ProduceSync(t *testing.T) {
 		// fallback candidate.
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
 		// No hedge candidate → only the primary attempt was made before
 		// giving up, recorded under the failure outcome.
 		count, sum := histogramCountSum(t, m.produceRequestsAttemptsFailure.(prometheus.Histogram))
 		assert.Equal(t, uint64(1), count)
 		assert.Equal(t, float64(1), sum)
+		// The cascade dispatched nothing, so it adds no hedge payload.
+		assertAttemptPayload(t, m, reqStats, produceRequestStats{})
+	})
+
+	t.Run("hedging suppressed and primary fails: cascade is classified as primary failure", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.respFn = successResp
+		producer.errs[primaryID] = kerr.RequestTimedOut
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, NewAverageAgentStatsTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.NoError(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
+		assertProduceFailures(t, m, nil)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsSuppressedTotal.WithLabelValues(hedgeSuppressedNoAgentStats)))
+	})
+
+	t.Run("hedging suppressed and primary fails with no secondary: candidates exhausted", func(t *testing.T) {
+		emptyStrat := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, NewAverageAgentStatsTracker(), emptyStrat, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsSuppressedTotal.WithLabelValues(hedgeSuppressedNoAgentStats)))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
 	})
 
 	t.Run("partial fallback coverage: any partition exhausting candidates stops the whole attempt", func(t *testing.T) {
@@ -505,6 +640,10 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.NotContains(t, callIDs, secondaryID)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
 	})
 
 	t.Run("primary marked as probe (demoted): hedge fires immediately, ignoring hedge delay", func(t *testing.T) {
@@ -555,6 +694,10 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.True(t, sawFallback)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerDemotedProbe: 1})
 	})
 
 	t.Run("demoted primary is the only candidate: hedge fires but finds no fallback; primary's success wins", func(t *testing.T) {
@@ -584,9 +727,12 @@ func TestHedger_ProduceSync(t *testing.T) {
 		// hedgeAttemptsTotal is incremented on the fallback goroutine, which
 		// may not have run yet when the primary already won the race.
 		assert.Eventually(t, func() bool {
-			return testutil.ToFloat64(m.hedgeAttemptsTotal) == 1
+			return testutil.ToFloat64(m.hedgeAttemptsTotal) == 1 &&
+				testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]) == 1
 		}, time.Second, 10*time.Millisecond)
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assertProduceFailures(t, m, nil)
 		// Primary fires once; the hedge cascade has no candidates to try
 		// so no hedge wire request is issued.
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
@@ -622,6 +768,10 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 		require.NoError(t, capture.get(topic, partition).err,
 			"primary's slow but successful probe must be honoured even when the racing-variant fallback returned an empty result")
+		// The fallback's exhausted stop is dropped because the primary then succeeded.
+		assertProduceFailures(t, m, nil)
+		// The probe cascade found nothing to win with; the primary did.
+		assertTriggerWins(t, m, nil)
 	})
 
 	t.Run("both legs fail with retriable errors: surfaces the last error", func(t *testing.T) {
@@ -646,6 +796,11 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Len(t, producer.recordedCalls(), 2)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
+		assertTriggerWins(t, m, nil)
 	})
 
 	t.Run("non-retriable fallback err aborts: no further waves even with candidates left", func(t *testing.T) {
@@ -692,6 +847,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.Zero(t, seen[agentD])
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
 	})
 
 	t.Run("primary and secondary legs share the tried set: no agent is attempted twice", func(t *testing.T) {
@@ -814,6 +972,11 @@ func TestHedger_ProduceSync(t *testing.T) {
 			"got %v", err)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		// Both legs failed: exactly one failure reason, taken from the fallback's stop.
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
+		assertTriggerWins(t, m, nil)
 	})
 
 	t.Run("racing path: fallback exhausts before primary returns → fallback kerr preserved", func(t *testing.T) {
@@ -840,6 +1003,123 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.ErrorIs(t, err, kerr.NotLeaderForPartition, "got %v", err)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
+		assertTriggerWins(t, m, nil)
+	})
+
+	t.Run("primary fails non-retriably and the candidate budget is one: terminal error", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		one := cfg
+		one.MaxHedgeAgents = 1
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, one, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+	})
+
+	t.Run("primary fails non-retriably and it is the only candidate: terminal error", func(t *testing.T) {
+		onlyPrimary := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), onlyPrimary, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+	})
+
+	t.Run("racing path: fallback exhausts then the primary fails non-retriably: terminal error", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 50 * time.Millisecond
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+		assertTriggerWins(t, m, nil)
+	})
+
+	t.Run("racing path: fallback exhausts then the primary hits the work deadline is a write timeout", func(t *testing.T) {
+		// The fallback tries the one secondary and exhausts quickly, leaving
+		// the primary to run out the clock. The deadline is why this failed.
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 10 * time.Second
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		capture := newResultCapture()
+		runHedger(h, ctx, makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonWriteTimeout: 1,
+		})
+		assertTriggerWins(t, m, nil)
+	})
+
+	t.Run("racing path: fallback exhausts then the caller cancels while the primary runs: no failure counted", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.delays[primaryID] = 10 * time.Second
+		producer.errs[secondaryID] = kerr.NotLeaderForPartition
+
+		raceCfg := cfg
+		raceCfg.MinHedgeDelay = time.Millisecond
+		raceCfg.MaxHedgeAgents = 2
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, slowPrimaryTracker(), stratPrimaryAndSecondary, health, raceCfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// The secondary fails within milliseconds, so the cascade has
+		// exhausted its candidates well before the cancel.
+		time.AfterFunc(150*time.Millisecond, cancel)
+		capture := newResultCapture()
+		runHedger(h, ctx, makeReq(capture))
+
+		// The caller still sees the fallback's last error from the merged response.
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, nil)
 	})
 
 	t.Run("ctx canceled mid-fallback: result surfaces ctx err, not synthesized timeout", func(t *testing.T) {
@@ -872,6 +1152,33 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, nil)
+	})
+
+	t.Run("ctx deadline mid-fallback: failure reason is write timeout", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		gate := make(chan struct{})
+		producer.blockCh[secondaryID] = gate
+		t.Cleanup(func() { close(gate) })
+
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		err := h.ProduceSync(ctx, primaryID, []routedEncodedTopicPartitionRecords{{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition}}),
+			nodeID:                       primaryID,
+		}}).error()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonWriteTimeout: 1,
+		})
 	})
 
 	t.Run("fallback wins: primary leg is canceled via workCtx instead of running until its per-attempt deadline", func(t *testing.T) {
@@ -910,6 +1217,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 			}
 			return false
 		}, time.Second, 10*time.Millisecond, "primary leg was not canceled after fallback won")
+		// The canceled primary leg is a loser, not a failed produce.
+		assertProduceFailures(t, m, nil)
+		assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerDemotedProbe: 1})
 	})
 
 	t.Run("returns error when a routed partition's nodeID disagrees with primaryID", func(t *testing.T) {
@@ -931,6 +1241,126 @@ func TestHedger_ProduceSync(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "primaryID=1")
 		assert.Empty(t, producer.recordedCalls())
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonInternalError: 1,
+		})
+		successCount, _ := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
+		failureCount, _ := histogramCountSum(t, m.produceRequestsAttemptsFailure.(prometheus.Histogram))
+		assert.Equal(t, uint64(0), successCount)
+		assert.Equal(t, uint64(0), failureCount)
+		// Nothing was dispatched, so nothing was attempted.
+		assertAttemptPayload(t, m, produceRequestStats{}, produceRequestStats{})
+	})
+
+	t.Run("healthy primary with zero computed delay is a latency trigger", func(t *testing.T) {
+		// MinHedgeDelay and the baseline are both zero, so the fast path
+		// races immediately. That delay is not a demoted probe.
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		for _, id := range []int32{primaryID, secondaryID} {
+			seedFullWindow(tr, id, nowNs, 20, 0, 0)
+		}
+		producer := newMockDirectProducer()
+		producer.respFn = successResp
+		gate := make(chan struct{})
+		producer.blockCh[primaryID] = gate
+		t.Cleanup(func() { close(gate) })
+
+		zeroCfg := cfg
+		zeroCfg.MinHedgeDelay = 0
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, tr, stratPrimaryAndSecondary, health, zeroCfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+		require.NoError(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerDemotedProbe]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.GreaterOrEqual(t, testutil.ToFloat64(m.produceRequestsHedgeTotal), float64(1))
+		assertProduceFailures(t, m, nil)
+	})
+
+	t.Run("max hedge agents of one exhausts before any fallback dispatch", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		one := cfg
+		one.MaxHedgeAgents = 1
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, one, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assert.Equal(t, []int32{primaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
+		assertAttemptPayload(t, m, reqStats, produceRequestStats{})
+	})
+
+	t.Run("canceled before fallback dispatch counts the cascade and emits no failure", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.blockCh[primaryID] = make(chan struct{})
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := h.ProduceSync(ctx, primaryID, []routedEncodedTopicPartitionRecords{{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition}}),
+			nodeID:                       primaryID,
+		}}).error()
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assertProduceFailures(t, m, nil)
+	})
+
+	t.Run("unknown fallback error is a terminal failure reason", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		producer.errs[secondaryID] = errors.New("boom")
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID, secondaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+	})
+
+	t.Run("duplicate partition is an internal error and dispatches no fallback", func(t *testing.T) {
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.RequestTimedOut
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), stratPrimaryAndSecondary, health, cfg, 0, 1<<20, m, nil)
+
+		part := routedEncodedTopicPartitionRecords{
+			encodedTopicPartitionRecords: newEncodedTopicPartitionRecords(topic, partition, []*kgo.Record{{Topic: topic, Partition: partition}}),
+			nodeID:                       primaryID,
+		}
+		err := h.ProduceSync(context.Background(), primaryID, []routedEncodedTopicPartitionRecords{part, part}).error()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "duplicate")
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+		assert.Equal(t, []int32{primaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonInternalError: 1,
+		})
 	})
 
 	t.Run("shared hedge flush does not resolve a partition the leg did not send", func(t *testing.T) {
@@ -1204,6 +1634,209 @@ func TestHedger_ProduceSync(t *testing.T) {
 	})
 }
 
+// TestHedger_AttemptPayloadCountsMergedHedgeFlush checks the hedge payload is
+// measured after buffer merging: two callers' same-partition retries share one
+// flush, which is one attempt carrying the merged batch.
+func TestHedger_AttemptPayloadCountsMergedHedgeFlush(t *testing.T) {
+	const (
+		topic     = "t"
+		partition = int32(0)
+		primary   = int32(100)
+		fallback  = int32(101)
+	)
+	tracker := NewAverageAgentStatsTracker()
+	nowNs := time.Now().UnixNano()
+	for _, id := range []int32{primary, fallback} {
+		seedFullWindow(tracker, id, nowNs, 20, 1, 0)
+	}
+	strategy := &mockPartitionAssignmentStrategy{
+		candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primary, fallback)},
+	}
+	producer := newMockDirectProducer()
+	producer.errs[primary] = kerr.RequestTimedOut
+	producer.respFn = func(_ int32, partitions []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) {
+		resp := &kmsg.ProduceResponse{}
+		for _, p := range partitions {
+			resp.Topics = append(resp.Topics, kmsg.ProduceResponseTopic{
+				Topic:      p.topic,
+				Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: p.partition}},
+			})
+		}
+		return resp, nil
+	}
+	health := HealthCheckConfig{SlowMultiplier: 2.0, MaxSlowFraction: 0.3, FaultyThreshold: 0.05, MaxFaultyFraction: 0.3}
+	// A failed primary returns long before the hedge delay, so each caller
+	// cascades without racing the timer.
+	cfg := HedgerConfig{MinHedgeDelay: time.Hour, MaxHedgeAgents: 2}
+
+	m := newMetrics(prometheus.NewPedanticRegistry())
+	// The linger never fires: the test flushes the fallback buffer itself.
+	h := NewHedger(producer, tracker, strategy, health, cfg, time.Hour, 1<<20, m, nil)
+	t.Cleanup(h.Close)
+
+	buffer, err := h.hedgeBuffer.agentBufferFor(fallback)
+	require.NoError(t, err)
+
+	done1 := runHedgerAsync(h, routedHedgeRecord(topic, partition, primary, "caller-1", nil))
+	done2 := runHedgerAsync(h, routedHedgeRecord(topic, partition, primary, "caller-2", nil))
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.ElementsMatch(c, []string{"caller-1", "caller-2"}, bufferedRecordValues(buffer))
+	}, time.Second, time.Millisecond)
+	buffer.timerFlush()
+	for _, done := range []<-chan struct{}{done1, done2} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("ProduceSync did not return after the hedge flush")
+		}
+	}
+
+	// What the producer actually received, per role.
+	sent := map[attemptRole]produceRequestStats{}
+	var hedgeCalls int
+	for _, call := range producer.recordedCalls() {
+		role := attemptHedge
+		if call.nodeID == primary {
+			role = attemptPrimary
+		} else {
+			hedgeCalls++
+		}
+		for _, p := range call.partitions {
+			sent[role] = sent[role].add(p.encodedStats)
+		}
+	}
+	require.Equal(t, 1, hedgeCalls, "both retries share one hedge flush")
+	assert.Equal(t, int64(2), sent[attemptHedge].records, "the one flush carries both callers' records")
+	assert.Equal(t, int64(2), sent[attemptPrimary].records, "each caller's primary carries one record")
+
+	assertAttemptPayload(t, m, sent[attemptPrimary], sent[attemptHedge])
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsHedgeTotal))
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+}
+
+// deadlineCtx reports a fixed deadline without ever arming its timer, like a
+// context whose deadline has been reached but whose timer has not fired yet.
+type deadlineCtx struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c deadlineCtx) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestHedger_CtxStopErr(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.NoError(t, ctxStopErr(context.Background()), "no deadline, not done")
+	assert.ErrorIs(t, ctxStopErr(canceled), context.Canceled)
+	assert.NoError(t, ctxStopErr(deadlineCtx{context.Background(), time.Now().Add(time.Hour)}), "deadline not reached")
+	assert.ErrorIs(t,
+		ctxStopErr(deadlineCtx{context.Background(), time.Now().Add(-time.Millisecond)}),
+		context.DeadlineExceeded, "deadline reached before its timer fired")
+	assert.ErrorIs(t, ctxStopErr(deadlineCtx{canceled, time.Now().Add(-time.Millisecond)}), context.Canceled,
+		"an explicit cancel is reported as a cancel, not a deadline")
+}
+
+// TestHedger_WinCountMatchesSelectedResult releases a primary and a fallback
+// that both succeed, one after the other in either order, and checks a win is
+// counted exactly when the returned result is the fallback's. The loser is held
+// inside the producer, ignoring the work context, so it finishes successfully
+// after the owner has returned and must not count.
+func TestHedger_WinCountMatchesSelectedResult(t *testing.T) {
+	const (
+		topic         = "t"
+		partition     = int32(0)
+		primary       = int32(100)
+		fallback      = int32(101)
+		primaryOffset = int64(1000)
+		fallbackOff   = int64(2000)
+	)
+	strategy := &mockPartitionAssignmentStrategy{
+		candidates: map[partitionKey][]Agent{{topic, partition}: {
+			{NodeID: primary, State: AgentStateDemoted},
+			{NodeID: fallback, State: AgentStateHealthy},
+		}},
+	}
+	tracker := NewAverageAgentStatsTracker()
+	nowNs := time.Now().UnixNano()
+	for _, id := range []int32{primary, fallback} {
+		seedFullWindow(tracker, id, nowNs, 20, 1, 0)
+	}
+	health := HealthCheckConfig{SlowMultiplier: 2.0, MaxSlowFraction: 0.3, FaultyThreshold: 0.05, MaxFaultyFraction: 0.3}
+	cfg := HedgerConfig{MinHedgeDelay: time.Hour, MaxHedgeAgents: 2}
+
+	for _, fallbackFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("fallbackFirst=%v", fallbackFirst), func(t *testing.T) {
+			gates := map[int32]chan struct{}{primary: make(chan struct{}), fallback: make(chan struct{})}
+			entered := map[int32]chan struct{}{primary: make(chan struct{}, 1), fallback: make(chan struct{}, 1)}
+
+			producer := newMockDirectProducer()
+			// respFn takes no context, so a held call completes successfully
+			// even after the work context is canceled.
+			producer.respFn = func(nodeID int32, _ []encodedTopicPartitionRecords) (*kmsg.ProduceResponse, error) {
+				entered[nodeID] <- struct{}{}
+				<-gates[nodeID]
+				offset := primaryOffset
+				if nodeID == fallback {
+					offset = fallbackOff
+				}
+				return &kmsg.ProduceResponse{Topics: []kmsg.ProduceResponseTopic{{
+					Topic:      topic,
+					Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: partition, BaseOffset: offset}},
+				}}}, nil
+			}
+
+			m := newMetrics(prometheus.NewPedanticRegistry())
+			h := NewHedger(producer, tracker, strategy, health, cfg, 0, 1<<20, m, nil)
+			t.Cleanup(h.Close)
+
+			// A demoted primary starts the fallback immediately.
+			part := routedHedgeRecord(topic, partition, primary, "v", nil)
+			part.item.nodeState = AgentStateDemoted
+			resCh := make(chan ProduceResult, 1)
+			go func() {
+				resCh <- h.ProduceSync(context.Background(), primary, unpromise([]promised[routedEncodedTopicPartitionRecords]{part}))
+			}()
+
+			// Both legs are in flight before either is released.
+			for _, id := range []int32{primary, fallback} {
+				select {
+				case <-entered[id]:
+				case <-time.After(time.Second):
+					t.Fatalf("agent %d was never called", id)
+				}
+			}
+
+			winner, loser := primary, fallback
+			wantOffset, wantWins := primaryOffset, float64(0)
+			if fallbackFirst {
+				winner, loser = fallback, primary
+				wantOffset, wantWins = fallbackOff, 1
+			}
+			close(gates[winner])
+			res := <-resCh
+			require.NoError(t, res.error())
+			assert.Equal(t, wantOffset, res.resp.Topics[0].Partitions[0].BaseOffset)
+
+			// The loser now completes successfully, after the owner returned.
+			close(gates[loser])
+			require.Eventually(t, func() bool {
+				for _, call := range producer.recordedCalls() {
+					if call.nodeID == loser && call.err == nil {
+						return true
+					}
+				}
+				return false
+			}, time.Second, time.Millisecond, "the losing leg must finish successfully")
+			h.Close()
+
+			assert.Equal(t, wantWins, testutil.ToFloat64(m.hedgeWinsTotal))
+			assertTriggerWins(t, m, map[hedgeTrigger]float64{hedgeTriggerDemotedProbe: wantWins})
+		})
+	}
+}
+
 func TestMaxFractionFloor(t *testing.T) {
 	tests := map[string]struct {
 		configured   float64
@@ -1275,4 +1908,70 @@ func TestHedgerCandidates_fetch(t *testing.T) {
 		assert.Len(t, got, 2)
 		assert.Equal(t, 2, strategy.lastMaxCandidates(topic, 0))
 	})
+}
+
+func TestHedger_FinalStop(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired := deadlineCtx{context.Background(), time.Now().Add(-time.Millisecond)}
+
+	failed := ProduceResult{err: kerr.RequestTimedOut}
+	succeeded := ProduceResult{resp: &kmsg.ProduceResponse{}}
+
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		primary ProduceResult
+		result  ProduceResult
+		stop    produceStop
+		want    produceStop
+	}{
+		{"a successful result is left alone", context.Background(), failed, succeeded, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
+		{"a settled terminal stop is left alone", expired, failed, failed, produceStopTerminalError, produceStopTerminalError},
+		{"a settled write timeout is left alone", context.Background(), failed, failed, produceStopWriteTimeout, produceStopWriteTimeout},
+		{"a write timeout after a non-retriable primary error is terminal", expired, ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopWriteTimeout, produceStopTerminalError},
+		{"a write timeout after a canceled primary stays a write timeout", expired, ProduceResult{err: context.Canceled}, failed, produceStopWriteTimeout, produceStopWriteTimeout},
+		{"exhausted stays exhausted while the context is live", context.Background(), failed, failed, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
+		{"exhausted after a non-retriable primary error is terminal", context.Background(), ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
+		{"a non-retriable primary error outranks an expired deadline", expired, ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
+		{"exhausted with an expired deadline is a write timeout", expired, failed, failed, produceStopCandidatesExhausted, produceStopWriteTimeout},
+		{"exhausted with a canceled context emits no failure", canceled, failed, failed, produceStopCandidatesExhausted, produceStopCanceled},
+		{"a canceled primary is a cancel, not a terminal error", canceled, ProduceResult{err: context.Canceled}, failed, produceStopCandidatesExhausted, produceStopCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, finalStop(tt.ctx, tt.primary, tt.result, tt.stop))
+		})
+	}
+}
+
+func TestHedger_ClassifyProduceStop(t *testing.T) {
+	brokerErr := kerr.MessageTooLarge
+	unknownErr := errors.New("boom")
+
+	tests := []struct {
+		name        string
+		terminal    bool
+		terminalErr error
+		ctxErr      error
+		exhausted   bool
+		want        produceStop
+	}{
+		{name: "success", want: produceStopNone},
+		{name: "candidates exhausted", exhausted: true, want: produceStopCandidatesExhausted},
+		{name: "terminal broker error", terminal: true, terminalErr: brokerErr, want: produceStopTerminalError},
+		{name: "terminal unknown error", terminal: true, terminalErr: unknownErr, want: produceStopTerminalError},
+		{name: "deadline is the returned failure", ctxErr: context.DeadlineExceeded, want: produceStopWriteTimeout},
+		{name: "deadline after exhaustion is the returned failure", ctxErr: context.DeadlineExceeded, exhausted: true, want: produceStopWriteTimeout},
+		{name: "deadline does not relabel a terminal broker error", terminal: true, terminalErr: brokerErr, ctxErr: context.DeadlineExceeded, want: produceStopTerminalError},
+		{name: "explicit cancel", ctxErr: context.Canceled, want: produceStopCanceled},
+		{name: "explicit cancel after exhaustion", ctxErr: context.Canceled, exhausted: true, want: produceStopCanceled},
+		{name: "cancel that aborted the accumulator", terminal: true, terminalErr: context.Canceled, ctxErr: context.Canceled, want: produceStopCanceled},
+		{name: "cancel does not relabel a terminal broker error", terminal: true, terminalErr: brokerErr, ctxErr: context.Canceled, want: produceStopTerminalError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyProduceStop(tt.terminal, tt.terminalErr, tt.ctxErr, tt.exhausted))
+		})
+	}
 }
