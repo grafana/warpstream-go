@@ -225,6 +225,12 @@ func (s *DefaultPartitionAssignmentStrategy) candidatesWithRoute(topic string, p
 			return nil, routeMissEmptyPool
 		}
 		if _, topicKnown := s.knownTopics[topic]; !topicKnown {
+			// A topic with no named leaders is in partitionCounts but not in
+			// knownTopics. Use the count only to pick the label. Adding the
+			// topic to knownTopics would route its holes to a stand-in.
+			if n, listed := s.partitionCounts[topic]; listed && (partition < 0 || partition >= n) {
+				return nil, routeMissOutOfRange
+			}
 			return nil, routeMissUnknownTopic
 		}
 		if partition < 0 || partition >= s.partitionCounts[topic] {

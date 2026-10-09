@@ -529,6 +529,41 @@ func TestHashTopicPartition_NoHeapAllocation(t *testing.T) {
 	assert.Zero(t, allocs)
 }
 
+// A topic with no named leaders is not in knownTopics, so its holes are still
+// rejected. The partition count only changes the label.
+func TestDefaultPartitionAssignmentStrategy_CandidatesWithRoute_AllLeadersUnnamed(t *testing.T) {
+	const topic = "t"
+	// Partitions 0 and 2 have no leader. Partition 1 is a hole.
+	s := newDefaultPartitionAssignmentStrategy([]int32{1, 2, 3},
+		map[topicPartition]int32{},
+		nil,
+		map[topicPartition]struct{}{{topic: topic, partition: 0}: {}, {topic: topic, partition: 2}: {}},
+		map[string]int32{topic: 3})
+
+	tests := []struct {
+		name      string
+		topic     string
+		partition int32
+		want      routeOutcome
+	}{
+		{"listed partition", topic, 0, routeMissNoLeader},
+		{"other listed partition", topic, 2, routeMissNoLeader},
+		{"hole is rejected", topic, 1, routeMissUnknownTopic},
+		{"past the count", topic, 3, routeMissOutOfRange},
+		{"far past the count", topic, 9, routeMissOutOfRange},
+		{"negative partition", topic, -1, routeMissOutOfRange},
+		{"topic not in Metadata", "other", 0, routeMissUnknownTopic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, outcome := s.candidatesWithRoute(tt.topic, tt.partition, 1)
+			assert.Equal(t, tt.want, outcome)
+			assert.Empty(t, got)
+			assert.Empty(t, s.Candidates(tt.topic, tt.partition, 1))
+		})
+	}
+}
+
 func TestDefaultPartitionAssignmentStrategy_CandidatesWithRoute(t *testing.T) {
 	const topic = "t"
 	agents := []int32{1, 2, 3}

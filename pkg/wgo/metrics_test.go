@@ -437,11 +437,11 @@ func TestNewMetrics_RoutingCounters(t *testing.T) {
 	m.partitionRoutes[routeSourceStandIn].Add(3)
 	m.routingMisses[routingMissPartitionOutOfRange].Inc()
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_partition_routes_total `+routeHelp(t, reg, "warpstream_partition_routes_total")+`
+		# HELP warpstream_partition_routes_total Input records routed to an agent, by how the strategy chose it: leader (the partition's named leader is in the snapshot) or stand_in (the leader entry was missing for a known topic, so a live agent was picked). Counted once per record at the initial routing decision, not per hedge, retry or flush. A demoted leader replaced by the Demoter keeps the classification of the lookup. stand_in covers every missing leader entry, not only an excluded leader.
 		# TYPE warpstream_partition_routes_total counter
 		warpstream_partition_routes_total{source="leader"} 0
 		warpstream_partition_routes_total{source="stand_in"} 3
-		# HELP warpstream_routing_misses_total `+routeHelp(t, reg, "warpstream_routing_misses_total")+`
+		# HELP warpstream_routing_misses_total Input records rejected because the initial lookup found no agent, by reason: empty_pool (no agents), unknown_topic (the topic is not in the snapshot, including a topic Metadata returned with an error), no_leader (WarpStream named no leader for the partition), partition_out_of_range (the partition does not exist), or other (no agent was found and no reason was set; not expected with the default strategy). Counted once per record, matching warpstream_produce_records_rejected_total{reason="no_agent_assigned"}.
 		# TYPE warpstream_routing_misses_total counter
 		warpstream_routing_misses_total{reason="empty_pool"} 0
 		warpstream_routing_misses_total{reason="no_leader"} 0
@@ -449,17 +449,4 @@ func TestNewMetrics_RoutingCounters(t *testing.T) {
 		warpstream_routing_misses_total{reason="partition_out_of_range"} 1
 		warpstream_routing_misses_total{reason="unknown_topic"} 0
 	`), "warpstream_partition_routes_total", "warpstream_routing_misses_total"))
-}
-
-func routeHelp(t *testing.T, reg prometheus.Gatherer, name string) string {
-	t.Helper()
-	families, err := reg.Gather()
-	require.NoError(t, err)
-	for _, f := range families {
-		if f.GetName() == name {
-			return f.GetHelp()
-		}
-	}
-	require.FailNow(t, "metric family not found", name)
-	return ""
 }

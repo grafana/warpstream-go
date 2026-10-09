@@ -109,12 +109,13 @@ const (
 // routingMissReason is why an initial route found no agent.
 type routingMissReason int8
 
+// The zero value is other, so an unset miss is not counted as an empty pool.
 const (
-	routingMissEmptyPool routingMissReason = iota
+	routingMissOther routingMissReason = iota
+	routingMissEmptyPool
 	routingMissUnknownTopic
 	routingMissNoLeader
 	routingMissPartitionOutOfRange
-	routingMissOther
 	routingMissCount
 )
 
@@ -297,12 +298,12 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	partitionRoutes := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_partition_routes_total",
-		Help: "Input records routed to an agent, by how the strategy chose it: leader (the partition's named leader is in the snapshot) or stand_in (the leader entry was missing for a known topic, so a live agent was picked). Counted once per record at the initial routing decision, not per hedge, retry or flush. A demoted leader replaced by the Demoter keeps the classification of the lookup. Records routed by a custom PartitionAssignmentStrategy are not counted. stand_in covers every missing leader entry, not only an excluded leader.",
+		Help: "Input records routed to an agent, by how the strategy chose it: leader (the partition's named leader is in the snapshot) or stand_in (the leader entry was missing for a known topic, so a live agent was picked). Counted once per record at the initial routing decision, not per hedge, retry or flush. A demoted leader replaced by the Demoter keeps the classification of the lookup. stand_in covers every missing leader entry, not only an excluded leader.",
 	}, []string{"source"})
 
 	routingMisses := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_routing_misses_total",
-		Help: "Input records rejected because the initial lookup found no agent, by reason: empty_pool (no agents), unknown_topic (the topic is not in the snapshot, including a topic Metadata returned with an error), no_leader (WarpStream named no leader for the partition), partition_out_of_range (the partition does not exist), or other (a custom strategy, which cannot say why). Counted once per record, matching warpstream_produce_records_rejected_total{reason=\"no_agent_assigned\"}.",
+		Help: "Input records rejected because the initial lookup found no agent, by reason: empty_pool (no agents), unknown_topic (the topic is not in the snapshot, including a topic Metadata returned with an error), no_leader (WarpStream named no leader for the partition), partition_out_of_range (the partition does not exist), or other (no agent was found and no reason was set; not expected with the default strategy). Counted once per record, matching warpstream_produce_records_rejected_total{reason=\"no_agent_assigned\"}.",
 	}, []string{"reason"})
 
 	hedgeTriggers := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
