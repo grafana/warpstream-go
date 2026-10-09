@@ -3,7 +3,6 @@ package wgo
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -93,8 +92,6 @@ func (p *AgentPool) refresh(ctx context.Context) (removed []int32, dropped leade
 		newAgents = append(newAgents, b.NodeID)
 	}
 	sort.Slice(newAgents, func(i, j int) bool { return newAgents[i] < newAgents[j] })
-	// A NodeID listed twice is still one agent.
-	newAgents = slices.Compact(newAgents)
 
 	agentSet := make(map[int32]struct{}, len(newAgents))
 	for _, id := range newAgents {

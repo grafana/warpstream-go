@@ -65,7 +65,7 @@ func (d hedgeDecision) trigger() hedgeTrigger {
 }
 
 // produceStop is why a hedge cascade ended. Cancellation is a stop but not a
-// final-outcome reason: the produce still returns the cancel error.
+// failure reason: the produce still returns the cancel error.
 type produceStop int8
 
 const (
@@ -184,7 +184,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	// histogram since no attempt ran.
 	for _, p := range routedPartitions {
 		if p.nodeID != primaryID {
-			h.metrics.produceFinalOutcome[produceFinalOutcomeInternalError].Inc()
+			h.metrics.produceRequestsFailed[produceFailureReasonInternalError].Inc()
 			return ProduceResult{err: fmt.Errorf("hedger: partition %s/%d routed to nodeID=%d but primaryID=%d", p.topic, p.partition, p.nodeID, primaryID)}
 		}
 	}
@@ -203,7 +203,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 		if stop == produceStopNone {
 			stop = produceStopInternal
 		}
-		h.observeProduceFinalOutcome(stop)
+		h.observeProduceFailure(stop)
 	}
 
 	// The rest of the Hedger works with unrouted partitions, because it will be
@@ -295,26 +295,26 @@ func (h *Hedger) observeHedgeWin(trigger hedgeTrigger) {
 	h.metrics.hedgeTriggerWins[trigger].Inc()
 }
 
-func (h *Hedger) observeProduceFinalOutcome(stop produceStop) {
-	var reason produceFinalOutcome
+func (h *Hedger) observeProduceFailure(stop produceStop) {
+	var reason produceFailureReason
 	switch stop {
 	case produceStopNone, produceStopCanceled:
 		return
 	case produceStopCandidatesExhausted:
-		reason = produceFinalOutcomeCandidatesExhausted
+		reason = produceFailureReasonCandidatesExhausted
 	case produceStopTerminalError:
-		reason = produceFinalOutcomeTerminalError
+		reason = produceFailureReasonTerminalError
 	case produceStopWriteTimeout:
-		reason = produceFinalOutcomeWriteTimeout
+		reason = produceFailureReasonWriteTimeout
 	default:
-		reason = produceFinalOutcomeInternalError
+		reason = produceFailureReasonInternalError
 	}
-	h.metrics.produceFinalOutcome[reason].Inc()
+	h.metrics.produceRequestsFailed[reason].Inc()
 }
 
 // classifyProduceStop picks why a cascade ended. A terminal broker or unknown
 // error wins over a context that expires afterward, explicit cancellation is
-// not a final-outcome reason, and an expired deadline outranks candidate
+// not a failure reason, and an expired deadline outranks candidate
 // exhaustion.
 func classifyProduceStop(terminal bool, terminalErr, ctxErr error, exhausted bool) produceStop {
 	if terminal && !errors.Is(terminalErr, context.Canceled) {
@@ -340,7 +340,8 @@ func classifyProduceStop(terminal bool, terminalErr, ctxErr error, exhausted boo
 // that no other agent could work around is the cause even when the cascade
 // stopped as exhausted or, with the work context already done, as a write
 // timeout. A work context that ended while the primary was still running is
-// also the cause of an exhausted stop. Other stops are already settled.
+// also the cause of an exhausted stop. Other stops are already settled; a
+// canceled stop remains omitted.
 func finalStop(workCtx context.Context, primary, result ProduceResult, stop produceStop) produceStop {
 	if (stop != produceStopCandidatesExhausted && stop != produceStopWriteTimeout) || result.succeeded() {
 		return stop

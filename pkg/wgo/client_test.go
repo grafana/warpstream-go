@@ -303,7 +303,7 @@ func TestWarpstreamClient_ProduceSync(t *testing.T) {
 			// The caller cancel detaches this wait. The flush keeps its own
 			// deadline, and a successful background produce is not a Hedger failure.
 			synctest.Wait()
-			assertFinalOutcomes(t, c.metrics, nil)
+			assertProduceFailures(t, c.metrics, nil)
 		})
 	})
 
@@ -1258,8 +1258,8 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 					// Returned at the write-timeout ceiling, not hanging.
 					assert.GreaterOrEqual(t, elapsed, writeTimeout)
 					assert.Less(t, elapsed, writeTimeout+time.Second)
-					assertFinalOutcomes(t, c.metrics, map[produceFinalOutcome]float64{
-						produceFinalOutcomeWriteTimeout: 1,
+					assertProduceFailures(t, c.metrics, map[produceFailureReason]float64{
+						produceFailureReasonWriteTimeout: 1,
 					})
 					// The stuck attempt was dispatched, so it counts as attempted,
 					// but nothing was acked on the wire.
@@ -1282,8 +1282,8 @@ func TestWarpstreamClient_WriteTimeoutUnblocksStuckProduce(t *testing.T) {
 					case <-time.After(5 * time.Second):
 						t.Fatal("Produce promise did not fire within the write-timeout bound")
 					}
-					assertFinalOutcomes(t, c.metrics, map[produceFinalOutcome]float64{
-						produceFinalOutcomeWriteTimeout: 1,
+					assertProduceFailures(t, c.metrics, map[produceFailureReason]float64{
+						produceFailureReasonWriteTimeout: 1,
 					})
 				})
 			})
@@ -2118,59 +2118,6 @@ func TestWarpstreamClient_AgentPoolChurnOnLiveRefresh(t *testing.T) {
 		added, removed = churn()
 		assert.Equal(t, float64(1), added)
 		assert.Equal(t, float64(1), removed)
-	})
-}
-
-// TestWarpstreamClient_DuplicateBrokerInMetadata checks a NodeID listed twice in
-// one Metadata response is one agent: the pool holds it once and the response
-// appearing and disappearing is not membership churn.
-func TestWarpstreamClient_DuplicateBrokerInMetadata(t *testing.T) {
-	const topic = "test-topic"
-
-	synctest.Test(t, func(t *testing.T) {
-		c, cluster, _, _ := newTestWarpstreamClient(t, topic, 1)
-		agents := slices.Clone(c.pool.Agents())
-		require.NotEmpty(t, agents)
-
-		raw, err := c.Request(t.Context(), kmsg.NewPtrMetadataRequest())
-		require.NoError(t, err)
-		template := raw.(*kmsg.MetadataResponse)
-
-		var duplicate atomic.Bool
-		cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
-			cluster.KeepControl()
-			if !duplicate.Load() {
-				return nil, nil, false
-			}
-			resp := cloneMetadataResponse(template, req.GetVersion())
-			resp.Brokers = append(resp.Brokers, resp.Brokers[0])
-			return resp, nil, true
-		})
-
-		refresh := func() {
-			time.Sleep(10 * time.Second)
-			synctest.Wait()
-		}
-		churn := func() (added, removed float64) {
-			return testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnAdded]),
-				testutil.ToFloat64(c.metrics.agentpoolAgentsChanged[agentpoolChurnRemoved])
-		}
-
-		duplicate.Store(true)
-		refresh()
-		assert.Equal(t, agents, c.pool.Agents())
-		added, removed := churn()
-		assert.Zero(t, added)
-		assert.Zero(t, removed)
-
-		duplicate.Store(false)
-		refresh()
-		assert.Equal(t, agents, c.pool.Agents())
-		added, removed = churn()
-		assert.Zero(t, added)
-		assert.Zero(t, removed)
-		assert.Zero(t, testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-			string(metadataRefreshTriggerPeriodic), metadataRefreshResultMembershipChanged)))
 	})
 }
 

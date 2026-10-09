@@ -28,7 +28,7 @@ type metrics struct {
 	hedgeAttemptsSuppressedTotal *prometheus.CounterVec
 	hedgeTriggers                [hedgeTriggerCount]prometheus.Counter
 	hedgeTriggerWins             [hedgeTriggerCount]prometheus.Counter
-	produceFinalOutcome          [produceFinalOutcomeCount]prometheus.Counter
+	produceRequestsFailed        [produceFailureReasonCount]prometheus.Counter
 	agentpoolAgentsChanged       [agentpoolChurnCount]prometheus.Counter
 
 	lingerFlushesTotal prometheus.Counter
@@ -123,23 +123,23 @@ const (
 	attemptLabelHedge   = "hedge"
 )
 
-// produceFinalOutcome is why a Hedger produce failed. One increment is one
+// produceFailureReason is why a Hedger produce failed. One increment is one
 // failed invocation, not a record, partition or wire attempt.
-type produceFinalOutcome int8
+type produceFailureReason int8
 
 const (
-	produceFinalOutcomeCandidatesExhausted produceFinalOutcome = iota
-	produceFinalOutcomeTerminalError
-	produceFinalOutcomeWriteTimeout
-	produceFinalOutcomeInternalError
-	produceFinalOutcomeCount
+	produceFailureReasonCandidatesExhausted produceFailureReason = iota
+	produceFailureReasonTerminalError
+	produceFailureReasonWriteTimeout
+	produceFailureReasonInternalError
+	produceFailureReasonCount
 )
 
 const (
-	produceFinalOutcomeLabelCandidatesExhausted = "candidates_exhausted"
-	produceFinalOutcomeLabelTerminalError       = "terminal_error"
-	produceFinalOutcomeLabelWriteTimeout        = "write_timeout"
-	produceFinalOutcomeLabelInternalError       = "internal_error"
+	produceFailureReasonLabelCandidatesExhausted = "candidates_exhausted"
+	produceFailureReasonLabelTerminalError       = "terminal_error"
+	produceFailureReasonLabelWriteTimeout        = "write_timeout"
+	produceFailureReasonLabelInternalError       = "internal_error"
 )
 
 type agentpoolChurnDirection int8
@@ -251,8 +251,8 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		Help: "Compressed record bytes handed to the direct producer, by attempt role (primary, hedge). Same boundary as warpstream_produce_attempt_records_total; compare with produce_compressed_bytes_total, which counts only acked requests.",
 	}, []string{"attempt"})
 
-	produceFinalOutcome := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-		Name: "warpstream_produce_final_outcome_total",
+	produceRequestsFailed := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_produce_requests_failed_total",
 		Help: "Why a Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable or unknown error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.",
 	}, []string{"reason"})
 
@@ -299,11 +299,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			hedgeTriggerPrimaryFailure: hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelPrimaryFailure),
 			hedgeTriggerDemotedProbe:   hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelDemotedProbe),
 		},
-		produceFinalOutcome: [produceFinalOutcomeCount]prometheus.Counter{
-			produceFinalOutcomeCandidatesExhausted: produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelCandidatesExhausted),
-			produceFinalOutcomeTerminalError:       produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelTerminalError),
-			produceFinalOutcomeWriteTimeout:        produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelWriteTimeout),
-			produceFinalOutcomeInternalError:       produceFinalOutcome.WithLabelValues(produceFinalOutcomeLabelInternalError),
+		produceRequestsFailed: [produceFailureReasonCount]prometheus.Counter{
+			produceFailureReasonCandidatesExhausted: produceRequestsFailed.WithLabelValues(produceFailureReasonLabelCandidatesExhausted),
+			produceFailureReasonTerminalError:       produceRequestsFailed.WithLabelValues(produceFailureReasonLabelTerminalError),
+			produceFailureReasonWriteTimeout:        produceRequestsFailed.WithLabelValues(produceFailureReasonLabelWriteTimeout),
+			produceFailureReasonInternalError:       produceRequestsFailed.WithLabelValues(produceFailureReasonLabelInternalError),
 		},
 		agentpoolAgentsChanged: [agentpoolChurnCount]prometheus.Counter{
 			agentpoolChurnAdded:   agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelAdded),
