@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,7 +33,8 @@ type brokerBehaviour struct {
 // brokersBehaviour holds the Produce behaviour for every broker in the cluster,
 // keyed by node ID.
 type brokersBehaviour struct {
-	byBroker map[int32]brokerBehaviour
+	byBroker       map[int32]brokerBehaviour
+	missingBrokers []int32
 }
 
 // forBroker returns the behaviour for nodeID, and whether one is configured.
@@ -41,8 +43,8 @@ func (b brokersBehaviour) forBroker(nodeID int32) (brokerBehaviour, bool) {
 	return bh, ok
 }
 
-// healthyBehaviours returns a baseline where every broker runs at production-like
-// healthy latency. Scenarios mutate a copy.
+// healthyBehaviours returns a baseline where every broker runs at healthy
+// latency. Scenarios mutate a copy.
 func healthyBehaviours() brokersBehaviour {
 	byBroker := map[int32]brokerBehaviour{}
 	for i := range clusterSize {
@@ -81,10 +83,11 @@ func burstyLatencyBehaviours(burstRate float64, burst time.Duration) brokersBeha
 	return bh
 }
 
-// rngKey identifies a per-client, per-broker random stream.
+// Separate fault streams prevent callback order from changing injected failures.
 type rngKey struct {
-	client clientType
-	broker int32
+	client  clientType
+	broker  int32
+	failure bool
 }
 
 // brokersBehaviourProvider holds the currently-active brokersBehaviour.
@@ -107,7 +110,7 @@ func newBrokersBehaviourProvider(initial brokersBehaviour) *brokersBehaviourProv
 // set swaps in a copy of b's map so a caller that keeps mutating its own map can't
 // race the concurrent produce paths reading the live behaviour.
 func (p *brokersBehaviourProvider) set(b brokersBehaviour) {
-	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker)})
+	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers)})
 }
 
 func (p *brokersBehaviourProvider) get() brokersBehaviour {
@@ -127,7 +130,7 @@ func (p *brokersBehaviourProvider) nextLatencyFor(client clientType, nodeID int3
 	}
 	p.rngMu.Lock()
 	defer p.rngMu.Unlock()
-	return b.latencyFn(p.rngFor(client, nodeID))
+	return b.latencyFn(p.rngFor(client, nodeID, false))
 }
 
 // nextLatencySleepFor draws client's next latency for a broker and sleeps for it,
@@ -152,17 +155,22 @@ func (p *brokersBehaviourProvider) nextFailureFor(client clientType, nodeID int3
 	}
 	p.rngMu.Lock()
 	defer p.rngMu.Unlock()
-	return p.rngFor(client, nodeID).Float64() < b.failRate
+	return p.rngFor(client, nodeID, true).Float64() < b.failRate
 }
 
 // rngFor returns client's random generator for a broker, creating it on first use.
-// Seeded by (broker, client) for reproducibility and per-client independence.
+// Seeded by broker, client, and fault kind for independent reproducible draws.
 // Callers must hold rngMu.
-func (p *brokersBehaviourProvider) rngFor(client clientType, nodeID int32) *rand.Rand {
-	key := rngKey{client, nodeID}
+func (p *brokersBehaviourProvider) rngFor(client clientType, nodeID int32, failure bool) *rand.Rand {
+	key := rngKey{client: client, broker: nodeID, failure: failure}
 	r := p.rngs[key]
 	if r == nil {
-		r = rand.New(rand.NewPCG(uint64(nodeID), uint64(client)+1))
+		seed := uint64(client) + 1
+		if failure {
+			// Latency callbacks must not shift the sequence of injected failures.
+			seed += 2
+		}
+		r = rand.New(rand.NewPCG(uint64(nodeID), seed))
 		p.rngs[key] = r
 	}
 	return r

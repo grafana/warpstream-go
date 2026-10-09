@@ -32,6 +32,30 @@ jobs:
       - name: Run unit tests
         run: make test
 
+  simulation:
+    name: Simulation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run simulation
+        run: >-
+          go run ./pkg/internal/simulation -timeout 3m
+          -report-filepath "$RUNNER_TEMP/simulation-report.md"
+          -json-report-filepath "$RUNNER_TEMP/simulation-report.json"
+      - name: Verify scenario names and attempt/pass counts
+        run: diff -u pkg/internal/simulation/REPORT.json "$RUNNER_TEMP/simulation-report.json"
+      - name: Publish simulation report
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/simulation-report.md" ]; then
+            cat "$RUNNER_TEMP/simulation-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   vendor:
     name: Check go.mod, go.sum and vendor
     runs-on: ubuntu-latest

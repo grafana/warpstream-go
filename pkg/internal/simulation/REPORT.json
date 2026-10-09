@@ -1,0 +1,134 @@
+[
+  {
+    "scenario": "1 dropped leader",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 19
+    }
+  },
+  {
+    "scenario": "1 fast-failing agent",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 0
+    }
+  },
+  {
+    "scenario": "1 slow agent",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 120
+    }
+  },
+  {
+    "scenario": "1% failure rate across all agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 0
+    }
+  },
+  {
+    "scenario": "1% slow bursts across all agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 120
+    }
+  },
+  {
+    "scenario": "1% timeouts across all agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 64
+    }
+  },
+  {
+    "scenario": "2 fast-failing agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 0
+    }
+  },
+  {
+    "scenario": "2 slow agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 120
+    }
+  },
+  {
+    "scenario": "25% dropped leaders",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 19
+    }
+  },
+  {
+    "scenario": "25% slow agents",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 120
+    }
+  },
+  {
+    "scenario": "GCS slow outage (10% bad, 40% moderate)",
+    "wgo": {
+      "attempts": 120,
+      "passes": 114
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 27
+    }
+  },
+  {
+    "scenario": "all healthy",
+    "wgo": {
+      "attempts": 120,
+      "passes": 120
+    },
+    "kgo": {
+      "attempts": 120,
+      "passes": 120
+    }
+  }
+]
