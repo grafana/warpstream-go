@@ -2653,3 +2653,69 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestWarpstreamClient_RoutingMetricsReconcile(t *testing.T) {
+	const topic = "test-topic"
+	synctest.Test(t, func(t *testing.T) {
+		c, _, _, _ := newTestWarpstreamClient(t, topic, 4)
+		// The single fake broker is node 0. Partition 0 names it as leader,
+		// partition 1 has no entry (stand-in), partition 2 is unnamed and
+		// partitions past 3 do not exist.
+		live := c.pool.state.Load()
+		c.pool.state.Store(&poolState{
+			agents:   live.agents,
+			topicIDs: live.topicIDs,
+			strategy: newDefaultPartitionAssignmentStrategy([]int32{0},
+				map[topicPartition]int32{{topic: topic, partition: 0}: 0},
+				nil,
+				map[topicPartition]struct{}{{topic: topic, partition: 2}: {}},
+				map[string]int32{topic: 4}),
+		})
+
+		rec := func(topic string, partition int32, size int) *kgo.Record {
+			return &kgo.Record{Topic: topic, Partition: partition, Value: make([]byte, size), Timestamp: time.Now()}
+		}
+		results := c.ProduceSync(t.Context(), []*kgo.Record{
+			rec(topic, 0, 1), rec(topic, 0, 1),
+			rec(topic, 1, 1), rec(topic, 1, 1), rec(topic, 1, 1),
+			rec(topic, 2, 1),
+			rec(topic, 9, 1), rec(topic, 9, 1),
+			rec("other", 0, 1),
+			rec(topic, 0, 2<<20), // larger than the test client's 1<<20 BatchMaxBytes
+		})
+		require.Len(t, results, 10)
+		for _, i := range []int{0, 1, 2, 3, 4} {
+			assert.NoError(t, results[i].Err)
+		}
+
+		var (
+			routes = testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceLeader]) + testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceStandIn])
+			misses float64
+		)
+		for _, m := range c.metrics.routingMisses {
+			misses += testutil.ToFloat64(m)
+		}
+		tooLarge := testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedRecordTooLarge))
+		noAgent := testutil.ToFloat64(c.metrics.produceRecordsRejectedTotal.WithLabelValues(produceRejectedNoAgentAssigned))
+
+		assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceLeader]))
+		assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceStandIn]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.routingMisses[routingMissNoLeader]))
+		assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.routingMisses[routingMissPartitionOutOfRange]))
+		assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.routingMisses[routingMissUnknownTopic]))
+		// Every submitted record is exactly one of: too large, routed, or a miss.
+		assert.Equal(t, testutil.ToFloat64(c.metrics.produceRecordsTotal), tooLarge+routes+misses)
+		assert.Equal(t, noAgent, misses)
+
+		// Produce counts one record per call. The rejected batch above nudged a
+		// refresh that may have replaced the injected strategy, so only the
+		// total is stable here.
+		var promised sync.WaitGroup
+		promised.Add(2)
+		c.Produce(t.Context(), rec(topic, 1, 1), func(*kgo.Record, error) { promised.Done() })
+		c.Produce(t.Context(), rec(topic, 9, 1), func(*kgo.Record, error) { promised.Done() })
+		promised.Wait()
+		assert.Equal(t, float64(6), testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceLeader])+testutil.ToFloat64(c.metrics.partitionRoutes[routeSourceStandIn]))
+		assert.Equal(t, float64(3), testutil.ToFloat64(c.metrics.routingMisses[routingMissPartitionOutOfRange]))
+	})
+}
