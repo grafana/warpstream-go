@@ -58,7 +58,16 @@ func TestMetadata_DroppedLeaderWrites(t *testing.T) {
 
 		time.Sleep(clientMetadataRefresh)
 		synctest.Wait()
-		require.Positive(t, gatherCounter(registry, "warpstream_agentpool_leader_dropped_total"))
+		metrics, err := registry.Gather()
+		require.NoError(t, err)
+		var excludedLeaders float64
+		for _, metric := range metrics {
+			if metric.GetName() == "warpstream_agentpool_excluded_leaders" {
+				require.Len(t, metric.Metric, 1)
+				excludedLeaders = metric.Metric[0].GetGauge().GetValue()
+			}
+		}
+		require.Equal(t, float64(1), excludedLeaders)
 
 		var fallbackWrites atomic.Int64
 		client.SetTestProduceResponseHook(func(_ context.Context, nodeID int32, response *kmsg.ProduceResponse, err error) {
