@@ -528,3 +528,56 @@ func TestHashTopicPartition_NoHeapAllocation(t *testing.T) {
 	allocs := testing.AllocsPerRun(1000, func() { _ = hashTopicPartition("some-topic-name", 7) })
 	assert.Zero(t, allocs)
 }
+
+func TestDefaultPartitionAssignmentStrategy_CandidatesWithRoute(t *testing.T) {
+	const topic = "t"
+	agents := []int32{1, 2, 3}
+	build := func(agents []int32) *DefaultPartitionAssignmentStrategy {
+		return newDefaultPartitionAssignmentStrategy(agents,
+			map[topicPartition]int32{{topic: topic, partition: 0}: 2},
+			nil,
+			map[topicPartition]struct{}{{topic: topic, partition: 1}: {}},
+			map[string]int32{topic: 4})
+	}
+
+	tests := []struct {
+		name      string
+		strategy  *DefaultPartitionAssignmentStrategy
+		topic     string
+		partition int32
+		max       int
+		want      routeOutcome
+		wantAgent bool
+	}{
+		{"named leader", build(agents), topic, 0, 1, routeLeader, true},
+		{"missing leader entry stands in", build(agents), topic, 2, 1, routeStandIn, true},
+		{"unnamed leader", build(agents), topic, 1, 1, routeMissNoLeader, false},
+		{"empty pool", build(nil), topic, 2, 1, routeMissEmptyPool, false},
+		{"unknown topic", build(agents), "other", 0, 1, routeMissUnknownTopic, false},
+		{"partition past the count", build(agents), topic, 4, 1, routeMissOutOfRange, false},
+		{"negative partition", build(agents), topic, -1, 1, routeMissOutOfRange, false},
+		{"no candidates requested", build(agents), topic, 0, 0, routeUnclassified, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, outcome := tt.strategy.candidatesWithRoute(tt.topic, tt.partition, tt.max)
+			assert.Equal(t, tt.want, outcome)
+			assert.Equal(t, tt.wantAgent, len(got) > 0)
+			assert.Equal(t, tt.strategy.Candidates(tt.topic, tt.partition, tt.max), got)
+		})
+	}
+
+	t.Run("the lazy strategy forwards the outcome from one snapshot", func(t *testing.T) {
+		lazy := NewLazyPartitionAssignmentStrategy(func() PartitionAssignmentStrategy { return build(agents) })
+		_, outcome := lazy.candidatesWithRoute(topic, 2, 1)
+		assert.Equal(t, routeStandIn, outcome)
+	})
+
+	t.Run("a strategy that cannot classify reports unclassified", func(t *testing.T) {
+		custom := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{topic, 0}: healthyAgents(7)}}
+		lazy := NewLazyPartitionAssignmentStrategy(func() PartitionAssignmentStrategy { return custom })
+		got, outcome := lazy.candidatesWithRoute(topic, 0, 1)
+		assert.Equal(t, routeUnclassified, outcome)
+		assert.Equal(t, healthyAgents(7), got)
+	})
+}

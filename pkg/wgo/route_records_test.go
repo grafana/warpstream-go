@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -249,6 +250,7 @@ func TestWarpstreamClient_RouteRecords(t *testing.T) {
 func newRouteRecordsClient(strategy PartitionAssignmentStrategy, nudge chan struct{}) *WarpstreamClient {
 	return &WarpstreamClient{
 		demoter:      NewDemoter(strategy, noopAgentStatsTracker{}, HealthCheckConfig{}, DemoterConfig{}, nopLogger{}, prometheus.NewRegistry()),
+		metrics:      newMetrics(prometheus.NewRegistry()),
 		refreshNowCh: nudge,
 	}
 }
@@ -328,4 +330,74 @@ func benchRouteInputs(topic string, n, partitions, missEvery int) ([]*kgo.Record
 		}
 	}
 	return records, &mockPartitionAssignmentStrategy{candidates: candidates}
+}
+
+func TestWarpstreamClient_RouteRecordsCountsRoutesAndMisses(t *testing.T) {
+	const topic = "t"
+	strategy := newDefaultPartitionAssignmentStrategy([]int32{1, 2},
+		map[topicPartition]int32{{topic: topic, partition: 0}: 1},
+		nil,
+		map[topicPartition]struct{}{{topic: topic, partition: 2}: {}},
+		map[string]int32{topic: 4})
+	newClient := func() *WarpstreamClient {
+		return newRouteRecordsClient(strategy, make(chan struct{}, 4))
+	}
+	rec := func(topic string, partition int32) *kgo.Record {
+		return &kgo.Record{Topic: topic, Partition: partition, Value: []byte("v")}
+	}
+	routes := func(c *WarpstreamClient) [routeSourceCount]float64 {
+		var out [routeSourceCount]float64
+		for i := range out {
+			out[i] = testutil.ToFloat64(c.metrics.partitionRoutes[i])
+		}
+		return out
+	}
+	misses := func(c *WarpstreamClient) [routingMissCount]float64 {
+		var out [routingMissCount]float64
+		for i := range out {
+			out[i] = testutil.ToFloat64(c.metrics.routingMisses[i])
+		}
+		return out
+	}
+
+	t.Run("a batch counts input records, not groups", func(t *testing.T) {
+		c := newClient()
+		_, rejected := c.routeRecords([]*kgo.Record{
+			rec(topic, 0), rec(topic, 0), rec(topic, 0),
+			rec(topic, 1), rec(topic, 1),
+			rec(topic, 2),
+			rec(topic, 9), rec(topic, 9),
+			rec("other", 0),
+		}, countAccepted(new(int)))
+
+		require.Len(t, rejected, 3)
+		assert.Equal(t, [routeSourceCount]float64{routeSourceLeader: 3, routeSourceStandIn: 2}, routes(c))
+		assert.Equal(t, [routingMissCount]float64{
+			routingMissNoLeader:            1,
+			routingMissPartitionOutOfRange: 2,
+			routingMissUnknownTopic:        1,
+		}, misses(c))
+	})
+
+	t.Run("a single record counts once", func(t *testing.T) {
+		c := newClient()
+		_, err := c.routeRecord(rec(topic, 1), func(ProduceResult) {})
+		require.NoError(t, err)
+		_, err = c.routeRecord(rec(topic, 9), func(ProduceResult) {})
+		require.Error(t, err)
+
+		assert.Equal(t, [routeSourceCount]float64{routeSourceStandIn: 1}, routes(c))
+		assert.Equal(t, [routingMissCount]float64{routingMissPartitionOutOfRange: 1}, misses(c))
+	})
+
+	t.Run("a custom strategy is not counted as a route and misses are other", func(t *testing.T) {
+		custom := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{topic, 0}: healthyAgents(5)}}
+		c := newRouteRecordsClient(custom, make(chan struct{}, 4))
+		routed, rejected := c.routeRecords([]*kgo.Record{rec(topic, 0), rec(topic, 1)}, countAccepted(new(int)))
+
+		require.Len(t, routed, 1)
+		require.Len(t, rejected, 1)
+		assert.Equal(t, [routeSourceCount]float64{}, routes(c))
+		assert.Equal(t, [routingMissCount]float64{routingMissOther: 1}, misses(c))
+	})
 }

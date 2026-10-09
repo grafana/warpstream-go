@@ -287,3 +287,40 @@ func BenchmarkMetrics_ClusterStatsCollect(b *testing.B) {
 		}
 	}
 }
+
+func TestNewMetrics_RoutingCounters(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := newMetrics(reg)
+
+	assert.Equal(t, int(routeSourceCount), testutil.CollectAndCount(reg, "warpstream_partition_routes_total"))
+	assert.Equal(t, int(routingMissCount), testutil.CollectAndCount(reg, "warpstream_routing_misses_total"))
+
+	m.partitionRoutes[routeSourceStandIn].Add(3)
+	m.routingMisses[routingMissPartitionOutOfRange].Inc()
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP warpstream_partition_routes_total `+routeHelp(t, reg, "warpstream_partition_routes_total")+`
+		# TYPE warpstream_partition_routes_total counter
+		warpstream_partition_routes_total{source="leader"} 0
+		warpstream_partition_routes_total{source="stand_in"} 3
+		# HELP warpstream_routing_misses_total `+routeHelp(t, reg, "warpstream_routing_misses_total")+`
+		# TYPE warpstream_routing_misses_total counter
+		warpstream_routing_misses_total{reason="empty_pool"} 0
+		warpstream_routing_misses_total{reason="no_leader"} 0
+		warpstream_routing_misses_total{reason="other"} 0
+		warpstream_routing_misses_total{reason="partition_out_of_range"} 1
+		warpstream_routing_misses_total{reason="unknown_topic"} 0
+	`), "warpstream_partition_routes_total", "warpstream_routing_misses_total"))
+}
+
+func routeHelp(t *testing.T, reg prometheus.Gatherer, name string) string {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, f := range families {
+		if f.GetName() == name {
+			return f.GetHelp()
+		}
+	}
+	require.FailNow(t, "metric family not found", name)
+	return ""
+}

@@ -1042,3 +1042,158 @@ func TestDemoter_Refresh(t *testing.T) {
 	assert.True(t, kept3)
 	assert.Len(t, d.lastDemotedProbe, 2)
 }
+
+// routeStub is an inner strategy that classifies its answers. outcome receives
+// the 1-based call number so a test can change the classification between the
+// Demoter's lookups.
+type routeStub struct {
+	agents  []Agent
+	outcome func(call int) routeOutcome
+	calls   int
+}
+
+func (s *routeStub) Candidates(topic string, partition int32, maxCandidates int) []Agent {
+	agents, _ := s.candidatesWithRoute(topic, partition, maxCandidates)
+	return agents
+}
+
+func (s *routeStub) candidatesWithRoute(_ string, _ int32, maxCandidates int) ([]Agent, routeOutcome) {
+	s.calls++
+	return s.agents[:min(len(s.agents), maxCandidates)], s.outcome(s.calls)
+}
+
+func TestDemoter_CandidatesWithRoute(t *testing.T) {
+	const topic = "t"
+	health := HealthCheckConfig{
+		SlowMultiplier:    2.0,
+		MaxSlowFraction:   0.3,
+		FaultyThreshold:   0.05,
+		MaxFaultyFraction: 0.3,
+	}
+	cfg := DemoterConfig{ProbeInterval: time.Second}
+
+	t.Run("keeps the inner classification", func(t *testing.T) {
+		inner := newDefaultPartitionAssignmentStrategy([]int32{1, 2}, map[topicPartition]int32{
+			{topic: topic, partition: 0}: 1,
+		}, nil, nil, map[string]int32{topic: 2})
+		d, _ := newTestDemoter(inner, noopAgentStatsTracker{}, HealthCheckConfig{}, DemoterConfig{})
+
+		got, outcome := d.candidatesWithRoute(topic, 0, 1)
+		require.Len(t, got, 1)
+		assert.Equal(t, routeLeader, outcome)
+
+		_, outcome = d.candidatesWithRoute(topic, 1, 1)
+		assert.Equal(t, routeStandIn, outcome)
+
+		got, outcome = d.candidatesWithRoute(topic, 5, 1)
+		assert.Empty(t, got)
+		assert.Equal(t, routeMissOutOfRange, outcome)
+	})
+
+	t.Run("a custom inner strategy is unclassified", func(t *testing.T) {
+		custom := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{topic, 0}: healthyAgents(9)}}
+		d, _ := newTestDemoter(custom, noopAgentStatsTracker{}, HealthCheckConfig{}, DemoterConfig{})
+		got, outcome := d.candidatesWithRoute(topic, 0, 1)
+		assert.Equal(t, healthyAgents(9), got)
+		assert.Equal(t, routeUnclassified, outcome)
+	})
+
+	t.Run("Candidates is unchanged", func(t *testing.T) {
+		inner := newDefaultPartitionAssignmentStrategy([]int32{1, 2}, map[topicPartition]int32{
+			{topic: topic, partition: 0}: 1,
+		}, nil, nil, map[string]int32{topic: 2})
+		d, _ := newTestDemoter(inner, noopAgentStatsTracker{}, HealthCheckConfig{}, DemoterConfig{})
+		want, _ := d.candidatesWithRoute(topic, 0, 2)
+		assert.Equal(t, want, d.Candidates(topic, 0, 2))
+	})
+
+	t.Run("a demoted leader replaced by an alternate keeps the classification", func(t *testing.T) {
+		const leader, healthy = int32(2), int32(1)
+		inner := newDefaultPartitionAssignmentStrategy([]int32{healthy, leader, 3}, map[topicPartition]int32{
+			{topic: topic, partition: 0}: leader,
+		}, nil, nil, map[string]int32{topic: 1})
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		for _, id := range []int32{healthy, 3} {
+			seedFullWindow(tr, id, nowNs, 20, 10, 0)
+		}
+		seedFullWindow(tr, leader, nowNs, 10, 10, 10)
+		d, _ := newTestDemoter(inner, tr, health, cfg)
+		now := time.Now()
+		d.now = func() time.Time { return now }
+
+		// The first call spends the leader's probe slot.
+		got, outcome := d.candidatesWithRoute(topic, 0, 1)
+		require.Len(t, got, 1)
+		assert.Equal(t, leader, got[0].NodeID)
+		assert.Equal(t, AgentStateDemoted, got[0].State)
+		assert.Equal(t, routeLeader, outcome)
+
+		// Within the probe interval the leader is skipped for an alternate.
+		got, outcome = d.candidatesWithRoute(topic, 0, 1)
+		require.Len(t, got, 1)
+		assert.NotEqual(t, leader, got[0].NodeID)
+		assert.Equal(t, routeLeader, outcome)
+	})
+
+	t.Run("a forced probe keeps the classification", func(t *testing.T) {
+		const slow = int32(2)
+		inner := &routeStub{
+			agents:  healthyAgents(slow),
+			outcome: func(int) routeOutcome { return routeStandIn },
+		}
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		seedFullWindow(tr, 1, nowNs, 20, 10, 0)
+		seedFullWindow(tr, 3, nowNs, 20, 10, 0)
+		seedFullWindow(tr, slow, nowNs, 10, 10, 10)
+		d, _ := newTestDemoter(inner, tr, health, cfg)
+		now := time.Now()
+		d.now = func() time.Time { return now }
+
+		_, _ = d.candidatesWithRoute(topic, 0, 1) // spends the probe slot
+
+		got, outcome := d.candidatesWithRoute(topic, 0, 1)
+		require.Len(t, got, 1)
+		assert.Equal(t, slow, got[0].NodeID)
+		assert.Equal(t, AgentStateDemoted, got[0].State)
+		assert.Equal(t, routeStandIn, outcome)
+	})
+
+	t.Run("the classification comes from the lookup that produced the agents", func(t *testing.T) {
+		// Ten demoted agents ahead of one healthy agent make the Demoter widen
+		// its ask. A refresh between the lookups changes the answer, so the
+		// outcome of the last lookup is the one that matches the returned agents.
+		// A quarter of the agents are faulty, below the cluster-wide guard.
+		faulty := []int32{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+		var healthy []int32
+		for id := int32(100); id < 130; id++ {
+			healthy = append(healthy, id)
+		}
+		inner := &routeStub{
+			agents: healthyAgents(append(append([]int32{}, faulty...), healthy...)...),
+			outcome: func(call int) routeOutcome {
+				if call == 1 {
+					return routeLeader
+				}
+				return routeStandIn
+			},
+		}
+		tr := NewAverageAgentStatsTracker()
+		nowNs := time.Now().UnixNano()
+		for _, id := range healthy {
+			seedFullWindow(tr, id, nowNs, 20, 10, 0)
+		}
+		for _, id := range faulty {
+			seedFullWindow(tr, id, nowNs, 20, 10, 10)
+		}
+		d, _ := newTestDemoter(inner, tr, health, cfg)
+		now := time.Now()
+		d.now = func() time.Time { return now }
+
+		got, outcome := d.candidatesWithRoute(topic, 0, 1)
+		require.Len(t, got, 1)
+		require.Greater(t, inner.calls, 1)
+		assert.Equal(t, routeStandIn, outcome)
+	})
+}

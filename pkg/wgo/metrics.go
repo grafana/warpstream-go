@@ -50,6 +50,9 @@ type metrics struct {
 	produceRecordsFailedTotal   prometheus.Counter
 	produceRecordsRejectedTotal *prometheus.CounterVec
 
+	partitionRoutes [routeSourceCount]prometheus.Counter
+	routingMisses   [routingMissCount]prometheus.Counter
+
 	agentPoolLeaderDroppedTotal prometheus.Counter
 	metadataRefreshResultsTotal *prometheus.CounterVec
 
@@ -81,6 +84,67 @@ const (
 	produceRejectedRecordTooLarge  = "record_too_large"
 	produceRejectedNoAgentAssigned = "no_agent_assigned"
 )
+
+// routeSource is how the strategy chose the primary agent for a routed record.
+type routeSource int8
+
+const (
+	routeSourceLeader routeSource = iota
+	routeSourceStandIn
+	routeSourceCount
+)
+
+const (
+	routeSourceLabelLeader  = "leader"
+	routeSourceLabelStandIn = "stand_in"
+)
+
+// routingMissReason is why an initial route found no agent.
+type routingMissReason int8
+
+const (
+	routingMissEmptyPool routingMissReason = iota
+	routingMissUnknownTopic
+	routingMissNoLeader
+	routingMissPartitionOutOfRange
+	routingMissOther
+	routingMissCount
+)
+
+const (
+	routingMissLabelEmptyPool           = "empty_pool"
+	routingMissLabelUnknownTopic        = "unknown_topic"
+	routingMissLabelNoLeader            = "no_leader"
+	routingMissLabelPartitionOutOfRange = "partition_out_of_range"
+	routingMissLabelOther               = "other"
+)
+
+// routeSource reports the counter an accepted route belongs to. A strategy that
+// cannot classify its answer is not counted.
+func (o routeOutcome) routeSource() (routeSource, bool) {
+	switch o {
+	case routeLeader:
+		return routeSourceLeader, true
+	case routeStandIn:
+		return routeSourceStandIn, true
+	}
+	return 0, false
+}
+
+// missReason is the reason a lookup that returned no agent is counted under.
+func (o routeOutcome) missReason() routingMissReason {
+	switch o {
+	case routeMissEmptyPool:
+		return routingMissEmptyPool
+	case routeMissUnknownTopic:
+		return routingMissUnknownTopic
+	case routeMissNoLeader:
+		return routingMissNoLeader
+	case routeMissOutOfRange:
+		return routingMissPartitionOutOfRange
+	}
+	return routingMissOther
+}
 
 const (
 	agentStateHealthy = "healthy"
@@ -178,6 +242,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		NativeHistogramMinResetDuration: time.Hour,
 	}, []string{"outcome"})
 
+	partitionRoutes := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_partition_routes_total",
+		Help: "Input records routed to an agent, by how the strategy chose it: leader (the partition's named leader is in the snapshot) or stand_in (the leader entry was missing for a known topic, so a live agent was picked). Counted once per record at the initial routing decision, not per hedge, retry or flush. A demoted leader replaced by the Demoter keeps the classification of the lookup. Records routed by a custom PartitionAssignmentStrategy are not counted. stand_in covers every missing leader entry, not only an excluded leader.",
+	}, []string{"source"})
+
+	routingMisses := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "warpstream_routing_misses_total",
+		Help: "Input records rejected because the initial lookup found no agent, by reason: empty_pool (no agents), unknown_topic (the topic is not in the snapshot, including a topic Metadata returned with an error), no_leader (WarpStream named no leader for the partition), partition_out_of_range (the partition does not exist), or other (a custom strategy, which cannot say why). Counted once per record, matching warpstream_produce_records_rejected_total{reason=\"no_agent_assigned\"}.",
+	}, []string{"reason"})
+
 	version, franzGoVersion := clientBuildInfo()
 	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 		Name:        "warpstream_client_build_info",
@@ -186,6 +260,17 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	}).Set(1)
 
 	return &metrics{
+		partitionRoutes: [routeSourceCount]prometheus.Counter{
+			routeSourceLeader:  partitionRoutes.WithLabelValues(routeSourceLabelLeader),
+			routeSourceStandIn: partitionRoutes.WithLabelValues(routeSourceLabelStandIn),
+		},
+		routingMisses: [routingMissCount]prometheus.Counter{
+			routingMissEmptyPool:           routingMisses.WithLabelValues(routingMissLabelEmptyPool),
+			routingMissUnknownTopic:        routingMisses.WithLabelValues(routingMissLabelUnknownTopic),
+			routingMissNoLeader:            routingMisses.WithLabelValues(routingMissLabelNoLeader),
+			routingMissPartitionOutOfRange: routingMisses.WithLabelValues(routingMissLabelPartitionOutOfRange),
+			routingMissOther:               routingMisses.WithLabelValues(routingMissLabelOther),
+		},
 		hedgeAttemptsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_hedge_attempts_total",
 			Help: "Total number of produce requests for which a fanout to per-partition secondaries was attempted. Includes both latency-triggered hedges (primary still in flight) and primary-failure retries.",
