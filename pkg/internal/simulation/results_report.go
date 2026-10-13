@@ -1,6 +1,8 @@
 package main
 
 import (
+	"cmp"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -21,6 +23,32 @@ type resultsReport struct {
 
 func newResultsReport(r scenarioResults) *resultsReport {
 	return &resultsReport{results: r}
+}
+
+func (rr *resultsReport) generateJSON() ([]byte, error) {
+	type clientResults struct {
+		Attempts int `json:"attempts"`
+		Passes   int `json:"passes"`
+	}
+	type scenarioSuccess struct {
+		Scenario string        `json:"scenario"`
+		Wgo      clientResults `json:"wgo"`
+		Kgo      clientResults `json:"kgo"`
+	}
+	results := make([]scenarioSuccess, 0, len(rr.results.entries))
+	for _, res := range rr.results.entries {
+		results = append(results, scenarioSuccess{
+			Scenario: res.sc.name,
+			Wgo:      clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
+			Kgo:      clientResults{Attempts: res.kgoSummary.total, Passes: res.kgoSummary.successes},
+		})
+	}
+	slices.SortFunc(results, func(a, b scenarioSuccess) int { return cmp.Compare(a.Scenario, b.Scenario) })
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }
 
 // generateMarkdown renders the full comparison report.
@@ -58,15 +86,11 @@ func (rr *resultsReport) generateMarkdown() string {
 	return b.String()
 }
 
-// writeConfigSection renders the client configuration the run used: settings
-// shared by both clients (mirroring production, per newKgoClient's doc
-// comment), plus each client's own knobs with no equivalent on the other
-// side. Printed so a reader can judge whether a result reflects the
-// scenario's behaviour or just this run's particular timeout/hedge/linger
-// values, without having to go read environment.go.
+// Include settings so readers can distinguish scenario effects from client
+// configuration differences.
 func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 	b.WriteString("## Client configuration\n\n")
-	b.WriteString("Shared by both clients (mirrors production `pkg/storage/ingest/writer_client.go`):\n\n")
+	b.WriteString("Shared by both clients:\n\n")
 	b.WriteString("| Setting | Value |\n| --- | --- |\n")
 	fmt.Fprintf(b, "| Dial timeout | %s |\n", clientDialTimeout)
 	fmt.Fprintf(b, "| Write / delivery timeout | %s |\n", clientWriteTimeout)
@@ -78,7 +102,7 @@ func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 
 	b.WriteString("wgo-only — this simulation's own values, shown against `pkg/wgo`'s library " +
 		"defaults for comparison (a value need not match its default; it's what this run actually " +
-		"used, not a claim about what production configures):\n\n")
+		"used):\n\n")
 	b.WriteString("| Setting | Value | pkg/wgo default |\n| --- | --- | --- |\n")
 	fmt.Fprintf(b, "| Hedger: min hedge delay | %s | %s |\n", wgoHedgerMinHedgeDelay, wgo.DefaultHedgerMinHedgeDelay)
 	fmt.Fprintf(b, "| Hedger: max hedge agents | %d | %d |\n", wgoHedgerMaxHedgeAgents, wgo.DefaultHedgerMaxHedgeAgents)
@@ -95,6 +119,7 @@ func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 	b.WriteString("| Partitioner | Manual — fixed leader per partition, never reroutes |\n")
 	fmt.Fprintf(b, "| Max produce requests in-flight per broker | %d |\n", clientMaxInflight)
 	b.WriteString("| Record retries | unlimited (bounded only by the delivery timeout above) |\n")
+	b.WriteString("| Retry backoff | 250ms exponential, capped at 5s, without jitter |\n")
 	b.WriteString("| Max buffered records / bytes | unlimited |\n")
 	b.WriteString("\n")
 }
@@ -177,7 +202,13 @@ func (rr *resultsReport) writeBucketTable(b *strings.Builder, res scenarioResult
 			d.primary += x.primary
 			d.hedge += x.hedge
 		}
-		fmt.Fprintf(b, "| %ds+ drain | — | — | — | %s | — | — | — |\n", n*secs, rr.bucketSurgeCell(d))
+		if d.primary != 0 || d.hedge != 0 {
+			surge := rr.bucketSurgeCell(d)
+			if d.primary == 0 {
+				surge = fmt.Sprintf("%d/0 (n/a)", d.hedge)
+			}
+			fmt.Fprintf(b, "| %ds+ drain | — | — | — | %s | — | — | — |\n", n*secs, surge)
+		}
 	}
 }
 

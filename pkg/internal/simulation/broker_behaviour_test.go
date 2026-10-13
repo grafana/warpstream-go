@@ -55,6 +55,20 @@ func TestBrokersBehaviourProvider_NextFailureFor(t *testing.T) {
 	})
 }
 
+func TestBrokersBehaviourProvider_IndependentFaultStreams(t *testing.T) {
+	t.Parallel()
+	b := healthyBehaviours()
+	broker := b.byBroker[0]
+	broker.failRate = 0.5
+	b.byBroker[0] = broker
+	withLatency := newBrokersBehaviourProvider(b)
+	withoutLatency := newBrokersBehaviourProvider(b)
+	for range 100 {
+		withLatency.nextLatencyFor(clientTypeKgo, 0)
+		assert.Equal(t, withoutLatency.nextFailureFor(clientTypeKgo, 0), withLatency.nextFailureFor(clientTypeKgo, 0))
+	}
+}
+
 func TestBrokersBehaviourProvider_NextLatencyFor(t *testing.T) {
 	t.Parallel()
 

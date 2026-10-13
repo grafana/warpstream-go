@@ -12,4 +12,4 @@ lint:
 
 .PHONY: simulation
 simulation:
-	go run ./pkg/internal/simulation -report-filepath pkg/internal/simulation/REPORT.md
+	go run ./pkg/internal/simulation -report-filepath pkg/internal/simulation/REPORT.md -json-report-filepath pkg/internal/simulation/REPORT.json

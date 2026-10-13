@@ -51,9 +51,7 @@ const (
 	// with context.DeadlineExceeded. Models a caller that won't wait forever.
 	appRequestTimeout = 5 * time.Second
 
-	// Client configuration, matching pkg/storage/ingest/writer_client.go so the
-	// comparison reflects production behaviour. Differences from production are
-	// limited to test-only concerns (no SASL/TLS, no metrics hooks, no logger).
+	// Shared settings keep the two clients comparable.
 	clientLinger                 = 50 * time.Millisecond
 	clientBatchMaxBytes          = 16_000_000
 	clientMaxInflight            = 20
@@ -176,6 +174,21 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	clients = append(clients, kgoInner)
 	kgoClient := &latencyDelayedKgoClient{Client: kgoInner, behaviours: beh, client: clientTypeKgo}
 
+	ctx, cancel := context.WithTimeout(context.Background(), appRequestTimeout)
+	defer cancel()
+	for _, target := range []struct {
+		cluster *kfake.Cluster
+		client  interface {
+			Request(context.Context, kmsg.Request) (kmsg.Response, error)
+		}
+	}{{wgoCluster, wgoClient}, {kgoCluster, kgoInner}} {
+		raw, err := target.client.Request(ctx, kmsg.NewPtrMetadataRequest())
+		if err != nil {
+			return nil, fmt.Errorf("capture metadata: %w", err)
+		}
+		installMetadataControl(target.cluster, raw.(*kmsg.MetadataResponse), beh)
+	}
+
 	return &environment{
 		topic:         topicName,
 		numPartitions: clusterSize,
@@ -291,9 +304,8 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 	return c, reg, nil
 }
 
-// newKgoClient mirrors the kgo.Client configuration that
-// pkg/storage/ingest/writer_client.go applies in production. Any drift would
-// make the comparison misleading, so the two option sets are kept in lockstep.
+// Keep shared settings in lockstep so configuration differences do not bias
+// the comparison.
 func newKgoClient(addr string) (*kgo.Client, error) {
 	// Cap Produce at the version wgo pins so request and response payloads carry
 	// the topic name on the wire, matching what the client emits.
@@ -314,9 +326,10 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 		kgo.ProducerLinger(clientLinger),
 		kgo.MaxProduceRequestsInflightPerBroker(clientMaxInflight),
 
-		// Mirrors writer_client.go: unlimited retries, deadline on the max time
-		// a record can take to be delivered.
+		// Bound retries by delivery time rather than a fixed attempt count.
 		kgo.RecordRetries(math.MaxInt64),
+		// Retry jitter changes the fault draws consumed before the app deadline.
+		kgo.RetryBackoffFn(simulationRetryBackoff),
 		kgo.RecordDeliveryTimeout(clientWriteTimeout),
 		kgo.ProduceRequestTimeout(clientProduceRequestTimeout),
 		kgo.RequestTimeoutOverhead(clientRequestTimeoutOverhead),
@@ -327,4 +340,16 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 		kgo.MaxVersions(v),
 	}
 	return kgo.NewClient(opts...)
+}
+
+func simulationRetryBackoff(failures int) time.Duration {
+	const minBackoff = 250 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+	if failures <= 1 {
+		return minBackoff
+	}
+	if failures > 5 {
+		return maxBackoff
+	}
+	return min(minBackoff*time.Duration(1<<(failures-1)), maxBackoff)
 }
