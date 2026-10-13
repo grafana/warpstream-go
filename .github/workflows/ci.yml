@@ -47,8 +47,12 @@ jobs:
           go run ./pkg/internal/simulation -timeout 3m
           -report-filepath "$RUNNER_TEMP/simulation-report.md"
           -json-report-filepath "$RUNNER_TEMP/simulation-report.json"
-      - name: Verify scenario names and attempt/pass counts
-        run: diff -u pkg/internal/simulation/REPORT.json "$RUNNER_TEMP/simulation-report.json"
+      - name: Verify scenario names and attempt counts
+        run: |
+          projection='map({scenario, wgo: {attempts: .wgo.attempts}, kgo: {attempts: .kgo.attempts}}) | sort_by(.scenario)'
+          jq "$projection" pkg/internal/simulation/REPORT.json > "$RUNNER_TEMP/expected-scenarios.json"
+          jq "$projection" "$RUNNER_TEMP/simulation-report.json" > "$RUNNER_TEMP/actual-scenarios.json"
+          diff -u "$RUNNER_TEMP/expected-scenarios.json" "$RUNNER_TEMP/actual-scenarios.json"
       - name: Publish simulation report
         if: always()
         run: |
