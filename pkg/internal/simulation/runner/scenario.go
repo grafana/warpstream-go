@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"fmt"
@@ -45,12 +45,16 @@ type scenarioExpectations struct {
 // scenario is one comparison case: a set of per-broker behaviours swapped in
 // for the observed phase, plus what we expect the results to show.
 type scenario struct {
-	name            string
-	observedFor     time.Duration
-	description     string
-	behaviours      brokersBehaviour
-	expect          scenarioExpectations
-	transportPhases []transportPhase
+	name                    string
+	observedFor             time.Duration
+	description             string
+	behaviours              brokersBehaviour
+	expect                  scenarioExpectations
+	transportPhases         []transportPhase
+	profile                 *workloadProfile
+	behaviourPhases         []behaviourPhase
+	windows                 []observationWindow
+	requiredWgoDelayBrokers []int32
 }
 
 func (sc scenario) duration() time.Duration {

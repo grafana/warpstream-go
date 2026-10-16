@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -213,4 +213,43 @@ func TestMetadataView_WithdrawBroker(t *testing.T) {
 	assert.Equal(t, map[int32]int64{1: 1}, view.missingLeaders())
 	assert.Len(t, withdrawn.Brokers, 1)
 	assert.Equal(t, original.Topics, withdrawn.Topics)
+}
+
+func TestMetadata_PreferredPlacement(t *testing.T) {
+	template := kmsg.NewPtrMetadataResponse()
+	for id := int32(0); id < 4; id++ {
+		template.Brokers = append(template.Brokers, kmsg.MetadataResponseBroker{NodeID: id})
+	}
+	topic := "test"
+	template.Topics = []kmsg.MetadataResponseTopic{{Topic: &topic, TopicID: [16]byte{1}, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 0, Replicas: []int32{0}, ISR: []int32{0}}, {Partition: 1, Leader: 1, Replicas: []int32{1}, ISR: []int32{1}}}}}
+	response := metadataPreferredPlacement(template, 2, 3, -1)
+	require.Len(t, response.Brokers, 3)
+	require.EqualValues(t, 2, response.Brokers[0].NodeID)
+	require.EqualValues(t, 3, response.Brokers[1].NodeID)
+	require.EqualValues(t, 0, response.Brokers[2].NodeID)
+	require.Equal(t, template.Topics[0].TopicID, response.Topics[0].TopicID)
+	for _, partition := range response.Topics[0].Partitions {
+		require.EqualValues(t, 2, partition.Leader)
+		require.Equal(t, []int32{2}, partition.ISR)
+	}
+	require.Len(t, template.Brokers, 4)
+	require.EqualValues(t, 0, template.Topics[0].Partitions[0].Leader)
+	require.EqualValues(t, 1, template.Topics[0].Partitions[1].Leader)
+}
+
+func TestMetadata_RetainedFallback(t *testing.T) {
+	template := kmsg.NewPtrMetadataResponse()
+	for id := int32(0); id < 4; id++ {
+		template.Brokers = append(template.Brokers, kmsg.MetadataResponseBroker{NodeID: id})
+	}
+	for preferred := int32(0); preferred < 4; preferred++ {
+		response := metadataPreferredPlacement(template, preferred, 3, 3)
+		advertised := map[int32]bool{}
+		for _, broker := range response.Brokers {
+			advertised[broker.NodeID] = true
+		}
+		require.Len(t, advertised, 3)
+		require.True(t, advertised[preferred])
+		require.True(t, advertised[3])
+	}
 }

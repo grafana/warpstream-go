@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -22,6 +22,8 @@ const (
 
 // brokerBehaviour overrides per-broker Produce response behaviour.
 type brokerBehaviour struct {
+	injectedLatency    bool
+	minInjectedLatency time.Duration
 	// latencyFn draws an artificial response latency per request.
 	latencyFn func(*rand.Rand) time.Duration
 
@@ -97,12 +99,13 @@ type brokersBehaviourProvider struct {
 	// One mutex guards the generator map and every draw: draws are infrequent
 	// enough that a single lock is simpler than per-stream locking and not a
 	// contention point.
-	rngMu sync.Mutex
-	rngs  map[rngKey]*rand.Rand
+	rngMu             sync.Mutex
+	rngs              map[rngKey]*rand.Rand
+	latencySelections map[clientType]map[int32]int64
 }
 
 func newBrokersBehaviourProvider(initial brokersBehaviour) *brokersBehaviourProvider {
-	p := &brokersBehaviourProvider{rngs: map[rngKey]*rand.Rand{}}
+	p := &brokersBehaviourProvider{rngs: map[rngKey]*rand.Rand{}, latencySelections: map[clientType]map[int32]int64{}}
 	p.set(initial)
 	return p
 }
@@ -130,7 +133,14 @@ func (p *brokersBehaviourProvider) nextLatencyFor(client clientType, nodeID int3
 	}
 	p.rngMu.Lock()
 	defer p.rngMu.Unlock()
-	return b.latencyFn(p.rngFor(client, nodeID, false))
+	delay := b.latencyFn(p.rngFor(client, nodeID, false))
+	if b.injectedLatency && delay > b.minInjectedLatency {
+		if p.latencySelections[client] == nil {
+			p.latencySelections[client] = map[int32]int64{}
+		}
+		p.latencySelections[client][nodeID]++
+	}
+	return delay
 }
 
 // nextLatencySleepFor draws client's next latency for a broker and sleeps for it,
@@ -217,4 +227,10 @@ func triangular(rng *rand.Rand, min, mode, max time.Duration) time.Duration {
 		pick = float64(max) - math.Sqrt((1-u)*span*float64(max-mode))
 	}
 	return time.Duration(pick)
+}
+
+func (p *brokersBehaviourProvider) selectedLatencies(client clientType) map[int32]int64 {
+	p.rngMu.Lock()
+	defer p.rngMu.Unlock()
+	return maps.Clone(p.latencySelections[client])
 }
