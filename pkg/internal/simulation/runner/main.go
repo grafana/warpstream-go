@@ -20,10 +20,16 @@ func Main(factory WorkloadFactory) {
 		parallelism = 4
 	}
 	parallel := flag.Int("parallel", parallelism, "maximum simultaneous scenarios; 0 runs all scenarios concurrently")
+	profile := flag.String("profile", "standard", "scenario profile: standard or mimir-investigation (external workloads only)")
 	pattern := flag.String("scenario", "", "run scenarios whose names match this regular expression")
 	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
 	flag.Parse()
-	selected, err := selectScenarios(*pattern)
+	available, err := profileScenarios(*profile, factory != nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	selected, err := filterScenarios(*pattern, available)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -73,12 +79,16 @@ func Main(factory WorkloadFactory) {
 }
 
 func selectScenarios(pattern string) ([]scenario, error) {
+	return filterScenarios(pattern, scenarios())
+}
+
+func filterScenarios(pattern string, available []scenario) ([]scenario, error) {
 	match, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("scenario filter: %w", err)
 	}
 	var selected []scenario
-	for _, sc := range scenarios() {
+	for _, sc := range available {
 		if match.MatchString(sc.name) {
 			selected = append(selected, sc)
 		}

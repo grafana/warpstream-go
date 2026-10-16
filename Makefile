@@ -23,3 +23,8 @@ simulation-mimir-build:
 simulation-mimir: simulation-mimir-build
 	mkdir -p pkg/internal/simulation/mimir/.reports
 	cd pkg/internal/simulation/mimir && go run -mod=mod . -mimir-binary "$(CURDIR)/pkg/internal/simulation/mimir/.build/mimir" -timeout 10m -report-filepath .reports/report.md -json-report-filepath .reports/report.json
+
+.PHONY: simulation-mimir-investigation
+simulation-mimir-investigation: simulation-mimir-build
+	mkdir -p pkg/internal/simulation/mimir/.reports
+	cd pkg/internal/simulation/mimir && go run -mod=mod . -mimir-binary "$(CURDIR)/pkg/internal/simulation/mimir/.build/mimir" -profile mimir-investigation -parallel 1 -check=false -timeout 15m -report-filepath .reports/investigation.md -json-report-filepath .reports/investigation.json

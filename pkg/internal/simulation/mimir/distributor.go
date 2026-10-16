@@ -40,25 +40,26 @@ const (
 var mimirVersion string
 
 type distributorClient struct {
-	config             runner.WorkloadConfig
-	base               string
-	series             int
-	http               *http.Client
-	command            *exec.Cmd
-	done               chan struct{}
-	cleanup            []func()
-	once               sync.Once
-	mu                 sync.Mutex
-	metrics            []*dto.MetricFamily
-	failure            error
-	partitions         map[int32]bool
-	expectedPartitions int
-	lastWriteError     error
-	backend            string
+	config                             runner.WorkloadConfig
+	base                               string
+	series                             int
+	http                               *http.Client
+	command                            *exec.Cmd
+	done                               chan struct{}
+	cleanup                            []func()
+	once                               sync.Once
+	mu                                 sync.Mutex
+	metrics                            []*dto.MetricFamily
+	failure                            error
+	partitions                         map[int32]bool
+	expectedPartitions                 int
+	lastWriteError                     error
+	backend                            string
+	overlayIdentity, binaryDescription string
 }
 
-func newDistributor(binary string, cfg runner.WorkloadConfig) (_ runner.Producer, err error) {
-	c := &distributorClient{config: cfg, http: &http.Client{Timeout: distributorRemoteTimeout}, series: 32 * int(cfg.Partitions), partitions: make(map[int32]bool), expectedPartitions: int(cfg.Partitions), backend: cfg.Backend}
+func newDistributorWithOptions(binary string, cfg runner.WorkloadConfig, options distributorOptions) (_ *distributorClient, err error) {
+	c := &distributorClient{config: cfg, http: &http.Client{Timeout: remoteTimeout(cfg) + 500*time.Millisecond}, series: 32 * int(cfg.Partitions), partitions: make(map[int32]bool), expectedPartitions: int(cfg.Partitions), backend: cfg.Backend}
 	defer func() {
 		if err != nil {
 			c.Close()
@@ -80,12 +81,24 @@ func newDistributor(binary string, cfg runner.WorkloadConfig) (_ runner.Producer
 		return nil, err
 	}
 	c.cleanup = append(c.cleanup, fixture.Close)
-	dir, err := os.MkdirTemp("", "mimir-simulation-")
+	if options.logDirectory != "" {
+		if err := os.MkdirAll(options.logDirectory, 0700); err != nil {
+			return nil, err
+		}
+	}
+	dir, err := os.MkdirTemp(options.logDirectory, "mimir-simulation-")
 	if err != nil {
 		return nil, err
 	}
-	c.cleanup = append(c.cleanup, func() { _ = os.RemoveAll(dir) })
+	if options.logDirectory == "" {
+		c.cleanup = append(c.cleanup, func() { _ = os.RemoveAll(dir) })
+	}
 	config := distributorConfiguration(cfg, address, fixture.URL, dir)
+	config, c.overlayIdentity, err = applyConfigurationOverlay(config, cfg, address, options.overlay)
+	if err != nil {
+		return nil, err
+	}
+	c.binaryDescription = binaryIdentity(binary)
 	configPath := filepath.Join(dir, "mimir.yaml")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		return nil, err
@@ -146,6 +159,10 @@ func newDistributor(binary string, cfg runner.WorkloadConfig) (_ runner.Producer
 }
 
 func distributorConfiguration(cfg runner.WorkloadConfig, address, fixtureURL, dir string) string {
+	limits := fmt.Sprintf("  ingestion_artificial_delay: %s\n", cfg.ArtificialDelay)
+	if cfg.SecondaryTopic != "" {
+		limits += "  ingestion_rate: 1000000\n  ingestion_burst_size: 1000000\n"
+	}
 	return fmt.Sprintf(`target: distributor
 server:
   http_listen_address: 127.0.0.1
@@ -185,12 +202,13 @@ blocks_storage:
   backend: filesystem
   filesystem:
     dir: %s
-memberlist:
+limits:
+%smemberlist:
   bind_addr: [127.0.0.1]
   bind_port: 0
 usage_stats:
   enabled: false
-`, distributorRemoteTimeout, strings.TrimPrefix(fixtureURL, "http://"), cfg.Backend, address, cfg.Topic, cfg.WriteTimeout, cfg.WriteTimeoutOverhead, cfg.DialTimeout, filepath.Join(dir, "blocks"))
+`, remoteTimeout(cfg), strings.TrimPrefix(fixtureURL, "http://"), cfg.Backend, address, cfg.Topic, cfg.WriteTimeout, cfg.WriteTimeoutOverhead, cfg.DialTimeout, filepath.Join(dir, "blocks"), limits)
 }
 
 func partitionFixture(partitions int32) (*httptest.Server, error) {
@@ -373,5 +391,13 @@ func (*distributorClient) RecoveryResponseDescription() string {
 
 func (c *distributorClient) Describe() (string, string) {
 	return fmt.Sprintf("Workload: separate, unmodified Mimir distributor processes receive Prometheus remote-write HTTP requests for one tenant, with %d series per request across %d ingest partitions. Mimir validates, shards, serializes and writes using its warpstream or kafka backend. Fake brokers acknowledge without durable storage; this measures HTTP completion, not queryability.", c.series, c.expectedPartitions),
-		fmt.Sprintf("Configuration: cmd/mimir source pin %s, built with a go.mod replacement for this checkout. Distributor remote timeout %s; Kafka write timeout %s, overhead %s and dial timeout %s. Other client settings use the pinned Mimir defaults. Ingester migration writes are disabled. External TCP proxies apply faults and rewrite advertised broker addresses; counters are scraped from /metrics. Produce response latency is injected on the TCP wire using the shared per-broker distributions; response order is preserved.", strings.TrimSpace(mimirVersion), distributorRemoteTimeout, c.config.WriteTimeout, c.config.WriteTimeoutOverhead, c.config.DialTimeout)
+		fmt.Sprintf("Configuration: default builder source pin %s; supplied binary identity %s. Configuration overlay %s. Distributor remote timeout %s; Kafka write timeout %s, overhead %s and dial timeout %s. Other client settings use the pinned Mimir defaults. Ingester migration writes are disabled. External TCP proxies apply faults and rewrite advertised broker addresses; counters are scraped from /metrics. Produce response latency is injected on the TCP wire using the shared per-broker distributions; response order is preserved.", strings.TrimSpace(mimirVersion), c.binaryDescription, c.overlayIdentity, c.remoteTimeout(), c.config.WriteTimeout, c.config.WriteTimeoutOverhead, c.config.DialTimeout)
 }
+
+func remoteTimeout(cfg runner.WorkloadConfig) time.Duration {
+	if cfg.RemoteTimeout > 0 {
+		return cfg.RemoteTimeout
+	}
+	return distributorRemoteTimeout
+}
+func (c *distributorClient) remoteTimeout() time.Duration { return remoteTimeout(c.config) }

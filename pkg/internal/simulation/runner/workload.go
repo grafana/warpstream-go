@@ -17,6 +17,8 @@ type Producer interface {
 type WorkloadConfig struct {
 	Backend, Address, Topic                         string
 	Partitions                                      int32
+	SecondaryTopic                                  string
+	RemoteTimeout, ArtificialDelay                  time.Duration
 	Registry                                        *prometheus.Registry
 	Dialer                                          func(context.Context, string, string) (net.Conn, error)
 	ObserveProduce                                  func(address string)

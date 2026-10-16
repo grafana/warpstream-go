@@ -18,7 +18,7 @@ import (
 // swapped in; its observations are discarded. The observed phase then drives the
 // comparison.
 func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (scenarioResult, error) {
-	env, err := newEnvironment(healthyBehaviours(), factory)
+	env, err := newScenarioEnvironment(sc.healthyBehaviours(), factory, sc)
 	if err != nil {
 		return scenarioResult{}, err
 	}
@@ -28,10 +28,13 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	runCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	runScenarioWarmup(runCtx, env)
+	runScenarioWarmupWithSpacing(runCtx, env, sc.spacing())
 	if err := validateWorkloads(env); err != nil {
 		return scenarioResult{}, fmt.Errorf("scenario %q warmup: %w", sc.name, err)
 	}
+
+	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, sc.duration(), sc.spacing())
+	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, sc.duration(), sc.spacing())
 
 	// Sample the Hedger's primary/hedge counters at exact bucket boundaries,
 	// anchored at observedStart so the per-bucket deltas line up with the
@@ -53,17 +56,18 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		env.wgoNetwork.recoveryStart = observedStart.Add(*sc.expect.recoveryFrom)
 		env.wgoNetwork.mu.Unlock()
 	}
+	env.behaviours.set(sc.behaviours)
 	phaseCtx, stopPhases := context.WithCancel(runCtx)
 	defer stopPhases()
 	phaseDone := make(chan error, 1)
 	go func() {
-		err := runTransportPhases(phaseCtx, env, observedStart, sc.transportPhases)
+		err := runPhases(phaseCtx, env, observedStart, sc)
 		if err != nil {
 			cancel()
 		}
 		phaseDone <- err
 	}()
-	wgoObservations, kgoObservations := runScenarioObserved(runCtx, env, sc, observedStart)
+	wgoObservations, kgoObservations := runScenarioObservedEvents(runCtx, env, observedStart, wgoEvents, kgoEvents)
 	stopPhases()
 	if err := <-phaseDone; err != nil {
 		return scenarioResult{}, fmt.Errorf("scenario %q transport phases: %w", sc.name, err)
@@ -85,7 +89,9 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	res := scenarioResult{
 		wgoMissingLeaders: env.wgoMetadata.missingLeaders(), kgoMissingLeaders: env.kgoMetadata.missingLeaders(),
 		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
-		sc:             sc,
+		sc:                   sc,
+		wgoLatencySelections: env.behaviours.selectedLatencies(clientTypeWgo), kgoLatencySelections: env.behaviours.selectedLatencies(clientTypeKgo),
+		windows:        summarizeWindows(sc.windows, observedStart, wgoSnapshot, kgoSnapshot),
 		wgoSummary:     wgoSnapshot.summary(),
 		kgoSummary:     kgoSnapshot.summary(),
 		wgoBuckets:     wgoSnapshot.bucketedSummary(reportBucket),
@@ -130,11 +136,11 @@ func validateWorkloads(env *environment) error {
 	return nil
 }
 
-func runScenarioWarmup(ctx context.Context, env *environment) {
+func runScenarioWarmupWithSpacing(ctx context.Context, env *environment, spacing time.Duration) {
 	// Each client gets its own records: kgo writes back to the *kgo.Record it
 	// produces, so sharing one slice across the two concurrent clients would race.
-	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, warmupDuration, eventSpacing)
-	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, warmupDuration, eventSpacing)
+	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, warmupDuration, spacing)
+	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, warmupDuration, spacing)
 	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -143,12 +149,7 @@ func runScenarioWarmup(ctx context.Context, env *environment) {
 	wg.Wait()
 }
 
-func runScenarioObserved(ctx context.Context, env *environment, sc scenario, start time.Time) (wgoObservations, kgoObservations *observations) {
-	env.behaviours.set(sc.behaviours)
-	// Each client gets its own records: kgo writes back to the *kgo.Record it
-	// produces, so sharing one slice across the two concurrent clients would race.
-	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, sc.duration(), eventSpacing)
-	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, sc.duration(), eventSpacing)
+func runScenarioObservedEvents(ctx context.Context, env *environment, start time.Time, wgoEvents, kgoEvents []scenarioEvent) (wgoObservations, kgoObservations *observations) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); wgoObservations = runScenarioEvents(ctx, env.wgoClient, wgoEvents, start) }()

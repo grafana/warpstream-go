@@ -6,6 +6,8 @@ import "fmt"
 // scenario.
 type scenarioResult struct {
 	sc                                         scenario
+	windows                                    []windowResult
+	wgoLatencySelections, kgoLatencySelections map[int32]int64
 	workloadDescription, workloadConfiguration string
 	recoveryResponseDescription                string
 
@@ -132,8 +134,23 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("no successful recovery Produce response (including probes) reached restored broker %d", phase.nodeID)})
 		}
 	}
+	for _, phase := range res.sc.behaviourPhases {
+		for broker, behaviour := range phase.behaviours.byBroker {
+			if !behaviour.injectedLatency {
+				continue
+			}
+			for _, lane := range []struct {
+				name     string
+				selected map[int32]int64
+			}{{"wgo", res.wgoLatencySelections}, {"kgo", res.kgoLatencySelections}} {
+				if lane.selected[broker] == 0 {
+					out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s: no Produce response selected for injected delay on broker %d", lane.name, broker)})
+				}
+			}
+		}
+	}
 	if exp.recoveryFrom != nil {
-		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, eventSpacing))
+		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, res.sc.spacing()))
 		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
 			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
 			if exp.slowBudget != nil {

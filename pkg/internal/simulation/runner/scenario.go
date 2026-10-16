@@ -51,6 +51,9 @@ type scenario struct {
 	behaviours      brokersBehaviour
 	expect          scenarioExpectations
 	transportPhases []transportPhase
+	profile         *workloadProfile
+	behaviourPhases []behaviourPhase
+	windows         []observationWindow
 }
 
 func (sc scenario) duration() time.Duration {

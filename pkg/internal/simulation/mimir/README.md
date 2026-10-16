@@ -54,6 +54,66 @@ repository; fork PRs retain the artifacts and job summaries.
 
 To use an existing build, run `go run . -mimir-binary /absolute/path/to/mimir` in
 this directory. CI supplies the same path through `SIMULATION_BINARY`.
-The binary must use the pinned source and current client checkout.
+Use the pinned source and current client checkout for comparisons with CI.
+Reports identify the supplied binary's Go version and linked client version;
+the default builder source pin does not assert the source of a supplied binary.
 Use `-scenario` with a regular expression to rerun selected scenarios.
 Run `go test -race ./...` here for proxy, remote-write and observer unit tests.
+
+## Investigation profile
+
+`make simulation-mimir-investigation` runs an opt-in profile against the same
+unmodified Mimir binary. The standard suite and CI remain unchanged. The profile
+uses ten agents serving fifty partitions, a 4s Kafka write timeout, 500ms dial
+timeout, and 500ms minimum ingestion delay. Two independent distributors per
+client lane write distinct topics through the same agents. Their HTTP budgets
+are 5s and 4s. An application event sends both remote-write requests concurrently
+and succeeds only when both succeed within the outer 5s application deadline.
+
+Twenty application events per second produce forty HTTP pushes per second per
+lane, each containing 1600 series. A healthy case observes 600 events after warmup.
+The sustained-stall case observes 3600 events: ten healthy seconds, 120 seconds
+with one agent delaying Produce responses by 9s and four by 3s, then fifty healthy
+seconds. Reports separate scheduled pre-fault, degraded, and recovery windows;
+all 700 events scheduled from 145s must succeed. The degraded window has no
+success-rate floor or assumption that either client wins.
+
+This is a hypothesis-testing profile, not a complete Mimir deployment. Independent
+HTTP writers approximate coupled write outcomes, but do not implement an
+aggregation pipeline. Delaying Kafka responses does not emulate an object store,
+packet loss, shared storage queues, or server-side backpressure. Brokers still
+acknowledge without durable storage. Use real services to establish those effects.
+The profile takes about five minutes plus build time, running cases sequentially.
+
+To retain each process's logs and generated configuration locally:
+
+```sh
+cd pkg/internal/simulation/mimir
+go run . -mimir-binary /absolute/path/to/mimir -profile mimir-investigation \
+  -parallel 1 -check=false -timeout 15m \
+  -mimir-log-directory /private/tmp/mimir-investigation-logs \
+  -report-filepath .reports/investigation.md \
+  -json-report-filepath .reports/investigation.json
+```
+
+For compatible builds with additional configuration fields, supply
+`-mimir-config-overlay /absolute/path/to/overlay.yaml`. The YAML overlay is a Go
+text template with `.Backend`, `.Address`, `.Topic`, and `.SecondaryTopic` fields.
+It merges over the generated configuration. Harness-owned networking, topology,
+rings, write budgets, and artificial delay cannot be overridden. For example:
+
+```yaml
+limits:
+  max_global_series_per_user: 200000
+```
+
+Keep overlays and retained logs outside the repository. Reports include the
+SHA-256 of the overlay source, not its contents. Inspect retained configuration
+and logs before sharing them. Additional features must be explicitly configured
+in a compatible binary; an overlay alone does not add them to OSS Mimir.
+
+Build the same pinned Mimir source with another published client version using
+`WARPSTREAM_CLIENT_VERSION=<version> bash pkg/internal/simulation/mimir/build-mimir.sh /absolute/build/directory`.
+Compare runs with the same machine, profile, writer count, binary source and
+overlay. Use `-mimir-writers=1` to isolate the main writer; the default is two for
+the investigation profile and one for the standard suite.

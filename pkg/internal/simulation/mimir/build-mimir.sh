@@ -13,7 +13,11 @@ source_dir="$(go list -m -f '{{.Dir}}' "github.com/grafana/mimir@$version")"
 cp "$source_dir/go.mod" "$build_dir/go.mod"
 cp "$source_dir/go.sum" "$build_dir/go.sum"
 chmod u+w "$build_dir/go.mod" "$build_dir/go.sum"
-go mod edit -modfile="$build_dir/go.mod" -replace="github.com/grafana/warpstream-go=$repo_dir"
+if [[ -n "${WARPSTREAM_CLIENT_VERSION:-}" ]]; then
+  go mod edit -modfile="$build_dir/go.mod" -replace="github.com/grafana/warpstream-go=github.com/grafana/warpstream-go@$WARPSTREAM_CLIENT_VERSION"
+else
+  go mod edit -modfile="$build_dir/go.mod" -replace="github.com/grafana/warpstream-go=$repo_dir"
+fi
 (
   cd "$source_dir"
   GOMAXPROCS="${GOMAXPROCS:-4}" go build -p "${GOMAXPROCS:-4}" -mod=mod \

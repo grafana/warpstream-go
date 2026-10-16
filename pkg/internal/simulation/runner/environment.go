@@ -104,10 +104,39 @@ type environment struct {
 	wgoMetadata, kgoMetadata *metadataView
 }
 
-// newEnvironment builds two identically-configured clusters (one per client) with
-// the given initial per-broker behaviours. The caller owns the result and must
-// Close it.
-func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *environment, err error) {
+func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, sc scenario) (_ *environment, err error) {
+	if sc.profile != nil && factory == nil {
+		return nil, fmt.Errorf("investigation topology requires an external workload")
+	}
+	brokers, partitions := sc.topology()
+	createCluster := func() (*kfake.Cluster, string, error) {
+		cluster, address, createErr := testkafka.NewCluster(partitions, topicName, testkafka.WithNumBrokers(int(brokers)))
+		if createErr != nil || sc.profile == nil {
+			return cluster, address, createErr
+		}
+		if createErr = cluster.CreateTopic(secondaryTopicName, partitions, nil); createErr == nil {
+			for id := range partitions {
+				if createErr = cluster.MoveTopicPartition(secondaryTopicName, id, id%brokers); createErr != nil {
+					break
+				}
+			}
+		}
+		if createErr != nil {
+			cluster.Close()
+			return nil, "", createErr
+		}
+		return cluster, address, nil
+	}
+	workload := func(backend, address string, registry *prometheus.Registry, network *transportNetwork, behaviours *brokersBehaviourProvider) WorkloadConfig {
+		cfg := workloadConfig(backend, address, registry, network, behaviours)
+		cfg.Partitions = partitions
+		if sc.profile != nil {
+			cfg.SecondaryTopic = secondaryTopicName
+			cfg.WriteTimeout, cfg.DialTimeout = sc.profile.writeTimeout, sc.profile.dialTimeout
+			cfg.RemoteTimeout, cfg.ArtificialDelay = appRequestTimeout, 500*time.Millisecond
+		}
+		return cfg
+	}
 	beh := newBrokersBehaviourProvider(initial)
 
 	var clusters []*kfake.Cluster
@@ -130,7 +159,7 @@ func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *envir
 	// Warpstream client testing environment.
 	//
 
-	wgoCluster, wsAddr, err := testkafka.NewCluster(clusterSize, topicName, testkafka.WithNumBrokers(int(clusterSize)))
+	wgoCluster, wsAddr, err := createCluster()
 	if err != nil {
 		return nil, fmt.Errorf("create warpstream cluster: %w", err)
 	}
@@ -164,7 +193,7 @@ func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *envir
 			wgoClient = raw
 		}
 	} else {
-		wgoClient, err = factory(workloadConfig("warpstream", wsAddr, wgoRegistry, wgoNetwork, beh))
+		wgoClient, err = factory(workload("warpstream", wsAddr, wgoRegistry, wgoNetwork, beh))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create warpstream workload: %w", err)
@@ -175,7 +204,7 @@ func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *envir
 	// franz-go client testing environment.
 	//
 
-	kgoCluster, kgoAddr, err := testkafka.NewCluster(clusterSize, topicName, testkafka.WithNumBrokers(int(clusterSize)))
+	kgoCluster, kgoAddr, err := createCluster()
 	if err != nil {
 		return nil, fmt.Errorf("create kgo cluster: %w", err)
 	}
@@ -200,7 +229,7 @@ func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *envir
 			kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
 		}
 	} else {
-		kgoClient, err = factory(workloadConfig("kafka", kgoAddr, prometheus.NewPedanticRegistry(), kgoNetwork, beh))
+		kgoClient, err = factory(workload("kafka", kgoAddr, prometheus.NewPedanticRegistry(), kgoNetwork, beh))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create kafka workload: %w", err)
@@ -232,7 +261,7 @@ func newEnvironment(initial brokersBehaviour, factory WorkloadFactory) (_ *envir
 
 	return &environment{
 		topic:         topicName,
-		numPartitions: clusterSize,
+		numPartitions: partitions,
 		wgoCluster:    wgoCluster,
 		wgoClient:     wgoClient,
 		wgoRegistry:   wgoRegistry,
@@ -290,7 +319,7 @@ func installFailureControl(cluster *kfake.Cluster, behaviours *brokersBehaviourP
 }
 
 // latencyDelayedKgoClient wraps a kgo.Client and delays every Produce promise by
-// the latency drawn from the per-partition behaviour. See newEnvironment for why
+// the latency drawn from the per-partition behaviour. See newScenarioEnvironment for why
 // partition-keying is equivalent to broker-keying for this baseline.
 //
 // Latency is applied after kgo's promise fires, not on the wire, so kgo's own
