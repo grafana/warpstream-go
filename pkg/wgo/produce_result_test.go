@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -211,7 +214,7 @@ func TestGetProduceResultErr(t *testing.T) {
 		},
 		"transport error (io.EOF)": {
 			err:  io.EOF,
-			want: produceResultErr{reason: "transport", retriable: true, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "transport", retriable: true, code: kerr.NetworkException.Code},
 		},
 		"non-retriable kerr error (MessageTooLarge)": {
 			err:  kerr.MessageTooLarge,
@@ -762,5 +765,16 @@ func TestSelectProduceResult(t *testing.T) {
 				assert.Equal(t, tc.want.err.Error(), got.err.Error())
 			}
 		})
+	}
+}
+
+func TestProduceResult_TransportFailuresStayRetryableInBufferedResponses(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{io.EOF, &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}} {
+		acc := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+		acc.accumulate(ProduceResult{err: err})
+		responseOnly := ProduceResult{resp: acc.result().resp}
+		require.ErrorIs(t, responseOnly.error(), kerr.NetworkException)
+		assert.True(t, getProduceResultErr(responseOnly.error()).retriable)
 	}
 }

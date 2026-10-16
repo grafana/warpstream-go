@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -115,6 +116,7 @@ type produceResultErr struct {
 
 // getProduceResultErr classifies err into a produceResultErr.
 func getProduceResultErr(err error) produceResultErr {
+	var networkErr *net.OpError
 	switch {
 	case errors.Is(err, context.Canceled):
 		return produceResultErr{err: err, reason: "canceled", retriable: false, code: kerr.RequestTimedOut.Code}
@@ -127,8 +129,12 @@ func getProduceResultErr(err error) produceResultErr {
 			code = kerrErr.Code
 		}
 		return produceResultErr{err: err, reason: "kafka_retriable_error", retriable: true, code: code}
-	case kgo.IsRetryableBrokerErr(err):
-		return produceResultErr{err: err, reason: "transport", retriable: true, code: kerr.UnknownServerError.Code}
+	case err != nil && err.Error() == "unknown broker":
+		// franz-go exposes no sentinel for a broker removed during a metadata refresh.
+		return produceResultErr{err: err, reason: "transport", retriable: true, code: kerr.BrokerNotAvailable.Code}
+	case kgo.IsRetryableBrokerErr(err), errors.As(err, &networkErr):
+		// Buffered responses must preserve retryability when only Kafka codes survive.
+		return produceResultErr{err: err, reason: "transport", retriable: true, code: kerr.NetworkException.Code}
 	}
 	// Distinguish a known-but-non-retriable kerr error (MessageTooLarge,
 	// auth, etc.) from anything else. Unknown errors stay non-retriable: we
