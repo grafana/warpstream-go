@@ -81,8 +81,8 @@ const (
 // same batch of partitions. The whole "retry on a different agent,
 // possibly fire a hedge to race the primary, give up when
 // MaxHedgeAgents is reached" story lives here; the layer below
-// (TrackingProducer → KafkaDirectProducer) is a single per-attempt
-// produce with no retry of its own.
+// (TrackingProducer → KafkaDirectProducer) keeps each attempt on one agent;
+// bounded connection recovery leaves time for this layer to fail over.
 //
 // ProduceSync fires the primary leg and then waits for one of three outcomes:
 //
@@ -150,7 +150,7 @@ func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy Partitio
 		logger:   logger,
 	}
 	h.hedgeBuffer = NewClusterBuffer[routedEncodedTopicPartitionRecords](linger, batchMaxBytes, func(ctx context.Context, nodeID int32, parts []routedEncodedTopicPartitionRecords) ProduceResult {
-		// Every hedge-buffer flush is one hedge wire request (possibly
+		// Every hedge-buffer flush is one hedge attempt (possibly
 		// covering multiple partitions). The companion primary counter is
 		// incremented in ProduceSync.
 		m.produceRequestsHedgeTotal.Inc()

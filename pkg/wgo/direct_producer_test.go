@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,12 +23,113 @@ import (
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/kversion"
 
 	"github.com/grafana/warpstream-go/pkg/internal/testkafka"
 )
 
 func TestKafkaDirectProducer_ImplementsDirectProducer(t *testing.T) {
 	var _ DirectProducer = (*KafkaDirectProducer)(nil)
+}
+
+type directProducerWriteHook struct{ wrote chan struct{} }
+
+func (h directProducerWriteHook) OnBrokerWrite(_ kgo.BrokerMetadata, key int16, _ int, _, _ time.Duration, err error) {
+	if key == int16(kmsg.Produce) && err == nil {
+		h.wrote <- struct{}{}
+	}
+}
+
+func blockedDirectProducer(t *testing.T) (*KafkaDirectProducer, *kgo.Client, <-chan struct{}, func()) {
+	t.Helper()
+	var vnet kfake.VirtualNetwork
+	cluster, address := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithVirtualNetwork(&vnet))
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	cluster.ControlKey(int16(kmsg.Produce), func(kmsg.Request) (kmsg.Response, error, bool) {
+		cluster.SleepControl(func() { <-hold })
+		return nil, nil, false
+	})
+	writes := make(chan struct{}, 8)
+	client, err := kgo.NewClient(kgo.SeedBrokers(address), kgo.Dialer(vnet.DialContext), kgo.WithHooks(directProducerWriteHook{writes}))
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	metadata, err := client.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+	require.NoError(t, err)
+	id := metadata.(*kmsg.MetadataResponse).Topics[0].TopicID
+	producer := NewKafkaDirectProducer(client, func(string) ([16]byte, bool) { return id, true }, 9, KafkaDirectProducerConfig{
+		ProduceRequestTimeout: time.Second, ProduceRequestTimeoutOverhead: time.Second,
+	}, newMetrics(prometheus.NewPedanticRegistry()))
+	return producer, client, writes, release
+}
+
+func TestKafkaDirectProducer_CancellationPreservesPeerRequests(t *testing.T) {
+	for _, expireGrace := range []bool{false, true} {
+		name := "response drains"
+		if expireGrace {
+			name = "drain grace expires"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				producer, _, writes, release := blockedDirectProducer(t)
+				parts := partitionsForTest([]*kgo.Record{{Topic: "test-topic", Value: []byte("value"), Timestamp: time.Now()}})
+				ctx, cancel := context.WithCancel(t.Context())
+				first, second := make(chan ProduceResult, 1), make(chan ProduceResult, 1)
+				go func() { first <- producer.ProduceSync(ctx, Agent{NodeID: 0}, parts) }()
+				<-writes
+				go func() { second <- producer.ProduceSync(t.Context(), Agent{NodeID: 0}, parts) }()
+				<-writes
+				cancel()
+				synctest.Wait()
+				require.ErrorIs(t, (<-first).error(), context.Canceled)
+				if expireGrace {
+					time.Sleep(time.Second)
+					synctest.Wait()
+					<-writes
+				}
+				release()
+				require.NoError(t, (<-second).error())
+			})
+		})
+	}
+}
+
+func TestKafkaDirectProducer_CancellationAndShutdown(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		name := "caller cancellation"
+		if shutdown {
+			name = "client shutdown"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				producer, client, writes, release := blockedDirectProducer(t)
+				drained := make(chan error, 1)
+				producer.onProduceResponse = func(_ context.Context, _ int32, _ *kmsg.ProduceResponse, err error) { drained <- err }
+				ctx, cancel := context.WithCancel(t.Context())
+				result := make(chan ProduceResult, 1)
+				go func() {
+					result <- producer.ProduceSync(ctx, Agent{NodeID: 0}, partitionsForTest([]*kgo.Record{{Topic: "test-topic", Value: []byte("value"), Timestamp: time.Now()}}))
+				}()
+				<-writes
+				stoppedAt := time.Now()
+				if shutdown {
+					client.Close()
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				require.Error(t, (<-result).error())
+				require.Equal(t, stoppedAt, time.Now())
+				require.Error(t, <-drained)
+				if !shutdown {
+					require.Equal(t, producer.cfg.ProduceRequestTimeoutOverhead, time.Since(stoppedAt))
+				}
+				cancel()
+				release()
+			})
+		})
+	}
 }
 
 func TestKafkaDirectProducer_Produce(t *testing.T) {
@@ -99,7 +205,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 			// Counter ticked once on the successful Produce; no failures.
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.
 				# TYPE warpstream_produce_direct_requests_total counter
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
@@ -113,7 +219,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			require.NoError(t, res.err)
 
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.
 				# TYPE warpstream_produce_direct_requests_total counter
 				warpstream_produce_direct_requests_total{agent_state="demoted"} 1
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
@@ -277,10 +383,10 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 
 			// Failure was an attempt-timeout (DeadlineExceeded from inner ctx).
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.
 				# TYPE warpstream_produce_direct_requests_total counter
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
-				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.
 				# TYPE warpstream_produce_direct_requests_failed_total counter
 				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="timeout"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
@@ -348,7 +454,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 					assert.ErrorIs(t, res.error(), tc.wantErr)
 
 					require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.
 						# TYPE warpstream_produce_direct_requests_failed_total counter
 						warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="%s"} 1
 					`, tc.reason)), "warpstream_produce_direct_requests_failed_total"))
@@ -384,4 +490,124 @@ func partitionsForTest(records []*kgo.Record) []encodedTopicPartitionRecords {
 		out = append(out, newEncodedTopicPartitionRecords(g.topic, g.partition, g.records))
 	}
 	return out
+}
+
+func TestKafkaDirectProducer_UnreachablePrimaryAllowsColdFailover(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var vnet kfake.VirtualNetwork
+		cluster, address := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithNumBrokers(2), testkafka.WithVirtualNetwork(&vnet))
+		cluster.ControlKey(int16(kmsg.Produce), func(request kmsg.Request) (kmsg.Response, error, bool) {
+			cluster.KeepControl()
+			req := request.(*kmsg.ProduceRequest)
+			resp := req.ResponseKind().(*kmsg.ProduceResponse)
+			resp.Version = req.Version
+			for _, topic := range req.Topics {
+				out := kmsg.ProduceResponseTopic{Topic: topic.Topic, TopicID: topic.TopicID}
+				for _, partition := range topic.Partitions {
+					out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{Partition: partition.Partition})
+				}
+				resp.Topics = append(resp.Topics, out)
+			}
+			return resp, nil, true
+		})
+		var reject atomic.Bool
+		versions := kversion.Stable()
+		versions.SetMaxKeyVersion(kmsg.Produce.Int16(), 9)
+		client, err := kgo.NewClient(kgo.SeedBrokers(address), kgo.MaxVersions(versions), kgo.Dialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if reject.Load() && addr == cluster.ListenAddrs()[0] {
+				return nil, &net.OpError{Op: "dial", Net: network, Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+			}
+			return vnet.DialContext(ctx, network, addr)
+		}))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		metadata, err := client.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+		require.NoError(t, err)
+		id := metadata.(*kmsg.MetadataResponse).Topics[0].TopicID
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		producer := NewKafkaDirectProducer(client, func(string) ([16]byte, bool) { return id, true }, 9, KafkaDirectProducerConfig{ProduceRequestTimeout: 8 * time.Second, ProduceRequestTimeoutOverhead: 2 * time.Second}, m)
+		strategy := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{"test-topic", 0}: healthyAgents(0, 1)}}
+		hedger := NewHedger(producer, NewAverageAgentStatsTracker(), strategy, HealthCheckConfig{}, HedgerConfig{MinHedgeDelay: time.Millisecond, MaxHedgeAgents: 2}, 0, 1<<20, m, nil)
+		t.Cleanup(hedger.Close)
+		reject.Store(true)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		parts := partitionsForTest([]*kgo.Record{{Topic: "test-topic", Partition: 0, Value: []byte("value"), Timestamp: time.Now()}})
+		started := time.Now()
+		result := hedger.ProduceSync(ctx, 0, []routedEncodedTopicPartitionRecords{{encodedTopicPartitionRecords: parts[0], nodeID: 0, nodeState: AgentStateHealthy}})
+		require.NoError(t, result.error())
+		assert.Less(t, time.Since(started), time.Second)
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsSuppressedTotal.WithLabelValues(hedgeSuppressedNoAgentStats)))
+	})
+}
+
+func TestKafkaDirectProducer_MissingBrokerRemainsRetryable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var vnet kfake.VirtualNetwork
+		_, address := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithVirtualNetwork(&vnet))
+		client, err := kgo.NewClient(kgo.SeedBrokers(address), kgo.MaxVersions(produceMaxVersions()), kgo.Dialer(vnet.DialContext))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		producer := NewKafkaDirectProducer(client, func(string) ([16]byte, bool) { return [16]byte{}, true }, ProduceAPIVersion, KafkaDirectProducerConfig{ProduceRequestTimeout: time.Second, ProduceRequestTimeoutOverhead: time.Second}, newMetrics(prometheus.NewPedanticRegistry()))
+		parts := partitionsForTest([]*kgo.Record{{Topic: "test-topic", Value: []byte("value"), Timestamp: time.Now()}})
+		result := producer.ProduceSync(t.Context(), Agent{NodeID: 123}, parts)
+		require.Error(t, result.error())
+		classified := getProduceResultErr(result.error())
+		assert.True(t, classified.retriable)
+		assert.Equal(t, kerr.BrokerNotAvailable.Code, classified.code)
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		strategy := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{"test-topic", 0}: healthyAgents(123, 0)}}
+		hedger := NewHedger(producer, NewAverageAgentStatsTracker(), strategy, HealthCheckConfig{}, HedgerConfig{MinHedgeDelay: time.Millisecond, MaxHedgeAgents: 2}, 0, 1<<20, m, nil)
+		t.Cleanup(hedger.Close)
+		response := hedger.ProduceSync(t.Context(), 123, []routedEncodedTopicPartitionRecords{{encodedTopicPartitionRecords: parts[0], nodeID: 123, nodeState: AgentStateHealthy}})
+		require.NoError(t, response.error())
+	})
+}
+
+func TestKafkaDirectProducer_ConnectionRetryReservesFailoverBudget(t *testing.T) {
+	for _, budget := range []time.Duration{time.Second, 10 * time.Second} {
+		t.Run(budget.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var vnet kfake.VirtualNetwork
+				cluster, address := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithNumBrokers(2), testkafka.WithVirtualNetwork(&vnet))
+				var primaryCalls atomic.Int32
+				cluster.ControlKey(int16(kmsg.Produce), func(request kmsg.Request) (kmsg.Response, error, bool) {
+					cluster.KeepControl()
+					if cluster.CurrentNode() == 0 {
+						if primaryCalls.Add(1) == 1 {
+							return nil, io.EOF, true
+						}
+						return nil, nil, true
+					}
+					req := request.(*kmsg.ProduceRequest)
+					resp := req.ResponseKind().(*kmsg.ProduceResponse)
+					resp.Version = req.Version
+					for _, topic := range req.Topics {
+						out := kmsg.ProduceResponseTopic{Topic: topic.Topic, TopicID: topic.TopicID}
+						for _, partition := range topic.Partitions {
+							out.Partitions = append(out.Partitions, kmsg.ProduceResponseTopicPartition{Partition: partition.Partition})
+						}
+						resp.Topics = append(resp.Topics, out)
+					}
+					return resp, nil, true
+				})
+				client, err := kgo.NewClient(kgo.SeedBrokers(address), kgo.Dialer(vnet.DialContext), kgo.MaxVersions(produceMaxVersions()), kgo.AlwaysRetryEOF())
+				require.NoError(t, err)
+				t.Cleanup(client.Close)
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				producer := NewKafkaDirectProducer(client, func(string) ([16]byte, bool) { return [16]byte{}, true }, ProduceAPIVersion, KafkaDirectProducerConfig{ProduceRequestTimeout: 8 * time.Second, ProduceRequestTimeoutOverhead: 2 * time.Second}, m)
+				strategy := &mockPartitionAssignmentStrategy{candidates: map[partitionKey][]Agent{{"test-topic", 0}: healthyAgents(0, 1)}}
+				hedger := NewHedger(producer, NewAverageAgentStatsTracker(), strategy, HealthCheckConfig{}, HedgerConfig{MinHedgeDelay: time.Millisecond, MaxHedgeAgents: 2}, 0, 1<<20, m, nil)
+				t.Cleanup(hedger.Close)
+				ctx, cancel := context.WithTimeout(t.Context(), budget)
+				defer cancel()
+				parts := partitionsForTest([]*kgo.Record{{Topic: "test-topic", Value: []byte("value"), Timestamp: time.Now()}})
+				started := time.Now()
+				result := hedger.ProduceSync(ctx, 0, []routedEncodedTopicPartitionRecords{{encodedTopicPartitionRecords: parts[0], nodeID: 0, nodeState: AgentStateHealthy}})
+				require.NoError(t, result.error())
+				assert.Equal(t, min(2*time.Second, budget/2), time.Since(started))
+				assert.Equal(t, int32(2), primaryCalls.Load())
+			})
+		})
+	}
 }

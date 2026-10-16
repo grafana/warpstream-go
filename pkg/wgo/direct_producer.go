@@ -34,9 +34,9 @@ type KafkaDirectProducerConfig struct {
 	ProduceRequestTimeout time.Duration
 
 	// ProduceRequestTimeoutOverhead is added on top of ProduceRequestTimeout
-	// to compute the client-side ctx deadline. Always strictly greater than zero
-	// so the client never kills a connection while the agent is still legitimately
-	// working.
+	// to compute the client-side deadline. It also bounds the cancellation drain
+	// grace and one connection-recovery retry, so a stalled shared connection
+	// cannot consume the whole write budget. Must be strictly positive.
 	ProduceRequestTimeoutOverhead time.Duration
 }
 
@@ -78,14 +78,14 @@ func NewKafkaDirectProducer(client *kgo.Client, topicID func(string) ([16]byte, 
 
 // ProduceSync implements DirectProducer.
 func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, partitions []encodedTopicPartitionRecords) (retResult ProduceResult) {
+	if err := ctx.Err(); err != nil {
+		return ProduceResult{err: err}
+	}
 	req, reqStats, err := buildMultiTopicProduceRequestFromEncoded(s.version, s.topicID, partitions)
 	if err != nil {
 		return ProduceResult{err: err}
 	}
 	req.SetTimeout(int32(s.cfg.ProduceRequestTimeout.Milliseconds()))
-
-	attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.ProduceRequestTimeout+s.cfg.ProduceRequestTimeoutOverhead)
-	defer cancel()
 
 	agentState := agentStateLabel(target.State)
 	s.metrics.produceDirectRequestsTotal.WithLabelValues(agentState).Inc()
@@ -116,9 +116,55 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		}
 	}()
 
-	// Uses Broker.Request (not RetriableRequest) so franz-go's internal retry
-	// loop stays out of the way: retries are owned by the caller.
-	resp, err := s.client.Broker(int(target.NodeID)).Request(attemptCtx, req)
+	// Give a canceled wire request time to drain without closing its shared
+	// connection, but bound that grace so slow responses cannot stall it forever.
+	attemptCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ProduceRequestTimeout+s.cfg.ProduceRequestTimeoutOverhead)
+	stop := context.AfterFunc(ctx, func() {
+		timer := time.NewTimer(s.cfg.ProduceRequestTimeoutOverhead)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-attemptCtx.Done():
+		}
+	})
+	result := make(chan ProduceResult, 1)
+	go func() {
+		defer cancel()
+		defer stop()
+		if err := ctx.Err(); err != nil {
+			result <- ProduceResult{err: err}
+			return
+		}
+		result <- s.request(ctx, attemptCtx, target, req)
+	}()
+	select {
+	case retResult = <-result:
+		if err := ctx.Err(); err != nil {
+			return ProduceResult{err: err}
+		}
+		return retResult
+	case <-ctx.Done():
+		return ProduceResult{err: ctx.Err()}
+	}
+}
+
+func (s *KafkaDirectProducer) request(callerCtx, ctx context.Context, target Agent, req *kmsg.ProduceRequest) ProduceResult {
+	// A canceled peer can drop the shared connection. Retry once, reserving
+	// at least half the remaining caller budget for cross-agent failover.
+	broker := s.client.Broker(int(target.NodeID))
+	resp, err := broker.Request(ctx, req)
+	if kgo.IsRetryableBrokerErr(err) && callerCtx.Err() == nil && ctx.Err() == nil {
+		budget := s.cfg.ProduceRequestTimeoutOverhead
+		if deadline, ok := callerCtx.Deadline(); ok {
+			budget = min(budget, time.Until(deadline)/2)
+		}
+		if budget > 0 {
+			retryCtx, cancel := context.WithTimeout(ctx, budget)
+			resp, err = broker.Request(retryCtx, req)
+			cancel()
+		}
+	}
 
 	// Decode the response up front so the hook always observes the same
 	// typed value the caller would see.
@@ -132,9 +178,9 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 	}
 
 	if s.onProduceResponse != nil {
-		s.onProduceResponse(attemptCtx, target.NodeID, pr, err)
+		s.onProduceResponse(ctx, target.NodeID, pr, err)
 		// The hook may have slept past the attempt deadline.
-		if ctxErr := attemptCtx.Err(); ctxErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ProduceResult{err: ctxErr}
 		}
 	}

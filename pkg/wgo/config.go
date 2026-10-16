@@ -279,7 +279,8 @@ func WithProduceRequestTimeout(d time.Duration) Opt {
 }
 
 // WithProduceRequestTimeoutOverhead sets the slack added on top of the produce
-// request timeout to compute the client-side deadline.
+// request timeout to compute the client-side deadline. It also caps the drain
+// grace after caller cancellation and one connection-recovery retry.
 func WithProduceRequestTimeoutOverhead(d time.Duration) Opt {
 	return opt{func(c *Config) { c.DirectProducer.ProduceRequestTimeoutOverhead = d }}
 }

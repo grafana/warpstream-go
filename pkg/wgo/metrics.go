@@ -281,7 +281,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	// absent for the success series.
 	produceDirectRequestLatency := promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
 		Name:                            "warpstream_produce_direct_request_latency_seconds",
-		Help:                            "Latency of a single direct Produce request to a Warpstream agent, by outcome (and by failure reason when the outcome is a failure). Each retry counts as a separate request.",
+		Help:                            "Latency of a single direct Produce request to a Warpstream agent, by outcome (and by failure reason when the outcome is a failure). Hedge retries count as separate attempts; connection-level retries are included in the attempt.",
 		NativeHistogramBucketFactor:     1.1,
 		NativeHistogramMaxBucketNumber:  100,
 		NativeHistogramMinResetDuration: time.Hour,
@@ -408,19 +408,19 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		produceDirectRequestsTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_total",
-			Help: "Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.",
+			Help: "Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.",
 		}, []string{"agent_state"}),
 		produceRequestsPrimaryTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_requests_primary_total",
-			Help: "Total number of primary Produce wire requests.",
+			Help: "Total number of primary Produce attempts, excluding connection-level retries within an attempt.",
 		}),
 		produceRequestsHedgeTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_requests_hedge_total",
-			Help: "Total number of hedging and retried Produce wire requests.",
+			Help: "Total number of hedging and retried Produce attempts, excluding connection-level retries within an attempt.",
 		}),
 		produceDirectRequestsFailedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_failed_total",
-			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.",
+			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Hedge retries count as separate attempts; connection-level retries are included in the attempt.",
 		}, []string{"reason", "agent_state"}),
 		produceRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_records_total",

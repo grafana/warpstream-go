@@ -52,6 +52,11 @@ and attempt accounting, and client-boundary record counters. They carry a
 `warpstream_` prefix so they never collide with franz-go/kprom names and are
 unambiguously backend-specific.
 
+Produce attempt counters and latency histograms count orchestration attempts.
+Connection-level retries within an attempt are covered by kprom's transport
+metrics; they do not increment the primary or hedge attempt counters. Producer
+state counters credit the final acknowledged result once.
+
 ## 4. Build info — `warpstream_client_build_info`
 
 One gauge, `warpstream_client_build_info`, is not behavioural. It is always
