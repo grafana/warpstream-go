@@ -6,7 +6,7 @@ import (
 )
 
 // scenarioExpectations declares what a scenario's results must show to pass.
-// minWgoSuccessRate is always enforced; the other two are opt-in per scenario
+// minWgoSuccessRate is always enforced; the other gates are opt-in per scenario
 // (nil disables them) because a single success-rate floor can't prove wgo
 // actually did something a plain client wouldn't have: on the latency
 // scenarios both clients finish every request inside appRequestTimeout, and
@@ -18,6 +18,8 @@ type scenarioExpectations struct {
 	// clear. Always enforced; the zero value is a no-op floor every run
 	// passes.
 	minWgoSuccessRate float64
+	recoveryFrom      *time.Duration
+	maxHedgeSurge     *float64
 
 	// slowBudget and maxWgoSlowFraction together assert wgo's sub-timeout
 	// tail: at most maxWgoSlowFraction of wgo requests may take longer than
@@ -43,10 +45,19 @@ type scenarioExpectations struct {
 // scenario is one comparison case: a set of per-broker behaviours swapped in
 // for the observed phase, plus what we expect the results to show.
 type scenario struct {
-	name        string
-	description string
-	behaviours  brokersBehaviour
-	expect      scenarioExpectations
+	name            string
+	observedFor     time.Duration
+	description     string
+	behaviours      brokersBehaviour
+	expect          scenarioExpectations
+	transportPhases []transportPhase
+}
+
+func (sc scenario) duration() time.Duration {
+	if sc.observedFor > 0 {
+		return sc.observedFor
+	}
+	return observedDuration
 }
 
 // ptr returns a pointer to a copy of v, for building scenarioExpectations'
@@ -69,7 +80,7 @@ func scenarios() []scenario {
 		return n
 	}
 
-	return []scenario{
+	return append([]scenario{
 		{
 			name:        "all healthy",
 			description: "Every agent at healthy latency. Every record should succeed via the primary; no hedge fires.",
@@ -259,5 +270,5 @@ func scenarios() []scenario {
 				expect: scenarioExpectations{minWgoSuccessRate: 0.20, minSuccessDeltaVsKgo: ptr(0.15)},
 			}
 		}(),
-	}
+	}, transportScenarios()...)
 }

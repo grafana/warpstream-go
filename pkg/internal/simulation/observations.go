@@ -8,9 +8,11 @@ import (
 
 // observation is one produce call's outcome.
 type observation struct {
-	issued  time.Time
-	latency time.Duration
-	err     error
+	// Recovery membership must not depend on scheduler delays.
+	scheduled time.Time
+	issued    time.Time
+	latency   time.Duration
+	err       error
 }
 
 // observations is a thread-safe collector.
@@ -20,8 +22,8 @@ type observations struct {
 }
 
 // record appends one observation from its fields.
-func (o *observations) record(issued time.Time, latency time.Duration, err error) {
-	o.add(observation{issued: issued, latency: latency, err: err})
+func (o *observations) record(scheduled, issued time.Time, latency time.Duration, err error) {
+	o.add(observation{scheduled: scheduled, issued: issued, latency: latency, err: err})
 }
 
 // add appends an already-formed observation.
@@ -157,4 +159,14 @@ type observationsSummary struct {
 	meanLatency time.Duration
 	p50Latency  time.Duration
 	p99Latency  time.Duration
+}
+
+func (s observationsSnapshot) scheduledSince(start time.Time) observationsSnapshot {
+	out := observationsSnapshot{}
+	for _, observation := range s.list {
+		if !observation.scheduled.Before(start) {
+			out.list = append(out.list, observation)
+		}
+	}
+	return out
 }

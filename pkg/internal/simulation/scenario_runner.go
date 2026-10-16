@@ -23,7 +23,7 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	}
 	defer env.Close()
 
-	budget := warmupDuration + observedDuration + 60*time.Second
+	budget := warmupDuration + sc.duration() + 60*time.Second
 	runCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
@@ -36,7 +36,27 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	sampler := startCounterSampler(observedStart, reportBucket, func() (int64, int64) {
 		return readProduceCounters(env.wgoRegistry)
 	})
-	wgoObservations, kgoObservations := runScenarioObserved(runCtx, env, sc.behaviours)
+	defer sampler.stop()
+	if sc.expect.recoveryFrom != nil {
+		env.wgoNetwork.mu.Lock()
+		env.wgoNetwork.recoveryStart = observedStart.Add(*sc.expect.recoveryFrom)
+		env.wgoNetwork.mu.Unlock()
+	}
+	phaseCtx, stopPhases := context.WithCancel(runCtx)
+	defer stopPhases()
+	phaseDone := make(chan error, 1)
+	go func() {
+		err := runTransportPhases(phaseCtx, env, observedStart, sc.transportPhases)
+		if err != nil {
+			cancel()
+		}
+		phaseDone <- err
+	}()
+	wgoObservations, kgoObservations := runScenarioObserved(runCtx, env, sc, observedStart)
+	stopPhases()
+	if err := <-phaseDone; err != nil {
+		return scenarioResult{}, fmt.Errorf("scenario %q transport phases: %w", sc.name, err)
+	}
 	samples := sampler.stop()
 
 	// A cancelled runCtx (parent timeout or a hung scenario) means the events
@@ -49,6 +69,8 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	wgoSnapshot := wgoObservations.snapshot()
 	kgoSnapshot := kgoObservations.snapshot()
 	res := scenarioResult{
+		wgoMissingLeaders: env.wgoMetadata.missingLeaders(), kgoMissingLeaders: env.kgoMetadata.missingLeaders(),
+		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
 		sc:             sc,
 		wgoSummary:     wgoSnapshot.summary(),
 		kgoSummary:     kgoSnapshot.summary(),
@@ -67,6 +89,13 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 		f := wgoSnapshot.slowFraction(*sc.expect.slowBudget)
 		res.wgoSlowFraction = &f
 	}
+	if sc.expect.recoveryFrom != nil {
+		recovery := wgoSnapshot.scheduledSince(observedStart.Add(*sc.expect.recoveryFrom))
+		res.wgoRecovery = recovery.summary()
+		if sc.expect.slowBudget != nil {
+			res.wgoRecoverySlowFraction = recovery.slowFraction(*sc.expect.slowBudget)
+		}
+	}
 	return res, nil
 }
 
@@ -75,23 +104,24 @@ func runScenarioWarmup(ctx context.Context, env *environment) {
 	// produces, so sharing one slice across the two concurrent clients would race.
 	wgoEvents := buildScenarioEvents(env.topic, env.numPartitions, warmupDuration, eventSpacing)
 	kgoEvents := buildScenarioEvents(env.topic, env.numPartitions, warmupDuration, eventSpacing)
+	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); runScenarioEvents(ctx, env.wgoClient, wgoEvents) }()
-	go func() { defer wg.Done(); runScenarioEvents(ctx, env.kgoClient, kgoEvents) }()
+	go func() { defer wg.Done(); runScenarioEvents(ctx, env.wgoClient, wgoEvents, start) }()
+	go func() { defer wg.Done(); runScenarioEvents(ctx, env.kgoClient, kgoEvents, start) }()
 	wg.Wait()
 }
 
-func runScenarioObserved(ctx context.Context, env *environment, behaviours brokersBehaviour) (wgoObservations, kgoObservations *observations) {
-	env.behaviours.set(behaviours)
+func runScenarioObserved(ctx context.Context, env *environment, sc scenario, start time.Time) (wgoObservations, kgoObservations *observations) {
+	env.behaviours.set(sc.behaviours)
 	// Each client gets its own records: kgo writes back to the *kgo.Record it
 	// produces, so sharing one slice across the two concurrent clients would race.
-	wgoEvents := buildScenarioEvents(env.topic, env.numPartitions, observedDuration, eventSpacing)
-	kgoEvents := buildScenarioEvents(env.topic, env.numPartitions, observedDuration, eventSpacing)
+	wgoEvents := buildScenarioEvents(env.topic, env.numPartitions, sc.duration(), eventSpacing)
+	kgoEvents := buildScenarioEvents(env.topic, env.numPartitions, sc.duration(), eventSpacing)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); wgoObservations = runScenarioEvents(ctx, env.wgoClient, wgoEvents) }()
-	go func() { defer wg.Done(); kgoObservations = runScenarioEvents(ctx, env.kgoClient, kgoEvents) }()
+	go func() { defer wg.Done(); wgoObservations = runScenarioEvents(ctx, env.wgoClient, wgoEvents, start) }()
+	go func() { defer wg.Done(); kgoObservations = runScenarioEvents(ctx, env.kgoClient, kgoEvents, start) }()
 	wg.Wait()
 	return wgoObservations, kgoObservations
 }
@@ -121,9 +151,8 @@ func buildScenarioEvents(topic string, numPartitions int32, duration, spacing ti
 
 // runScenarioEvents fires every event on its schedule against one client, each in
 // its own goroutine, and returns the recorded per-event observations.
-func runScenarioEvents(ctx context.Context, client produceClient, events []scenarioEvent) *observations {
+func runScenarioEvents(ctx context.Context, client produceClient, events []scenarioEvent, start time.Time) *observations {
 	obs := &observations{}
-	start := time.Now()
 	var wg sync.WaitGroup
 	for _, ev := range events {
 		wg.Go(func() {
@@ -134,11 +163,11 @@ func runScenarioEvents(ctx context.Context, client produceClient, events []scena
 	return obs
 }
 
-// runScenarioEvent waits until the event's scheduled time, produces its records
-// concurrently, and records the application-request outcome into obs: the latency
-// from issue to the slowest partition's promise, and the first non-nil error.
+// Kafka callbacks can outlive an application deadline. Record the caller's
+// outcome independently, then drain every callback before returning.
 func runScenarioEvent(ctx context.Context, client produceClient, start time.Time, event scenarioEvent, obs *observations) {
-	if d := time.Until(start.Add(event.at)); d > 0 {
+	scheduled := start.Add(event.at)
+	if d := time.Until(scheduled); d > 0 {
 		select {
 		case <-time.After(d):
 		case <-ctx.Done():
@@ -146,9 +175,8 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 		}
 	}
 	issued := time.Now()
-	// Per-event ctx caps the application request: if the slowest partition hasn't
-	// acked within appRequestTimeout the in-flight Produce calls observe ctx
-	// cancellation and fire with ctx.Err.
+	// Kafka callbacks may outlive cancellation; the caller's deadline still
+	// determines the application outcome.
 	eventCtx, cancel := context.WithTimeout(ctx, appRequestTimeout)
 	defer cancel()
 
@@ -170,6 +198,17 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 			innerWG.Done()
 		})
 	}
-	innerWG.Wait()
-	obs.record(issued, time.Since(issued), firstErr)
+	done := make(chan struct{})
+	go func() { innerWG.Wait(); close(done) }()
+	select {
+	case <-done:
+		if eventCtx.Err() != nil {
+			firstErr = eventCtx.Err()
+		}
+		obs.record(scheduled, issued, time.Since(issued), firstErr)
+	case <-eventCtx.Done():
+		obs.record(scheduled, issued, time.Since(issued), eventCtx.Err())
+	}
+	// Drain callbacks before cleanup so they cannot access a closed environment.
+	<-done
 }

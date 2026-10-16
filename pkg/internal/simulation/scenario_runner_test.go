@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -36,7 +37,7 @@ func TestRunScenarioEvents_RecordsObservations(t *testing.T) {
 	t.Parallel()
 	events := buildScenarioEvents("t", 2, 200*time.Millisecond, 100*time.Millisecond)
 
-	app := runScenarioEvents(context.Background(), &fakeProduceClient{delay: 5 * time.Millisecond}, events)
+	app := runScenarioEvents(context.Background(), &fakeProduceClient{delay: 5 * time.Millisecond}, events, time.Now())
 
 	snap := app.snapshot()
 	require.Len(t, snap.list, 2) // 2 events
@@ -52,7 +53,7 @@ func TestRunScenarioEvents_EventCtxTimeoutFailsEvent(t *testing.T) {
 	events := []scenarioEvent{{at: 0, records: []*kgo.Record{{Topic: "t", Partition: 0}}}}
 	client := &fakeProduceClient{delay: appRequestTimeout + 200*time.Millisecond}
 
-	app := runScenarioEvents(context.Background(), client, events)
+	app := runScenarioEvents(context.Background(), client, events, time.Now())
 
 	snap := app.snapshot()
 	require.Len(t, snap.list, 1)
@@ -82,3 +83,44 @@ func (f *fakeProduceClient) Produce(ctx context.Context, r *kgo.Record, promise 
 }
 
 func (f *fakeProduceClient) Close() {}
+
+func TestRunScenarioEvents_LateCallbackCannotReportSuccess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		observations := runScenarioEvents(t.Context(), &lateProduceClient{}, buildScenarioEvents("t", 1, eventSpacing, eventSpacing), time.Now())
+		snapshot := observations.snapshot()
+		require.Len(t, snapshot.list, 1)
+		require.ErrorIs(t, snapshot.list[0].err, context.DeadlineExceeded)
+		assert.Equal(t, appRequestTimeout, snapshot.list[0].latency)
+	})
+}
+
+type lateProduceClient struct{}
+
+func (*lateProduceClient) Produce(_ context.Context, record *kgo.Record, promise func(*kgo.Record, error)) {
+	go func() { time.Sleep(2 * appRequestTimeout); promise(record, nil) }()
+}
+func (*lateProduceClient) Close() {}
+
+func TestRunScenarioEvents_RecoveryWindowIgnoresSchedulerDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		events := buildScenarioEvents("t", 1, observedDuration, eventSpacing)
+		time.Sleep(50*time.Second + eventSpacing)
+		observations := runScenarioEvents(t.Context(), &fakeProduceClient{}, events, start)
+		snapshot := observations.snapshot()
+		require.Len(t, snapshot.list, 120)
+		for _, observation := range snapshot.list {
+			assert.False(t, observation.issued.Before(start.Add(50*time.Second)))
+		}
+		recovery := snapshot.scheduledSince(start.Add(50 * time.Second))
+		require.Len(t, recovery.list, 20)
+		for _, observation := range recovery.list {
+			assert.False(t, observation.scheduled.Before(start.Add(50*time.Second)))
+		}
+		result := scenarioResult{
+			sc:          scenario{name: "delayed recovery", expect: scenarioExpectations{recoveryFrom: ptr(50 * time.Second)}},
+			wgoRecovery: recovery.summary(), wgoRecoverySlowFraction: recovery.slowFraction(2 * time.Second),
+		}
+		assert.Empty(t, checkResult(result))
+	})
+}
