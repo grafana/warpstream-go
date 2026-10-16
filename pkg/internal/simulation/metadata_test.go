@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
@@ -83,7 +84,7 @@ func TestMetadata_DroppedLeaderWrites(t *testing.T) {
 			}
 		})
 		observations := runScenarioEvents(t.Context(), client,
-			buildScenarioEvents(topicName, 3, time.Second, eventSpacing)).snapshot()
+			buildScenarioEvents(topicName, 3, time.Second, eventSpacing), time.Now()).snapshot()
 		assert.Equal(t, 2, observations.summary().successes)
 		assert.Positive(t, fallbackWrites.Load())
 	})
@@ -97,4 +98,119 @@ func TestBrokersBehaviourProvider_MissingBrokers(t *testing.T) {
 	assert.Equal(t, []int32{1, 2}, p.get().missingBrokers)
 	p.set(healthyBehaviours())
 	assert.Empty(t, p.get().missingBrokers)
+}
+
+func TestMetadataView_UpdateBrokerPreservesSnapshots(t *testing.T) {
+	t.Parallel()
+	original := kmsg.NewPtrMetadataResponse()
+	original.Brokers = []kmsg.MetadataResponseBroker{{NodeID: 0}, {NodeID: 1, Port: 9093}, {NodeID: 2}}
+	original.Topics = []kmsg.MetadataResponseTopic{{Topic: kmsg.StringPtr(topicName), Partitions: []kmsg.MetadataResponseTopicPartition{
+		{Partition: 0, Leader: 0, LeaderEpoch: 2, Replicas: []int32{0, 1, 2}, ISR: []int32{0, 1, 2}},
+		{Partition: 1, Leader: 1, LeaderEpoch: 3, Replicas: []int32{1, 2, 0}, ISR: []int32{1, 2, 0}},
+		{Partition: 2, Leader: 2, LeaderEpoch: 4, Replicas: []int32{2, 0, 1}, ISR: []int32{2, 0, 1}},
+	}}}
+	view := &metadataView{template: original}
+	view.current.Store(original)
+	view.updateBroker(1, nil)
+	removed := view.current.Load()
+	require.Len(t, removed.Brokers, 2)
+	assert.Equal(t, int32(2), removed.Topics[0].Partitions[1].Leader)
+	assert.Equal(t, int32(4), removed.Topics[0].Partitions[1].LeaderEpoch)
+	for _, partition := range removed.Topics[0].Partitions {
+		assert.NotContains(t, partition.Replicas, int32(1))
+		assert.NotContains(t, partition.ISR, int32(1))
+		assert.Contains(t, partition.ISR, partition.Leader)
+		require.Len(t, partition.Replicas, 2)
+		require.Len(t, partition.ISR, 2)
+	}
+	view.updateBroker(1, &kmsg.MetadataResponseBroker{NodeID: 1, Port: 10000})
+	replaced := view.current.Load()
+	require.Len(t, replaced.Brokers, 3)
+	assert.Equal(t, int32(10000), replaced.Brokers[1].Port)
+	for index, partition := range replaced.Topics[0].Partitions {
+		assert.Equal(t, original.Topics[0].Partitions[index].Replicas, partition.Replicas)
+		assert.Equal(t, original.Topics[0].Partitions[index].ISR, partition.ISR)
+		assert.Equal(t, original.Topics[0].Partitions[index].Leader, partition.Leader)
+	}
+	assert.Equal(t, int32(5), replaced.Topics[0].Partitions[1].LeaderEpoch)
+	for _, partition := range []int{0, 2} {
+		assert.Equal(t, original.Topics[0].Partitions[partition].Leader, removed.Topics[0].Partitions[partition].Leader)
+		assert.Equal(t, original.Topics[0].Partitions[partition].LeaderEpoch, removed.Topics[0].Partitions[partition].LeaderEpoch)
+		assert.Equal(t, original.Topics[0].Partitions[partition], replaced.Topics[0].Partitions[partition])
+	}
+	require.Len(t, original.Brokers, 3)
+	assert.Equal(t, int32(1), original.Topics[0].Partitions[1].Leader)
+	assert.Equal(t, []int32{0, 1, 2}, original.Topics[0].Partitions[0].Replicas)
+	assert.Equal(t, []int32{0, 2}, removed.Topics[0].Partitions[0].Replicas)
+}
+
+func TestMetadataView_OverlappingRestarts(t *testing.T) {
+	t.Parallel()
+	original := kmsg.NewPtrMetadataResponse()
+	original.Brokers = []kmsg.MetadataResponseBroker{{NodeID: 0}, {NodeID: 1}, {NodeID: 2}}
+	original.Topics = []kmsg.MetadataResponseTopic{{Partitions: []kmsg.MetadataResponseTopicPartition{
+		{Partition: 0, Leader: 0, Replicas: []int32{0, 1, 2}, ISR: []int32{0, 1}, OfflineReplicas: []int32{2}},
+	}}}
+	view := &metadataView{template: original}
+	view.current.Store(original)
+	view.updateBroker(1, nil)
+	view.updateBroker(2, nil)
+	removed := view.current.Load()
+	assert.Equal(t, []int32{0}, removed.Topics[0].Partitions[0].Replicas)
+	assert.Equal(t, []int32{0}, removed.Topics[0].Partitions[0].ISR)
+	assert.Empty(t, removed.Topics[0].Partitions[0].OfflineReplicas)
+	view.updateBroker(1, &kmsg.MetadataResponseBroker{NodeID: 1})
+	partial := view.current.Load().Topics[0].Partitions[0]
+	assert.Equal(t, []int32{0, 1}, partial.Replicas)
+	assert.Equal(t, []int32{0, 1}, partial.ISR)
+	assert.Empty(t, partial.OfflineReplicas)
+	view.updateBroker(2, &kmsg.MetadataResponseBroker{NodeID: 2})
+	assert.Equal(t, original.Topics, view.current.Load().Topics)
+	assert.Equal(t, []int32{0}, removed.Topics[0].Partitions[0].Replicas)
+}
+
+func TestMetadataView_NoLiveReplica(t *testing.T) {
+	t.Parallel()
+	original := kmsg.NewPtrMetadataResponse()
+	original.Brokers = []kmsg.MetadataResponseBroker{{NodeID: 0}, {NodeID: 1}}
+	original.Topics = []kmsg.MetadataResponseTopic{{Partitions: []kmsg.MetadataResponseTopicPartition{
+		{Leader: 1, Replicas: []int32{1}, ISR: []int32{1}},
+	}}}
+	view := &metadataView{template: original}
+	view.current.Store(original)
+	view.updateBroker(1, nil)
+	unavailable := view.current.Load().Topics[0].Partitions[0]
+	assert.Equal(t, int32(-1), unavailable.Leader)
+	assert.Empty(t, unavailable.Replicas)
+	assert.Empty(t, unavailable.ISR)
+	assert.Equal(t, kerr.LeaderNotAvailable.Code, unavailable.ErrorCode)
+	view.updateBroker(1, &kmsg.MetadataResponseBroker{NodeID: 1})
+	restored := view.current.Load().Topics[0].Partitions[0]
+	assert.Equal(t, int32(1), restored.Leader)
+	assert.Zero(t, restored.ErrorCode)
+	assert.Equal(t, []int32{1}, restored.Replicas)
+}
+
+func TestMetadataView_WithdrawBroker(t *testing.T) {
+	t.Parallel()
+	original := kmsg.NewPtrMetadataResponse()
+	original.Brokers = []kmsg.MetadataResponseBroker{{NodeID: 0}, {NodeID: 1}}
+	original.Topics = []kmsg.MetadataResponseTopic{{Partitions: []kmsg.MetadataResponseTopicPartition{
+		{Partition: 0, Leader: 0, Replicas: []int32{0, 1}, ISR: []int32{0, 1}},
+		{Partition: 1, Leader: 1, Replicas: []int32{1, 0}, ISR: []int32{1, 0}},
+	}}}
+	view := &metadataView{template: original}
+	view.current.Store(original)
+	view.withdrawBroker(1)
+	withdrawn := view.current.Load()
+	require.Len(t, withdrawn.Brokers, 1)
+	assert.Equal(t, original.Topics, withdrawn.Topics)
+	assert.Len(t, original.Brokers, 2)
+	view.observeMissingLeaders(withdrawn)
+	assert.Equal(t, map[int32]int64{1: 1}, view.missingLeaders())
+	view.updateBroker(1, &kmsg.MetadataResponseBroker{NodeID: 1, Port: 10000})
+	view.observeMissingLeaders(view.current.Load())
+	assert.Equal(t, map[int32]int64{1: 1}, view.missingLeaders())
+	assert.Len(t, withdrawn.Brokers, 1)
+	assert.Equal(t, original.Topics, withdrawn.Topics)
 }

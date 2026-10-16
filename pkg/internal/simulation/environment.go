@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -101,7 +102,9 @@ type environment struct {
 	// behaviours is the atomically-settable cluster behaviour; the kfake control
 	// function and the latency hooks read through it so a single set retargets
 	// every produce path.
-	behaviours *brokersBehaviourProvider
+	behaviours               *brokersBehaviourProvider
+	wgoNetwork, kgoNetwork   *transportNetwork
+	wgoMetadata, kgoMetadata *metadataView
 }
 
 // newEnvironment builds two identically-configured clusters (one per client) with
@@ -137,7 +140,11 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	clusters = append(clusters, wgoCluster)
 	installFailureControl(wgoCluster, beh, clientTypeWgo)
 
-	wgoClient, wgoRegistry, err := newWarpstreamClient(wsAddr)
+	wgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	for nodeID, address := range wgoCluster.ListenAddrs() {
+		wgoNetwork.register(address, int32(nodeID))
+	}
+	wgoClient, wgoRegistry, err := newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
 	if err != nil {
 		return nil, fmt.Errorf("create warpstream client: %w", err)
 	}
@@ -147,8 +154,18 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	// TrackingProducer below it observes the simulated latency and feeds the
 	// Hedger/Demoter realistic stats. Installed once at construction so the hook
 	// is never reinstalled concurrently with in-flight produce traffic.
-	wgoClient.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, _ *kmsg.ProduceResponse, _ error) {
+	wgoClient.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, err error) {
 		beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
+		if err == nil && ctx.Err() == nil && response != nil {
+			for _, topic := range response.Topics {
+				for _, partition := range topic.Partitions {
+					if partition.ErrorCode == 0 {
+						wgoNetwork.observeProduce(nodeID)
+						return
+					}
+				}
+			}
+		}
 	})
 
 	//
@@ -167,7 +184,11 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	// ManualPartitioner does not hedge or re-route: records for partition P
 	// always go to P's one designated leader, so "partition P is slow" and "P's
 	// leader is slow" are equivalent from the producer's perspective.
-	kgoInner, err := newKgoClient(kgoAddr)
+	kgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	for nodeID, address := range kgoCluster.ListenAddrs() {
+		kgoNetwork.register(address, int32(nodeID))
+	}
+	kgoInner, err := newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
 	if err != nil {
 		return nil, fmt.Errorf("create kgo client: %w", err)
 	}
@@ -176,6 +197,7 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), appRequestTimeout)
 	defer cancel()
+	var metadataViews []*metadataView
 	for _, target := range []struct {
 		cluster *kfake.Cluster
 		client  interface {
@@ -186,7 +208,7 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 		if err != nil {
 			return nil, fmt.Errorf("capture metadata: %w", err)
 		}
-		installMetadataControl(target.cluster, raw.(*kmsg.MetadataResponse), beh)
+		metadataViews = append(metadataViews, installMetadataControl(target.cluster, raw.(*kmsg.MetadataResponse), beh))
 	}
 
 	return &environment{
@@ -198,6 +220,8 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 		kgoCluster:    kgoCluster,
 		kgoClient:     kgoClient,
 		behaviours:    beh,
+		wgoNetwork:    wgoNetwork, kgoNetwork: kgoNetwork,
+		wgoMetadata: metadataViews[0], kgoMetadata: metadataViews[1],
 	}, nil
 }
 
@@ -205,6 +229,8 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 func (env *environment) Close() {
 	env.wgoClient.Close()
 	env.kgoClient.Close()
+	env.wgoNetwork.Close()
+	env.kgoNetwork.Close()
 	env.wgoCluster.Close()
 	env.kgoCluster.Close()
 }
@@ -276,9 +302,9 @@ func (c *latencyDelayedKgoClient) Produce(ctx context.Context, r *kgo.Record, pr
 	})
 }
 
-func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Registry, error) {
+func newWarpstreamClient(addr string, extra ...wgo.Opt) (*wgo.WarpstreamClient, *prometheus.Registry, error) {
 	reg := prometheus.NewPedanticRegistry()
-	c, err := wgo.NewWarpstreamClient(nil, reg,
+	opts := []wgo.Opt{
 		wgo.WithAddress(addr),
 		wgo.WithTopic(topicName),
 		wgo.WithClientID("ws-simulation"),
@@ -297,7 +323,8 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 		wgo.WithMetadataRefreshInterval(clientMetadataRefresh),
 		wgo.WithProduceRequestTimeout(clientProduceRequestTimeout),
 		wgo.WithProduceRequestTimeoutOverhead(clientRequestTimeoutOverhead),
-	)
+	}
+	c, err := wgo.NewWarpstreamClient(nil, reg, append(opts, extra...)...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -306,7 +333,7 @@ func newWarpstreamClient(addr string) (*wgo.WarpstreamClient, *prometheus.Regist
 
 // Keep shared settings in lockstep so configuration differences do not bias
 // the comparison.
-func newKgoClient(addr string) (*kgo.Client, error) {
+func newKgoClient(addr string, extra ...kgo.Opt) (*kgo.Client, error) {
 	// Cap Produce at the version wgo pins so request and response payloads carry
 	// the topic name on the wire, matching what the client emits.
 	v := kversion.Stable()
@@ -339,7 +366,7 @@ func newKgoClient(addr string) (*kgo.Client, error) {
 
 		kgo.MaxVersions(v),
 	}
-	return kgo.NewClient(opts...)
+	return kgo.NewClient(append(opts, extra...)...)
 }
 
 func simulationRetryBackoff(failures int) time.Duration {
