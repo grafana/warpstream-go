@@ -2,8 +2,11 @@ package wgo
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -137,7 +140,67 @@ func getProduceResultErr(err error) produceResultErr {
 	if kerrErr := (*kerr.Error)(nil); errors.As(err, &kerrErr) {
 		return produceResultErr{err: err, reason: "kafka_non_retriable_error", retriable: false, code: kerrErr.Code}
 	}
+	// Classify a broker-call failure by class. These stay non-retriable.
+	if wire := (*wireError)(nil); errors.As(err, &wire) {
+		reason := "wire_other"
+		switch {
+		case errors.Is(err, kgo.ErrClientClosed):
+			reason = "client_closed"
+		case isTLSErr(err):
+			reason = "tls"
+		case isUnknownBrokerErr(err):
+			reason = "unknown_broker"
+		case isNonTimeoutDialErr(err):
+			reason = "dial"
+		}
+		return produceResultErr{err: err, reason: reason, retriable: false, code: kerr.UnknownServerError.Code}
+	}
 	return produceResultErr{err: err, reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code}
+}
+
+// wireError is a failure returned by the broker call.
+type wireError struct {
+	err error
+}
+
+func (e *wireError) Error() string {
+	if e == nil || e.err == nil {
+		return "wire error"
+	}
+	return e.err.Error()
+}
+
+func (e *wireError) Unwrap() error { return e.err }
+
+// isUnknownBrokerErr reports franz-go's unexported "unknown broker" error.
+func isUnknownBrokerErr(err error) bool {
+	for err != nil {
+		if err.Error() == "unknown broker" {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+// isNonTimeoutDialErr reports a dial that was not a timeout.
+func isNonTimeoutDialErr(err error) bool {
+	op := (*net.OpError)(nil)
+	return errors.As(err, &op) && op.Op == "dial" && !op.Timeout()
+}
+
+// isTLSErr reports a certificate or handshake failure.
+func isTLSErr(err error) bool {
+	verify := (*tls.CertificateVerificationError)(nil)
+	alert := tls.AlertError(0)
+	invalid := x509.CertificateInvalidError{}
+	host := x509.HostnameError{}
+	unknown := x509.UnknownAuthorityError{}
+	constraint := x509.ConstraintViolationError{}
+	roots := (*x509.SystemRootsError)(nil)
+	return errors.As(err, &verify) || errors.As(err, &alert) || errors.As(err, &invalid) ||
+		errors.As(err, &host) || errors.As(err, &unknown) || errors.As(err, &constraint) ||
+		errors.As(err, &roots)
 }
 
 // produceResultAccumulator merges the outcomes of one or more produce

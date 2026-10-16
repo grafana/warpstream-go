@@ -139,8 +139,9 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		}
 	}
 
+	// Mark a broker-call failure for classification.
 	if err != nil {
-		return ProduceResult{err: err}
+		return ProduceResult{err: &wireError{err: err}}
 	}
 	return ProduceResult{resp: pr}
 }
