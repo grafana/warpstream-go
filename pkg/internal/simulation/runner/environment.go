@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -80,10 +80,7 @@ const (
 )
 
 // produceClient is the minimum clients surface the simulation exercises.
-type produceClient interface {
-	Produce(ctx context.Context, r *kgo.Record, promise func(*kgo.Record, error))
-	Close()
-}
+type produceClient = Producer
 
 // environment owns one kfake cluster per client so the two clients never share
 // broker capacity. Each cluster is configured identically (same broker count,
@@ -93,7 +90,7 @@ type environment struct {
 	numPartitions int32
 
 	wgoCluster  *kfake.Cluster
-	wgoClient   *wgo.WarpstreamClient
+	wgoClient   produceClient
 	wgoRegistry *prometheus.Registry
 
 	kgoCluster *kfake.Cluster
@@ -107,14 +104,67 @@ type environment struct {
 	wgoMetadata, kgoMetadata *metadataView
 }
 
-// newEnvironment builds two identically-configured clusters (one per client) with
-// the given initial per-broker behaviours. The caller owns the result and must
-// Close it.
-func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
-	beh := newBrokersBehaviourProvider(initial)
+func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, sc scenario) (_ *environment, err error) {
+	if sc.profile != nil && factory == nil {
+		return nil, fmt.Errorf("investigation topology requires an external workload")
+	}
+	brokers, partitions := sc.topology()
+	behaviourProvider := newBrokersBehaviourProvider(initial)
+	metadataPartitions, secondaryPartitions := partitions, partitions
+	if sc.profile != nil {
+		if sc.profile.secondaryPartitions > 0 {
+			secondaryPartitions = sc.profile.secondaryPartitions
+		}
+	}
+	createCluster := func() (*kfake.Cluster, string, error) {
+		if sc.profile != nil && sc.profile.singleAgent {
+			cluster, createErr := kfake.NewCluster(kfake.NumBrokers(int(brokers)), kfake.SeedTopics(metadataPartitions, topicName))
+			if createErr != nil {
+				return nil, "", createErr
+			}
+			if createErr = cluster.CreateTopic(secondaryTopicName, secondaryPartitions, nil); createErr != nil {
+				cluster.Close()
+				return nil, "", createErr
+			}
+			return cluster, cluster.ListenAddrs()[0], nil
+		}
+		return testkafka.NewCluster(partitions, topicName, testkafka.WithNumBrokers(int(brokers)))
+	}
+	installMetadata := func(cluster *kfake.Cluster, address string, network *transportNetwork) (*metadataView, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), appRequestTimeout)
+		defer cancel()
+		admin, createErr := kgo.NewClient(kgo.SeedBrokers(address), kgo.Dialer(network.DialContext))
+		if createErr != nil {
+			return nil, createErr
+		}
+		defer admin.Close()
+		raw, requestErr := admin.Request(ctx, kmsg.NewPtrMetadataRequest())
+		if requestErr != nil {
+			return nil, fmt.Errorf("capture metadata: %w", requestErr)
+		}
+		retainedFallback := int32(-1)
+		if sc.profile != nil && sc.profile.dynamicPlacement {
+			retainedFallback = brokers - 1
+		}
+		return installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviourProvider, sc.profile != nil && sc.profile.singleAgent, sc.profile != nil && sc.profile.dynamicPlacement, retainedFallback), nil
+	}
+	workload := func(backend, address string, registry *prometheus.Registry, network *transportNetwork, behaviours *brokersBehaviourProvider) WorkloadConfig {
+		cfg := workloadConfig(backend, address, registry, network, behaviours)
+		cfg.Partitions = partitions
+		if sc.profile != nil {
+			cfg.SecondaryTopic = secondaryTopicName
+			cfg.SecondaryPartitions = secondaryPartitions
+			cfg.SeriesPerRequest = sc.profile.seriesPerRequest
+			cfg.WriteTimeout, cfg.DialTimeout = sc.profile.writeTimeout, sc.profile.dialTimeout
+			cfg.RemoteTimeout, cfg.ArtificialDelay = appRequestTimeout, 500*time.Millisecond
+		}
+		return cfg
+	}
+	beh := behaviourProvider
 
 	var clusters []*kfake.Cluster
 	var clients []interface{ Close() }
+	var networks []*transportNetwork
 
 	// On any error before we hand ownership to the caller, tear down whatever
 	// we already created.
@@ -122,6 +172,9 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 		if err != nil {
 			for _, c := range clients {
 				c.Close()
+			}
+			for _, network := range networks {
+				network.Close()
 			}
 			for _, c := range clusters {
 				c.Close()
@@ -133,7 +186,7 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	// Warpstream client testing environment.
 	//
 
-	wgoCluster, wsAddr, err := testkafka.NewCluster(clusterSize, topicName, testkafka.WithNumBrokers(int(clusterSize)))
+	wgoCluster, wsAddr, err := createCluster()
 	if err != nil {
 		return nil, fmt.Errorf("create warpstream cluster: %w", err)
 	}
@@ -141,38 +194,49 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	installFailureControl(wgoCluster, beh, clientTypeWgo)
 
 	wgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	networks = append(networks, wgoNetwork)
 	for nodeID, address := range wgoCluster.ListenAddrs() {
 		wgoNetwork.register(address, int32(nodeID))
 	}
-	wgoClient, wgoRegistry, err := newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
-	if err != nil {
-		return nil, fmt.Errorf("create warpstream client: %w", err)
-	}
-	clients = append(clients, wgoClient)
 
-	// Latency is injected at KafkaDirectProducer's post-response hook so the
-	// TrackingProducer below it observes the simulated latency and feeds the
-	// Hedger/Demoter realistic stats. Installed once at construction so the hook
-	// is never reinstalled concurrently with in-flight produce traffic.
-	wgoClient.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, err error) {
-		beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
-		if err == nil && ctx.Err() == nil && response != nil {
-			for _, topic := range response.Topics {
-				for _, partition := range topic.Partitions {
-					if partition.ErrorCode == 0 {
-						wgoNetwork.observeProduce(nodeID)
-						return
+	wgoMetadata, err := installMetadata(wgoCluster, wsAddr, wgoNetwork)
+	if err != nil {
+		return nil, err
+	}
+	wgoRegistry := prometheus.NewPedanticRegistry()
+	var wgoClient produceClient
+	if factory == nil {
+		var raw *wgo.WarpstreamClient
+		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
+		if err == nil {
+			raw.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, hookErr error) {
+				beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
+				if hookErr == nil && ctx.Err() == nil && response != nil {
+					for _, topic := range response.Topics {
+						for _, partition := range topic.Partitions {
+							if partition.ErrorCode == 0 {
+								wgoNetwork.observeProduce(nodeID)
+								return
+							}
+						}
 					}
 				}
-			}
+			})
+			wgoClient = raw
 		}
-	})
+	} else {
+		wgoClient, err = factory(workload("warpstream", wsAddr, wgoRegistry, wgoNetwork, beh))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create warpstream workload: %w", err)
+	}
+	clients = append(clients, wgoClient)
 
 	//
 	// franz-go client testing environment.
 	//
 
-	kgoCluster, kgoAddr, err := testkafka.NewCluster(clusterSize, topicName, testkafka.WithNumBrokers(int(clusterSize)))
+	kgoCluster, kgoAddr, err := createCluster()
 	if err != nil {
 		return nil, fmt.Errorf("create kgo cluster: %w", err)
 	}
@@ -185,35 +249,33 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 	// always go to P's one designated leader, so "partition P is slow" and "P's
 	// leader is slow" are equivalent from the producer's perspective.
 	kgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	networks = append(networks, kgoNetwork)
 	for nodeID, address := range kgoCluster.ListenAddrs() {
 		kgoNetwork.register(address, int32(nodeID))
 	}
-	kgoInner, err := newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
-	if err != nil {
-		return nil, fmt.Errorf("create kgo client: %w", err)
-	}
-	clients = append(clients, kgoInner)
-	kgoClient := &latencyDelayedKgoClient{Client: kgoInner, behaviours: beh, client: clientTypeKgo}
 
-	ctx, cancel := context.WithTimeout(context.Background(), appRequestTimeout)
-	defer cancel()
-	var metadataViews []*metadataView
-	for _, target := range []struct {
-		cluster *kfake.Cluster
-		client  interface {
-			Request(context.Context, kmsg.Request) (kmsg.Response, error)
-		}
-	}{{wgoCluster, wgoClient}, {kgoCluster, kgoInner}} {
-		raw, err := target.client.Request(ctx, kmsg.NewPtrMetadataRequest())
-		if err != nil {
-			return nil, fmt.Errorf("capture metadata: %w", err)
-		}
-		metadataViews = append(metadataViews, installMetadataControl(target.cluster, raw.(*kmsg.MetadataResponse), beh))
+	kgoMetadata, err := installMetadata(kgoCluster, kgoAddr, kgoNetwork)
+	if err != nil {
+		return nil, err
 	}
+	var kgoClient produceClient
+	if factory == nil {
+		var inner *kgo.Client
+		inner, err = newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
+		if err == nil {
+			kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
+		}
+	} else {
+		kgoClient, err = factory(workload("kafka", kgoAddr, prometheus.NewPedanticRegistry(), kgoNetwork, beh))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create kafka workload: %w", err)
+	}
+	clients = append(clients, kgoClient)
 
 	return &environment{
 		topic:         topicName,
-		numPartitions: clusterSize,
+		numPartitions: partitions,
 		wgoCluster:    wgoCluster,
 		wgoClient:     wgoClient,
 		wgoRegistry:   wgoRegistry,
@@ -221,7 +283,7 @@ func newEnvironment(initial brokersBehaviour) (_ *environment, err error) {
 		kgoClient:     kgoClient,
 		behaviours:    beh,
 		wgoNetwork:    wgoNetwork, kgoNetwork: kgoNetwork,
-		wgoMetadata: metadataViews[0], kgoMetadata: metadataViews[1],
+		wgoMetadata: wgoMetadata, kgoMetadata: kgoMetadata,
 	}, nil
 }
 
@@ -271,7 +333,7 @@ func installFailureControl(cluster *kfake.Cluster, behaviours *brokersBehaviourP
 }
 
 // latencyDelayedKgoClient wraps a kgo.Client and delays every Produce promise by
-// the latency drawn from the per-partition behaviour. See newEnvironment for why
+// the latency drawn from the per-partition behaviour. See newScenarioEnvironment for why
 // partition-keying is equivalent to broker-keying for this baseline.
 //
 // Latency is applied after kgo's promise fires, not on the wire, so kgo's own
@@ -379,4 +441,31 @@ func simulationRetryBackoff(failures int) time.Duration {
 		return maxBackoff
 	}
 	return min(minBackoff*time.Duration(1<<(failures-1)), maxBackoff)
+}
+
+func workloadConfig(backend, address string, registry *prometheus.Registry, network *transportNetwork, behaviours *brokersBehaviourProvider) WorkloadConfig {
+	return WorkloadConfig{Backend: backend, Address: address, Topic: topicName, Partitions: clusterSize, Registry: registry, Dialer: network.DialContext,
+		WriteTimeout: clientWriteTimeout, WriteTimeoutOverhead: clientRequestTimeoutOverhead, DialTimeout: clientDialTimeout,
+		ProduceLatency: func(address string) time.Duration {
+			network.mu.Lock()
+			nodeID, ok := network.brokers[address]
+			network.mu.Unlock()
+			if !ok {
+				return 0
+			}
+			client := clientTypeWgo
+			if backend == "kafka" {
+				client = clientTypeKgo
+			}
+			return behaviours.nextLatencyFor(client, nodeID)
+		},
+		ObserveProduce: func(address string) {
+			network.mu.Lock()
+			nodeID, ok := network.brokers[address]
+			network.mu.Unlock()
+			if ok {
+				network.observeProduce(nodeID)
+			}
+		},
+	}
 }

@@ -1,11 +1,15 @@
-package main
+package runner
 
 import "fmt"
 
 // scenarioResult holds everything the report and the pass/fail check need for one
 // scenario.
 type scenarioResult struct {
-	sc scenario
+	sc                                         scenario
+	windows                                    []windowResult
+	wgoLatencySelections, kgoLatencySelections map[int32]int64
+	workloadDescription, workloadConfiguration string
+	recoveryResponseDescription                string
 
 	wgoSummary, kgoSummary         observationsSummary
 	wgoBuckets, kgoBuckets         []observationsSummary
@@ -130,8 +134,27 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("no successful recovery Produce response (including probes) reached restored broker %d", phase.nodeID)})
 		}
 	}
+	if len(res.sc.behaviourPhases) > 0 {
+		for _, lane := range []struct {
+			name     string
+			selected map[int32]int64
+		}{{"wgo", res.wgoLatencySelections}, {"kgo", res.kgoLatencySelections}} {
+			var affected int64
+			for _, count := range lane.selected {
+				affected += count
+			}
+			if affected == 0 {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s: no Produce response selected for injected delay", lane.name)})
+			}
+		}
+	}
+	for _, broker := range res.sc.requiredWgoDelayBrokers {
+		if res.wgoLatencySelections[broker] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("wgo: no Produce response selected for injected delay on required broker %d", broker)})
+		}
+	}
 	if exp.recoveryFrom != nil {
-		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, eventSpacing))
+		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, res.sc.spacing()))
 		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
 			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
 			if exp.slowBudget != nil {

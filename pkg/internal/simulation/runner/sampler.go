@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -127,7 +127,7 @@ func bucketDeltas(samples []counterSample) []counterBucketDelta {
 // readProduceCounters returns the (primary, hedge) Produce wire-request counts
 // from a wgo registry. Lookup is by metric name, which is the public Prometheus
 // contract.
-func readProduceCounters(reg *prometheus.Registry) (primary, hedge int64) {
+func readProduceCounters(reg prometheus.Gatherer) (primary, hedge int64) {
 	return gatherCounter(reg, "warpstream_produce_requests_primary_total"),
 		gatherCounter(reg, "warpstream_produce_requests_hedge_total")
 }
@@ -137,7 +137,7 @@ func readProduceCounters(reg *prometheus.Registry) (primary, hedge int64) {
 // fail fast on. The panic names the coupling: this package looks up Prometheus
 // names as exported by github.com/grafana/warpstream-go/pkg/wgo, so a rename
 // there must be mirrored here (see readProduceCounters).
-func gatherCounter(reg *prometheus.Registry, name string) int64 {
+func gatherCounter(reg prometheus.Gatherer, name string) int64 {
 	mfs, err := reg.Gather()
 	if err != nil {
 		panic(fmt.Errorf("gatherCounter(%q): %w", name, err))
