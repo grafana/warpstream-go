@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -16,8 +17,8 @@ import (
 // wgo's stats tracker qualifies a baseline before the scenario behaviours are
 // swapped in; its observations are discarded. The observed phase then drives the
 // comparison.
-func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
-	env, err := newEnvironment(healthyBehaviours())
+func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (scenarioResult, error) {
+	env, err := newEnvironment(healthyBehaviours(), factory)
 	if err != nil {
 		return scenarioResult{}, err
 	}
@@ -28,12 +29,22 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	defer cancel()
 
 	runScenarioWarmup(runCtx, env)
+	if err := validateWorkloads(env); err != nil {
+		return scenarioResult{}, fmt.Errorf("scenario %q warmup: %w", sc.name, err)
+	}
 
 	// Sample the Hedger's primary/hedge counters at exact bucket boundaries,
 	// anchored at observedStart so the per-bucket deltas line up with the
 	// per-event observation buckets in the report.
 	observedStart := time.Now()
+	metrics := prometheus.Gatherer(env.wgoRegistry)
+	if external, ok := env.wgoClient.(prometheus.Gatherer); ok {
+		metrics = external
+	}
 	sampler := startCounterSampler(observedStart, reportBucket, func() (int64, int64) {
+		if builder, ok := env.wgoClient.(eventBuilder); ok {
+			return gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_primary_total"), gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_hedge_total")
+		}
 		return readProduceCounters(env.wgoRegistry)
 	})
 	defer sampler.stop()
@@ -64,6 +75,9 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 	// false pass/fail, so fail loudly instead.
 	if err := runCtx.Err(); err != nil {
 		return scenarioResult{}, fmt.Errorf("scenario %q did not complete: %w", sc.name, err)
+	}
+	if err := validateWorkloads(env); err != nil {
+		return scenarioResult{}, fmt.Errorf("scenario %q workload: %w", sc.name, err)
 	}
 
 	wgoSnapshot := wgoObservations.snapshot()
@@ -96,14 +110,31 @@ func runScenario(ctx context.Context, sc scenario) (scenarioResult, error) {
 			res.wgoRecoverySlowFraction = recovery.slowFraction(*sc.expect.slowBudget)
 		}
 	}
+	if profile, ok := env.wgoClient.(interface{ RecoveryResponseDescription() string }); ok {
+		res.recoveryResponseDescription = profile.RecoveryResponseDescription()
+	}
+	if profile, ok := env.wgoClient.(interface{ Describe() (string, string) }); ok {
+		res.workloadDescription, res.workloadConfiguration = profile.Describe()
+	}
 	return res, nil
+}
+
+func validateWorkloads(env *environment) error {
+	for _, client := range []produceClient{env.wgoClient, env.kgoClient} {
+		if checked, ok := client.(interface{ Validate() error }); ok {
+			if err := checked.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func runScenarioWarmup(ctx context.Context, env *environment) {
 	// Each client gets its own records: kgo writes back to the *kgo.Record it
 	// produces, so sharing one slice across the two concurrent clients would race.
-	wgoEvents := buildScenarioEvents(env.topic, env.numPartitions, warmupDuration, eventSpacing)
-	kgoEvents := buildScenarioEvents(env.topic, env.numPartitions, warmupDuration, eventSpacing)
+	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, warmupDuration, eventSpacing)
+	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, warmupDuration, eventSpacing)
 	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -116,8 +147,8 @@ func runScenarioObserved(ctx context.Context, env *environment, sc scenario, sta
 	env.behaviours.set(sc.behaviours)
 	// Each client gets its own records: kgo writes back to the *kgo.Record it
 	// produces, so sharing one slice across the two concurrent clients would race.
-	wgoEvents := buildScenarioEvents(env.topic, env.numPartitions, sc.duration(), eventSpacing)
-	kgoEvents := buildScenarioEvents(env.topic, env.numPartitions, sc.duration(), eventSpacing)
+	wgoEvents := eventsForClient(env.wgoClient, env.topic, env.numPartitions, sc.duration(), eventSpacing)
+	kgoEvents := eventsForClient(env.kgoClient, env.topic, env.numPartitions, sc.duration(), eventSpacing)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); wgoObservations = runScenarioEvents(ctx, env.wgoClient, wgoEvents, start) }()

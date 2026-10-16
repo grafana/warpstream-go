@@ -1,11 +1,13 @@
-package main
+package runner
 
 import "fmt"
 
 // scenarioResult holds everything the report and the pass/fail check need for one
 // scenario.
 type scenarioResult struct {
-	sc scenario
+	sc                                         scenario
+	workloadDescription, workloadConfiguration string
+	recoveryResponseDescription                string
 
 	wgoSummary, kgoSummary         observationsSummary
 	wgoBuckets, kgoBuckets         []observationsSummary
