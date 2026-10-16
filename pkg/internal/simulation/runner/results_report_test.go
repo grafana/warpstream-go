@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"fmt"
@@ -253,4 +253,16 @@ func TestResultsReport_SuccessDeltaCell_NaWithoutGate(t *testing.T) {
 	withGate.sc.expect.minSuccessDeltaVsKgo = ptr(0.1)
 	assert.Equal(t, "+50.0 pts", rr.successDeltaCell(withGate))
 	assert.Equal(t, "+50.0 pts (want ≥ 10.0 pts)", rr.successDeltaLine(withGate))
+}
+
+func TestResultsReport_WorkloadRecoveryEvidence(t *testing.T) {
+	t.Parallel()
+	result := scenarioResult{
+		sc:                          scenario{name: "recovery", transportPhases: []transportPhase{{0, 1, restorePod}}},
+		wgoTransport:                transportStats{recoveredResponses: map[int32]int64{1: 5}},
+		recoveryResponseDescription: "successful wire responses read after HTTP completion",
+	}
+	report := newResultsReport(scenarioResults{entries: []scenarioResult{result}}).generateMarkdown()
+	require.Contains(t, report, "successful wire responses read after HTTP completion from restored broker 1 during recovery: 5")
+	require.NotContains(t, report, "successful wgo Produce responses (including probes)")
 }

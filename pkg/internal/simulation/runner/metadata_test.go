@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/grafana/warpstream-go/pkg/internal/testkafka"
@@ -213,4 +214,84 @@ func TestMetadataView_WithdrawBroker(t *testing.T) {
 	assert.Equal(t, map[int32]int64{1: 1}, view.missingLeaders())
 	assert.Len(t, withdrawn.Brokers, 1)
 	assert.Equal(t, original.Topics, withdrawn.Topics)
+}
+
+func TestMetadata_PreferredPlacement(t *testing.T) {
+	template := kmsg.NewPtrMetadataResponse()
+	for id := int32(0); id < 4; id++ {
+		template.Brokers = append(template.Brokers, kmsg.MetadataResponseBroker{NodeID: id})
+	}
+	topic := "test"
+	template.Topics = []kmsg.MetadataResponseTopic{{Topic: &topic, TopicID: [16]byte{1}, Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 0, Replicas: []int32{0}, ISR: []int32{0}}, {Partition: 1, Leader: 1, Replicas: []int32{1}, ISR: []int32{1}}}}}
+	response := metadataPreferredPlacement(template, 2, 3, -1)
+	require.Len(t, response.Brokers, 3)
+	require.EqualValues(t, 2, response.Brokers[0].NodeID)
+	require.EqualValues(t, 3, response.Brokers[1].NodeID)
+	require.EqualValues(t, 0, response.Brokers[2].NodeID)
+	require.Equal(t, template.Topics[0].TopicID, response.Topics[0].TopicID)
+	for _, partition := range response.Topics[0].Partitions {
+		require.EqualValues(t, 2, partition.Leader)
+		require.Equal(t, []int32{2}, partition.ISR)
+	}
+	require.Len(t, template.Brokers, 4)
+	require.EqualValues(t, 0, template.Topics[0].Partitions[0].Leader)
+	require.EqualValues(t, 1, template.Topics[0].Partitions[1].Leader)
+}
+
+func TestMetadata_RetainedFallback(t *testing.T) {
+	template := kmsg.NewPtrMetadataResponse()
+	for id := int32(0); id < 4; id++ {
+		template.Brokers = append(template.Brokers, kmsg.MetadataResponseBroker{NodeID: id})
+	}
+	for preferred := int32(0); preferred < 4; preferred++ {
+		response := metadataPreferredPlacement(template, preferred, 3, 3)
+		advertised := map[int32]bool{}
+		for _, broker := range response.Brokers {
+			advertised[broker.NodeID] = true
+		}
+		require.Len(t, advertised, 3)
+		require.True(t, advertised[preferred])
+		require.True(t, advertised[3])
+	}
+}
+
+func TestMetadata_StaleFallbackIsUnknownToTransport(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var network kfake.VirtualNetwork
+		cluster, address := testkafka.CreateCluster(t, 3, topicName, testkafka.WithNumBrokers(3), testkafka.WithVirtualNetwork(&network))
+		client, err := kgo.NewClient(kgo.SeedBrokers(address), kgo.Dialer(network.DialContext))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		raw, err := client.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+		require.NoError(t, err)
+		behaviour := newBrokersBehaviourProvider(healthyBehaviours())
+		installFailureControl(cluster, behaviour, clientTypeWgo)
+		view := installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviour, true, false, -1)
+		pool := wgo.NewAgentPool(client)
+		_, err = pool.Refresh(t.Context())
+		require.NoError(t, err)
+		fault := healthyBehaviours()
+		fault.brokerOnlyMissing = []int32{1}
+		behaviour.set(fault)
+		time.Sleep(2 * time.Nanosecond)
+		client.ForceMetadataRefresh()
+		synctest.Wait()
+		require.Contains(t, pool.Agents(), int32(1))
+		require.Contains(t, pool.Agents(), int32(2))
+		_, err = client.Broker(1).Request(t.Context(), kmsg.NewPtrProduceRequest())
+		require.EqualError(t, err, "unknown broker")
+		view.mu.Lock()
+		withdrawals := view.brokerOnlyWithdrawals
+		view.mu.Unlock()
+		require.Positive(t, withdrawals)
+		// Both snapshots must remain observable while the transport loses the candidate.
+		time.Sleep(2 * time.Nanosecond)
+		_, err = pool.Refresh(t.Context())
+		require.NoError(t, err)
+		require.Contains(t, pool.Agents(), int32(1))
+		view.mu.Lock()
+		stale := view.staleRoutingResponses
+		view.mu.Unlock()
+		require.Positive(t, stale)
+	})
 }

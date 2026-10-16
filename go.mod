@@ -12,6 +12,7 @@ require (
 	github.com/twmb/franz-go/pkg/kfake v0.0.0-20261013022759-7b6cac30a57a
 	github.com/twmb/franz-go/pkg/kmsg v1.15.0
 	github.com/twmb/franz-go/plugin/kprom v1.5.0
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
@@ -24,5 +25,4 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 )

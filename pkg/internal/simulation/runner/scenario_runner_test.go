@@ -1,7 +1,8 @@
-package main
+package runner
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -122,5 +123,84 @@ func TestRunScenarioEvents_RecoveryWindowIgnoresSchedulerDelay(t *testing.T) {
 			wgoRecovery: recovery.summary(), wgoRecoverySlowFraction: recovery.slowFraction(2 * time.Second),
 		}
 		assert.Empty(t, checkResult(result))
+	})
+}
+
+func TestScenarioWarmup_PartitionCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		wgoReady, kgoReady, want int64
+	}{
+		{name: "covered during minimum warmup", wgoReady: 1, kgoReady: 1, want: 60},
+		{name: "waits for both lanes with fresh series", wgoReady: 61, kgoReady: 63, want: 63},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				wgo := &coverageProduceClient{readyAfter: tc.wgoReady}
+				kgo := &coverageProduceClient{readyAfter: tc.kgoReady}
+				env := &environment{wgoClient: wgo, kgoClient: kgo, topic: "t", numPartitions: 1}
+				require.NoError(t, runScenarioWarmupWithSpacing(t.Context(), env, 500*time.Millisecond))
+				for _, client := range []*coverageProduceClient{wgo, kgo} {
+					require.Equal(t, tc.want, client.calls.Load())
+					require.Len(t, client.offsets, int(tc.want))
+					for i, offset := range client.offsets {
+						require.Equal(t, time.Duration(i)*500*time.Millisecond, offset)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestScenarioWarmup_IncompleteCoverageIsBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &coverageProduceClient{readyAfter: 10000}
+		env := &environment{wgoClient: client, kgoClient: &fakeProduceClient{}, topic: "t", numPartitions: 1}
+		start := time.Now()
+		err := runScenarioWarmupWithSpacing(t.Context(), env, 500*time.Millisecond)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.ErrorContains(t, err, "partition coverage incomplete")
+		require.LessOrEqual(t, time.Since(start), warmupDuration+warmupCoverageTimeout)
+	})
+}
+
+func TestScenarioWarmup_Cancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), warmupDuration+time.Second)
+		defer cancel()
+		client := &coverageProduceClient{readyAfter: 10000}
+		env := &environment{wgoClient: client, kgoClient: &fakeProduceClient{}, topic: "t", numPartitions: 1}
+		start := time.Now()
+		require.ErrorIs(t, runScenarioWarmupWithSpacing(ctx, env, 500*time.Millisecond), context.DeadlineExceeded)
+		require.Equal(t, warmupDuration+time.Second, time.Since(start))
+	})
+}
+
+type coverageProduceClient struct {
+	calls      atomic.Int64
+	readyAfter int64
+	delay      time.Duration
+	offsets    []time.Duration
+}
+
+func (c *coverageProduceClient) EventRecords(topic string, _ int32, at time.Duration) []*kgo.Record {
+	c.offsets = append(c.offsets, at)
+	return []*kgo.Record{{Topic: topic}}
+}
+func (*coverageProduceClient) MetricsPrefix() string  { return "" }
+func (*coverageProduceClient) Close()                 {}
+func (c *coverageProduceClient) WarmupComplete() bool { return c.calls.Load() >= c.readyAfter }
+func (c *coverageProduceClient) Produce(_ context.Context, record *kgo.Record, promise func(*kgo.Record, error)) {
+	c.calls.Add(1)
+	time.Sleep(c.delay)
+	promise(record, nil)
+}
+
+func TestScenarioWarmup_SlowRequestsAdvanceSeriesSequence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &coverageProduceClient{readyAfter: 603, delay: 500 * time.Millisecond}
+		env := &environment{wgoClient: client, kgoClient: &fakeProduceClient{}, topic: "t", numPartitions: 1}
+		require.NoError(t, runScenarioWarmupWithSpacing(t.Context(), env, 50*time.Millisecond))
+		require.Equal(t, []time.Duration{30 * time.Second, 30500 * time.Millisecond, 31 * time.Second}, client.offsets[600:])
 	})
 }
