@@ -1,8 +1,13 @@
 package main
 
 import (
+	"cmp"
+	"maps"
 	"slices"
+	"sync"
+	"sync/atomic"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
@@ -13,15 +18,62 @@ func missingBrokerBehaviours(nodeIDs ...int32) brokersBehaviour {
 	return b
 }
 
-func installMetadataControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider) {
+type metadataView struct {
+	current                atomic.Pointer[kmsg.MetadataResponse]
+	template               *kmsg.MetadataResponse
+	mu                     sync.Mutex
+	missingLeaderResponses map[int32]int64
+}
+
+func installMetadataControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider) *metadataView {
+	view := &metadataView{template: template}
+	view.current.Store(template)
 	cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
 		cluster.KeepControl()
-		missing := behaviours.get().missingBrokers
-		if len(missing) == 0 {
-			return nil, nil, false
-		}
-		return metadataWithoutBrokers(template, req.GetVersion(), missing), nil, true
+		// kfake reshuffles leaders during membership changes. Publish a complete
+		// scenario view so unrelated partitions never inherit those random leaders.
+		response := metadataWithoutBrokers(view.current.Load(), req.GetVersion(), behaviours.get().missingBrokers)
+		view.observeMissingLeaders(response)
+		return response, nil, true
 	})
+	return view
+}
+
+func (view *metadataView) withdrawBroker(nodeID int32) {
+	previous := view.current.Load()
+	next := *previous
+	// Discovery can remove a pod before partition assignments converge.
+	next.Brokers = slices.DeleteFunc(slices.Clone(previous.Brokers), func(b kmsg.MetadataResponseBroker) bool { return b.NodeID == nodeID })
+	view.current.Store(&next)
+}
+
+func (view *metadataView) observeMissingLeaders(response *kmsg.MetadataResponse) {
+	live := make(map[int32]bool, len(response.Brokers))
+	for _, broker := range response.Brokers {
+		live[broker.NodeID] = true
+	}
+	missing := make(map[int32]bool)
+	for _, topic := range response.Topics {
+		for _, partition := range topic.Partitions {
+			if partition.Leader >= 0 && !live[partition.Leader] {
+				missing[partition.Leader] = true
+			}
+		}
+	}
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	if view.missingLeaderResponses == nil {
+		view.missingLeaderResponses = make(map[int32]int64)
+	}
+	for nodeID := range missing {
+		view.missingLeaderResponses[nodeID]++
+	}
+}
+
+func (view *metadataView) missingLeaders() map[int32]int64 {
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	return maps.Clone(view.missingLeaderResponses)
 }
 
 func metadataWithoutBrokers(template *kmsg.MetadataResponse, version int16, missing []int32) *kmsg.MetadataResponse {
@@ -33,4 +85,50 @@ func metadataWithoutBrokers(template *kmsg.MetadataResponse, version int16, miss
 		return slices.Contains(missing, b.NodeID)
 	})
 	return &response
+}
+
+func (view *metadataView) updateBroker(nodeID int32, broker *kmsg.MetadataResponseBroker) {
+	previous := view.current.Load()
+	next := *previous
+	next.Brokers = slices.DeleteFunc(slices.Clone(previous.Brokers), func(candidate kmsg.MetadataResponseBroker) bool { return candidate.NodeID == nodeID })
+	if broker != nil {
+		next.Brokers = append(next.Brokers, *broker)
+	}
+	slices.SortFunc(next.Brokers, func(a, b kmsg.MetadataResponseBroker) int { return cmp.Compare(a.NodeID, b.NodeID) })
+
+	live := make(map[int32]bool, len(next.Brokers))
+	for _, member := range next.Brokers {
+		live[member.NodeID] = true
+	}
+	liveReplicas := func(replicas []int32) []int32 {
+		return slices.DeleteFunc(slices.Clone(replicas), func(replica int32) bool { return !live[replica] })
+	}
+	// Rebuild from the captured layout so returning brokers regain their replica
+	// assignments without retaining departed members in any published snapshot.
+	next.Topics = slices.Clone(view.template.Topics)
+	for topicIndex := range next.Topics {
+		topic := &next.Topics[topicIndex]
+		topic.Partitions = slices.Clone(topic.Partitions)
+		for partitionIndex := range topic.Partitions {
+			partition := &topic.Partitions[partitionIndex]
+			partition.Replicas = liveReplicas(partition.Replicas)
+			partition.ISR = liveReplicas(partition.ISR)
+			partition.OfflineReplicas = liveReplicas(partition.OfflineReplicas)
+			if !live[partition.Leader] {
+				partition.Leader = -1
+				if len(partition.ISR) > 0 {
+					partition.Leader = partition.ISR[0]
+				} else {
+					partition.ErrorCode = kerr.LeaderNotAvailable.Code
+				}
+			}
+			oldPartition := previous.Topics[topicIndex].Partitions[partitionIndex]
+			partition.LeaderEpoch = oldPartition.LeaderEpoch
+			if partition.Leader != oldPartition.Leader {
+				partition.LeaderEpoch++
+			}
+		}
+	}
+
+	view.current.Store(&next)
 }

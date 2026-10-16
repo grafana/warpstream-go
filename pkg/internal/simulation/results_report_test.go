@@ -39,6 +39,18 @@ func TestResultsReport_GenerateJSON(t *testing.T) {
 	assert.NotEqual(t, data, moreAttempts)
 }
 
+func TestResultsReport_GenerateJSONIncludesFailures(t *testing.T) {
+	results := scenarioResults{entries: []scenarioResult{{
+		sc:         scenario{name: "healthy", expect: scenarioExpectations{minWgoSuccessRate: 1}},
+		wgoSummary: observationsSummary{total: 120, successes: 119},
+		kgoSummary: observationsSummary{total: 120, successes: 118},
+	}}}
+	data, err := newResultsReport(results).generateJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"failures"`)
+	assert.Contains(t, string(data), "wgo success rate 99.2% below required floor 100.0%")
+}
+
 func TestResultsReport_WriteBucketTableDrain(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

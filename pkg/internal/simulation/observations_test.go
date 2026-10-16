@@ -19,7 +19,8 @@ func TestObservations_RecordIsThreadSafe(t *testing.T) {
 	for range goroutines {
 		wg.Go(func() {
 			for range perGoroutine {
-				obs.record(time.Now(), 10*time.Millisecond, nil)
+				now := time.Now()
+				obs.record(now, now, 10*time.Millisecond, nil)
 			}
 		})
 	}

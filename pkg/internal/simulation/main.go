@@ -14,6 +14,7 @@ func main() {
 	reportFilepath := flag.String("report-filepath", "", "if set, write the Markdown report to this file path")
 	jsonReportFilepath := flag.String("json-report-filepath", "", "if set, write scenario names and attempt/pass counts as JSON to this file path")
 	timeout := flag.Duration("timeout", 20*time.Minute, "overall timeout for the whole simulation")
+	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -51,7 +52,10 @@ func main() {
 		for _, f := range failures {
 			fmt.Fprintf(os.Stderr, "  - %s\n", f)
 		}
-		os.Exit(1)
+		if *check {
+			os.Exit(1)
+		}
+		return
 	}
 	fmt.Println("\nPASS: all scenarios met their expectations.")
 }
