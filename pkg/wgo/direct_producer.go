@@ -139,7 +139,7 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		}
 	}
 
-	// Mark a broker-call failure for classification.
+	// Wrap so classification can tell this from a request we failed to build.
 	if err != nil {
 		return ProduceResult{err: &wireError{err: err}}
 	}

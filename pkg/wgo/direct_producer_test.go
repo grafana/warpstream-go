@@ -280,7 +280,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_total counter
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
-				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other. Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_failed_total counter
 				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="timeout"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
@@ -348,7 +348,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 					assert.ErrorIs(t, res.error(), tc.wantErr)
 
 					require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other. Each retry counts as a separate request.
+						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
 						# TYPE warpstream_produce_direct_requests_failed_total counter
 						warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="%s"} 1
 					`, tc.reason)), "warpstream_produce_direct_requests_failed_total"))
@@ -401,7 +401,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			assert.Equal(t, kerr.UnknownServerError.Code, got.code)
 
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other. Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_failed_total counter
 				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="unknown_broker"} 1
 			`), "warpstream_produce_direct_requests_failed_total"))

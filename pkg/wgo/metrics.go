@@ -420,7 +420,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		produceDirectRequestsFailedTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "warpstream_produce_direct_requests_failed_total",
-			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other. Each retry counts as a separate request.",
+			Help: "Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.",
 		}, []string{"reason", "agent_state"}),
 		produceRecordsTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "warpstream_produce_records_total",

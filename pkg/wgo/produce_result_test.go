@@ -258,6 +258,22 @@ func TestGetProduceResultErr(t *testing.T) {
 			err:  &wireError{err: tls.AlertError(42)},
 			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
 		},
+		"wire dial timeout stays transport": {
+			err:  &wireError{err: &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}},
+			want: produceResultErr{reason: "transport", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire unknown broker with a suffix is wire_other": {
+			err:  &wireError{err: errors.New("unknown broker 5")},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire plaintext record header is tls and not retriable": {
+			err:  &wireError{err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}},
+			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire-wrapped cancel stays canceled": {
+			err:  &wireError{err: context.Canceled},
+			want: produceResultErr{reason: "canceled", retriable: false, code: kerr.RequestTimedOut.Code},
+		},
 		"other wire error is one residual retriable reason": {
 			err:  &wireError{err: errors.New("broker replied with something new")},
 			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
@@ -387,6 +403,16 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		assert.Equal(t, "unknown_broker", a.lastErr.reason)
 		assert.True(t, a.lastErr.retriable)
 		assert.Len(t, a.remaining(), 1)
+	})
+
+	t.Run("canceled wire error aborts", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: context.Canceled}})
+
+		assert.True(t, a.done())
+		assert.Equal(t, "canceled", a.lastErr.reason)
+		assert.False(t, a.lastErr.retriable)
 	})
 
 	t.Run("tls wire error aborts", func(t *testing.T) {

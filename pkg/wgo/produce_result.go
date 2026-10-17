@@ -140,7 +140,8 @@ func getProduceResultErr(err error) produceResultErr {
 	if kerrErr := (*kerr.Error)(nil); errors.As(err, &kerrErr) {
 		return produceResultErr{err: err, reason: "kafka_non_retriable_error", retriable: false, code: kerrErr.Code}
 	}
-	// A broker-call failure is retriable unless it is TLS or the client is closed.
+	// The failure is local to this connection, so another agent may succeed.
+	// TLS and a closed client are not.
 	if wire := (*wireError)(nil); errors.As(err, &wire) {
 		reason := "wire_other"
 		retriable := true
@@ -161,21 +162,15 @@ func getProduceResultErr(err error) produceResultErr {
 	return produceResultErr{err: err, reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code}
 }
 
-// wireError is a failure returned by the broker call.
 type wireError struct {
 	err error
 }
 
-func (e *wireError) Error() string {
-	if e == nil || e.err == nil {
-		return "wire error"
-	}
-	return e.err.Error()
-}
+func (e *wireError) Error() string { return e.err.Error() }
 
 func (e *wireError) Unwrap() error { return e.err }
 
-// isUnknownBrokerErr reports franz-go's unexported "unknown broker" error.
+// franz-go's missing-node error is unexported. v1.21.6 and v1.22.1 both use this text.
 func isUnknownBrokerErr(err error) bool {
 	for err != nil {
 		if err.Error() == "unknown broker" {
@@ -186,24 +181,23 @@ func isUnknownBrokerErr(err error) bool {
 	return false
 }
 
-// isNonTimeoutDialErr reports a dial that was not a timeout.
 func isNonTimeoutDialErr(err error) bool {
 	op := (*net.OpError)(nil)
 	return errors.As(err, &op) && op.Op == "dial" && !op.Timeout()
 }
 
-// isTLSErr reports a certificate or handshake failure.
 func isTLSErr(err error) bool {
 	verify := (*tls.CertificateVerificationError)(nil)
 	alert := tls.AlertError(0)
+	header := tls.RecordHeaderError{}
 	invalid := x509.CertificateInvalidError{}
 	host := x509.HostnameError{}
 	unknown := x509.UnknownAuthorityError{}
 	constraint := x509.ConstraintViolationError{}
 	roots := (*x509.SystemRootsError)(nil)
-	return errors.As(err, &verify) || errors.As(err, &alert) || errors.As(err, &invalid) ||
-		errors.As(err, &host) || errors.As(err, &unknown) || errors.As(err, &constraint) ||
-		errors.As(err, &roots)
+	return errors.As(err, &verify) || errors.As(err, &alert) || errors.As(err, &header) ||
+		errors.As(err, &invalid) || errors.As(err, &host) || errors.As(err, &unknown) ||
+		errors.As(err, &constraint) || errors.As(err, &roots)
 }
 
 // produceResultAccumulator merges the outcomes of one or more produce
