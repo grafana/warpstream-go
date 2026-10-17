@@ -280,7 +280,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				# HELP warpstream_produce_direct_requests_total Total number of direct Produce requests issued to a Warpstream agent, by routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_total counter
 				warpstream_produce_direct_requests_total{agent_state="healthy"} 1
-				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
 				# TYPE warpstream_produce_direct_requests_failed_total counter
 				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="timeout"} 1
 			`), "warpstream_produce_direct_requests_total", "warpstream_produce_direct_requests_failed_total"))
@@ -348,7 +348,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 					assert.ErrorIs(t, res.error(), tc.wantErr)
 
 					require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). Each retry counts as a separate request.
+						# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
 						# TYPE warpstream_produce_direct_requests_failed_total counter
 						warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="%s"} 1
 					`, tc.reason)), "warpstream_produce_direct_requests_failed_total"))
@@ -360,6 +360,52 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				})
 			})
 		}
+	})
+
+	t.Run("node missing from metadata is unknown_broker", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var vnet kfake.VirtualNetwork
+			_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName, testkafka.WithVirtualNetwork(&vnet))
+
+			client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr), kgo.Dialer(vnet.DialContext))
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			metaResp, err := client.Request(t.Context(), &kmsg.MetadataRequest{
+				Topics: []kmsg.MetadataRequestTopic{{Topic: kmsg.StringPtr(topicName)}},
+			})
+			require.NoError(t, err)
+			topicID := metaResp.(*kmsg.MetadataResponse).Topics[0].TopicID
+
+			reg := prometheus.NewPedanticRegistry()
+			topicIDFn := func(name string) ([16]byte, bool) {
+				if name == topicName {
+					return topicID, true
+				}
+				return [16]byte{}, false
+			}
+			producer := NewKafkaDirectProducer(client, topicIDFn, 9, KafkaDirectProducerConfig{
+				ProduceRequestTimeout:         time.Second,
+				ProduceRequestTimeoutOverhead: time.Second,
+			}, newMetrics(reg))
+
+			const missingNodeID = int32(99)
+			res := producer.ProduceSync(t.Context(), Agent{NodeID: missingNodeID}, partitionsForTest([]*kgo.Record{{
+				Topic: topicName, Partition: partition, Value: []byte("v"), Timestamp: time.Now(),
+			}}))
+
+			require.ErrorContains(t, res.error(), "unknown broker")
+			got := getProduceResultErr(res.error())
+			assert.Equal(t, "unknown_broker", got.reason)
+			assert.True(t, got.retriable)
+			assert.Equal(t, kerr.UnknownServerError.Code, got.code)
+
+			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.
+				# TYPE warpstream_produce_direct_requests_failed_total counter
+				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="unknown_broker"} 1
+			`), "warpstream_produce_direct_requests_failed_total"))
+		})
 	})
 }
 

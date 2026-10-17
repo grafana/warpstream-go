@@ -2,8 +2,11 @@ package wgo
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -137,7 +140,64 @@ func getProduceResultErr(err error) produceResultErr {
 	if kerrErr := (*kerr.Error)(nil); errors.As(err, &kerrErr) {
 		return produceResultErr{err: err, reason: "kafka_non_retriable_error", retriable: false, code: kerrErr.Code}
 	}
+	// The failure is local to this connection, so another agent may succeed.
+	// TLS and a closed client are not.
+	if wire := (*wireError)(nil); errors.As(err, &wire) {
+		reason := "wire_other"
+		retriable := true
+		switch {
+		case errors.Is(err, kgo.ErrClientClosed):
+			reason = "client_closed"
+			retriable = false
+		case isTLSErr(err):
+			reason = "tls"
+			retriable = false
+		case isUnknownBrokerErr(err):
+			reason = "unknown_broker"
+		case isNonTimeoutDialErr(err):
+			reason = "dial"
+		}
+		return produceResultErr{err: err, reason: reason, retriable: retriable, code: kerr.UnknownServerError.Code}
+	}
 	return produceResultErr{err: err, reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code}
+}
+
+type wireError struct {
+	err error
+}
+
+func (e *wireError) Error() string { return e.err.Error() }
+
+func (e *wireError) Unwrap() error { return e.err }
+
+// franz-go's missing-node error is unexported. v1.21.6 and v1.22.1 both use this text.
+func isUnknownBrokerErr(err error) bool {
+	for err != nil {
+		if err.Error() == "unknown broker" {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+func isNonTimeoutDialErr(err error) bool {
+	op := (*net.OpError)(nil)
+	return errors.As(err, &op) && op.Op == "dial" && !op.Timeout()
+}
+
+func isTLSErr(err error) bool {
+	verify := (*tls.CertificateVerificationError)(nil)
+	alert := tls.AlertError(0)
+	header := tls.RecordHeaderError{}
+	invalid := x509.CertificateInvalidError{}
+	host := x509.HostnameError{}
+	unknown := x509.UnknownAuthorityError{}
+	constraint := x509.ConstraintViolationError{}
+	roots := (*x509.SystemRootsError)(nil)
+	return errors.As(err, &verify) || errors.As(err, &alert) || errors.As(err, &header) ||
+		errors.As(err, &invalid) || errors.As(err, &host) || errors.As(err, &unknown) ||
+		errors.As(err, &constraint) || errors.As(err, &roots)
 }
 
 // produceResultAccumulator merges the outcomes of one or more produce

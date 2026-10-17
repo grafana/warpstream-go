@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 	"testing"
@@ -1342,6 +1343,97 @@ func TestHedger_ProduceSync(t *testing.T) {
 		})
 	})
 
+	t.Run("unknown-broker fallback continues and the third agent wins", func(t *testing.T) {
+		const tertiaryID = int32(3)
+		strat := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID, secondaryID, tertiaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.respFn = successResp
+		producer.errs[primaryID] = io.EOF
+		producer.errs[secondaryID] = &wireError{err: errors.New("unknown broker")}
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), strat, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.NoError(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID, secondaryID, tertiaryID}, producer.recordedCallNodeIDs())
+		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, nil)
+		count, sum := histogramCountSum(t, m.produceRequestsAttemptsSuccess.(prometheus.Histogram))
+		assert.Equal(t, uint64(1), count)
+		assert.Equal(t, float64(3), sum)
+	})
+
+	t.Run("agent-local wire failures exhaust candidates", func(t *testing.T) {
+		const tertiaryID = int32(3)
+		strat := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID, secondaryID, tertiaryID)},
+		}
+		producer := newMockDirectProducer()
+		wireUnknown := &wireError{err: errors.New("unknown broker")}
+		producer.errs[primaryID] = wireUnknown
+		producer.errs[secondaryID] = wireUnknown
+		producer.errs[tertiaryID] = wireUnknown
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), strat, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID, secondaryID, tertiaryID}, producer.recordedCallNodeIDs())
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeWinsTotal))
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonCandidatesExhausted: 1,
+		})
+	})
+
+	t.Run("non-retriable primary still ends as a terminal error", func(t *testing.T) {
+		const tertiaryID = int32(3)
+		strat := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID, secondaryID, tertiaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = kerr.MessageTooLarge
+		producer.errs[secondaryID] = &wireError{err: errors.New("unknown broker")}
+		producer.errs[tertiaryID] = &wireError{err: errors.New("unknown broker")}
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), strat, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID, secondaryID, tertiaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+	})
+
+	t.Run("closed client on the fallback stops the cascade", func(t *testing.T) {
+		const tertiaryID = int32(3)
+		strat := &mockPartitionAssignmentStrategy{
+			candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID, secondaryID, tertiaryID)},
+		}
+		producer := newMockDirectProducer()
+		producer.errs[primaryID] = io.EOF
+		producer.errs[secondaryID] = &wireError{err: kgo.ErrClientClosed}
+		m := newMetrics(prometheus.NewPedanticRegistry())
+		h := NewHedger(producer, healthyTracker(), strat, health, cfg, 0, 1<<20, m, nil)
+
+		capture := newResultCapture()
+		runHedger(h, context.Background(), makeReq(capture))
+
+		require.Error(t, capture.get(topic, partition).err)
+		assert.Equal(t, []int32{primaryID, secondaryID}, producer.recordedCallNodeIDs())
+		assertProduceFailures(t, m, map[produceFailureReason]float64{
+			produceFailureReasonTerminalError: 1,
+		})
+	})
+
 	t.Run("duplicate partition is an internal error and dispatches no fallback", func(t *testing.T) {
 		producer := newMockDirectProducer()
 		producer.errs[primaryID] = kerr.RequestTimedOut
@@ -1933,6 +2025,8 @@ func TestHedger_FinalStop(t *testing.T) {
 		{"a write timeout after a canceled primary stays a write timeout", expired, ProduceResult{err: context.Canceled}, failed, produceStopWriteTimeout, produceStopWriteTimeout},
 		{"exhausted stays exhausted while the context is live", context.Background(), failed, failed, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
 		{"exhausted after a non-retriable primary error is terminal", context.Background(), ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
+		{"exhausted after a retriable wire primary stays exhausted", context.Background(), ProduceResult{err: &wireError{err: errors.New("unknown broker")}}, failed, produceStopCandidatesExhausted, produceStopCandidatesExhausted},
+		{"exhausted after a closed client primary is terminal", context.Background(), ProduceResult{err: &wireError{err: kgo.ErrClientClosed}}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
 		{"a non-retriable primary error outranks an expired deadline", expired, ProduceResult{err: kerr.MessageTooLarge}, failed, produceStopCandidatesExhausted, produceStopTerminalError},
 		{"exhausted with an expired deadline is a write timeout", expired, failed, failed, produceStopCandidatesExhausted, produceStopWriteTimeout},
 		{"exhausted with a canceled context emits no failure", canceled, failed, failed, produceStopCandidatesExhausted, produceStopCanceled},
