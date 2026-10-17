@@ -362,7 +362,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 		}
 	})
 
-	t.Run("node missing from metadata is unknown_broker and still not retriable", func(t *testing.T) {
+	t.Run("node missing from metadata is unknown_broker", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var vnet kfake.VirtualNetwork
 			_, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName, testkafka.WithVirtualNetwork(&vnet))
@@ -397,7 +397,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			require.ErrorContains(t, res.error(), "unknown broker")
 			got := getProduceResultErr(res.error())
 			assert.Equal(t, "unknown_broker", got.reason)
-			assert.False(t, got.retriable)
+			assert.True(t, got.retriable)
 			assert.Equal(t, kerr.UnknownServerError.Code, got.code)
 
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`

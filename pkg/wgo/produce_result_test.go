@@ -238,13 +238,13 @@ func TestGetProduceResultErr(t *testing.T) {
 			err:  errors.New("unknown broker"),
 			want: produceResultErr{reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code},
 		},
-		"wire unknown broker is named and not retriable": {
+		"wire unknown broker is named and retriable": {
 			err:  &wireError{err: errors.New("unknown broker")},
-			want: produceResultErr{reason: "unknown_broker", retriable: false, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "unknown_broker", retriable: true, code: kerr.UnknownServerError.Code},
 		},
-		"wire refused dial is named and not retriable": {
+		"wire refused dial is named and retriable": {
 			err:  &wireError{err: &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}},
-			want: produceResultErr{reason: "dial", retriable: false, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "dial", retriable: true, code: kerr.UnknownServerError.Code},
 		},
 		"wire client closed is named and not retriable": {
 			err:  &wireError{err: kgo.ErrClientClosed},
@@ -258,9 +258,9 @@ func TestGetProduceResultErr(t *testing.T) {
 			err:  &wireError{err: tls.AlertError(42)},
 			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
 		},
-		"other wire error is one residual reason": {
+		"other wire error is one residual retriable reason": {
 			err:  &wireError{err: errors.New("broker replied with something new")},
-			want: produceResultErr{reason: "wire_other", retriable: false, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
 		},
 		"wire-wrapped transport error stays transport": {
 			err:  &wireError{err: io.EOF},
@@ -378,15 +378,25 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 		assert.Len(t, a.remaining(), 1)
 	})
 
-	t.Run("named wire error still aborts", func(t *testing.T) {
+	t.Run("agent-local wire error is not aborted", func(t *testing.T) {
 		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
 
 		a.accumulate(ProduceResult{err: &wireError{err: errors.New("unknown broker")}})
 
-		assert.True(t, a.done())
+		assert.False(t, a.done())
 		assert.Equal(t, "unknown_broker", a.lastErr.reason)
+		assert.True(t, a.lastErr.retriable)
+		assert.Len(t, a.remaining(), 1)
+	})
+
+	t.Run("tls wire error aborts", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: x509.UnknownAuthorityError{}}})
+
+		assert.True(t, a.done())
+		assert.Equal(t, "tls", a.lastErr.reason)
 		assert.False(t, a.lastErr.retriable)
-		assert.ErrorContains(t, a.result().err, "unknown broker")
 	})
 
 	t.Run("wire-wrapped transport error is not aborted", func(t *testing.T) {

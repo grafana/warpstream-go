@@ -140,20 +140,23 @@ func getProduceResultErr(err error) produceResultErr {
 	if kerrErr := (*kerr.Error)(nil); errors.As(err, &kerrErr) {
 		return produceResultErr{err: err, reason: "kafka_non_retriable_error", retriable: false, code: kerrErr.Code}
 	}
-	// Classify a broker-call failure by class. These stay non-retriable.
+	// A broker-call failure is retriable unless it is TLS or the client is closed.
 	if wire := (*wireError)(nil); errors.As(err, &wire) {
 		reason := "wire_other"
+		retriable := true
 		switch {
 		case errors.Is(err, kgo.ErrClientClosed):
 			reason = "client_closed"
+			retriable = false
 		case isTLSErr(err):
 			reason = "tls"
+			retriable = false
 		case isUnknownBrokerErr(err):
 			reason = "unknown_broker"
 		case isNonTimeoutDialErr(err):
 			reason = "dial"
 		}
-		return produceResultErr{err: err, reason: reason, retriable: false, code: kerr.UnknownServerError.Code}
+		return produceResultErr{err: err, reason: reason, retriable: retriable, code: kerr.UnknownServerError.Code}
 	}
 	return produceResultErr{err: err, reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code}
 }
