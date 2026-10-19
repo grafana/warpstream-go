@@ -77,14 +77,14 @@ type WarpstreamClient struct {
 	// client's own produce path.
 	produceHooks produceHooks
 
-	pool             *AgentPool
-	tracker          *CachedAgentStatsTracker
-	demoter          *Demoter
-	directProducer   *KafkaDirectProducer
-	fallbackProducer *KafkaDirectProducer
-	fallbackClient   *kgo.Client
-	hedger           *Hedger
-	buffer           *ClusterBuffer[routedTopicPartitionRecords]
+	pool              *AgentPool
+	tracker           *CachedAgentStatsTracker
+	demoter           *Demoter
+	directProducer    *KafkaDirectProducer
+	fallbackProducers []*KafkaDirectProducer
+	fallbackClients   []*kgo.Client
+	hedger            *Hedger
+	buffer            *ClusterBuffer[routedTopicPartitionRecords]
 
 	// refreshCtx is canceled by Close. It both signals the background
 	// refresh goroutine to exit and interrupts any in-flight Refresh.
@@ -117,7 +117,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		return nil, fmt.Errorf("invalid warpstream client config: %w", err)
 	}
 
-	kgoClient, fallbackClient, err := newKgoClients(cfg, logger, reg)
+	kgoClient, fallbackClients, err := newKgoClients(cfg, logger, reg)
 	if err != nil {
 		return nil, fmt.Errorf("creating kgo client: %w", err)
 	}
@@ -126,7 +126,9 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	pool := NewAgentPool(kgoClient)
 	_, dropped, err := pool.refresh(context.Background())
 	if err != nil {
-		fallbackClient.Close()
+		for _, client := range fallbackClients {
+			client.Close()
+		}
 		kgoClient.Close()
 		return nil, fmt.Errorf("initial agent pool refresh: %w", err)
 	}
@@ -140,24 +142,30 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	// so the agent stats here reflect per-attempt quality and the Hedger
 	// reacts to it without a layered retry mechanism dampening the signal.
 	trackingProducer := NewTrackingProducer(directProducer, tracker)
-	fallbackProducer := NewKafkaDirectProducer(fallbackClient, pool.TopicID, ProduceAPIVersion, cfg.DirectProducer, m)
-	fallbackTrackingProducer := NewTrackingProducer(fallbackProducer, tracker)
+	var fallbackProducers []*KafkaDirectProducer
+	var fallbackTransports []DirectProducer
+	for _, client := range fallbackClients {
+		producer := NewKafkaDirectProducer(client, pool.TopicID, ProduceAPIVersion, cfg.DirectProducer, m)
+		fallbackProducers = append(fallbackProducers, producer)
+		fallbackTransports = append(fallbackTransports, producer)
+	}
+	fallbackTrackingProducer := NewTrackingProducer(newBalancedProducer(fallbackTransports), tracker)
 
 	refreshCtx, refreshCancel := context.WithCancel(context.Background())
 	c := &WarpstreamClient{
-		cfg:              cfg,
-		logger:           logger,
-		metrics:          m,
-		produceHooks:     newProduceHooks(cfg.Hooks),
-		Client:           kgoClient,
-		pool:             pool,
-		tracker:          tracker,
-		directProducer:   directProducer,
-		fallbackProducer: fallbackProducer,
-		fallbackClient:   fallbackClient,
-		refreshCtx:       refreshCtx,
-		refreshCancel:    refreshCancel,
-		refreshNowCh:     make(chan struct{}, 1),
+		cfg:               cfg,
+		logger:            logger,
+		metrics:           m,
+		produceHooks:      newProduceHooks(cfg.Hooks),
+		Client:            kgoClient,
+		pool:              pool,
+		tracker:           tracker,
+		directProducer:    directProducer,
+		fallbackProducers: fallbackProducers,
+		fallbackClients:   fallbackClients,
+		refreshCtx:        refreshCtx,
+		refreshCancel:     refreshCancel,
+		refreshNowCh:      make(chan struct{}, 1),
 	}
 	// Publish the excluded-leader count and do not nudge: the refresh goroutine starts below.
 	// The periodic tick fetches the next snapshot.
@@ -388,7 +396,9 @@ func (c *WarpstreamClient) BufferedProduceRecords() int64 {
 // tests that simulate per-agent latency. Production code does not set this.
 func (c *WarpstreamClient) SetTestProduceResponseHook(fn func(ctx context.Context, nodeID int32, resp *kmsg.ProduceResponse, err error)) {
 	c.directProducer.onProduceResponse = fn
-	c.fallbackProducer.onProduceResponse = fn
+	for _, producer := range c.fallbackProducers {
+		producer.onProduceResponse = fn
+	}
 }
 
 // Close stops the background metadata refresh, flushes pending batches, and
@@ -399,7 +409,9 @@ func (c *WarpstreamClient) Close() {
 		c.refreshWG.Wait()
 		c.buffer.Close()
 		c.hedger.Close()
-		c.fallbackClient.Close()
+		for _, client := range c.fallbackClients {
+			client.Close()
+		}
 		c.Client.Close()
 	})
 }
@@ -508,8 +520,10 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 		c.tracker.PurgeAgents(removed)
 	}
 	c.demoter.Refresh(c.pool.Agents())
-	if len(c.fallbackClient.DiscoveredBrokers()) > 0 {
-		c.fallbackClient.ForceMetadataRefresh()
+	for _, client := range c.fallbackClients {
+		if len(client.DiscoveredBrokers()) > 0 {
+			client.ForceMetadataRefresh()
+		}
 	}
 	// Nudge so a stand-in does not wait for the next periodic tick. Produce does
 	// not block. The refresh loop paces the follow-up.
@@ -706,7 +720,7 @@ func recordErrFromResult(res ProduceResult, topic string, partition int32) error
 }
 
 // newKgoClients isolates primary and fallback connections while sharing transport metrics.
-func newKgoClients(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kgo.Client, *kgo.Client, error) {
+func newKgoClients(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kgo.Client, []*kgo.Client, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Address...),
 		kgo.ClientID(cfg.ClientID),
@@ -763,12 +777,19 @@ func newKgoClients(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*k
 	for _, mechanism := range primary.OptValue(kgo.SASL).([]sasl.Mechanism) {
 		mechanisms = append(mechanisms, sharedSASLMechanism{mechanism})
 	}
-	fallback, err := kgo.NewClient(append(opts, kgo.WithHooks(sharedBrokerHooks{hooks: hooks}), kgo.WithContext(primary.Context()), kgo.SASL(mechanisms...))...)
-	if err != nil {
-		primary.Close()
-		return nil, nil, err
+	var fallbacks []*kgo.Client
+	for range 2 {
+		fallback, err := kgo.NewClient(append(opts, kgo.WithHooks(sharedBrokerHooks{hooks: hooks}), kgo.WithContext(primary.Context()), kgo.SASL(mechanisms...))...)
+		if err != nil {
+			for _, client := range fallbacks {
+				client.Close()
+			}
+			primary.Close()
+			return nil, nil, err
+		}
+		fallbacks = append(fallbacks, fallback)
 	}
-	return primary, fallback, nil
+	return primary, fallbacks, nil
 }
 
 // produceMaxVersions returns a kversion.Versions snapshot identical to

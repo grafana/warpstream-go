@@ -56,11 +56,14 @@ so it does not explain the regression by itself.
 ## Fix
 
 Primary and fallback requests use separate franz-go clients and broker
-connections. A blocked primary cannot hold a fallback behind it. Both transports
+connections. A blocked primary cannot hold a fallback behind it. All transports
 use the same authentication, deadlines and broker hooks. Only the primary owns
 SASL shutdown and lifecycle hooks, so sharing does not double-close credential
-resources or register metrics twice. One additional Produce connection may be
-opened per agent used by fallbacks.
+resources or register metrics twice. Two additional Produce connections may be
+opened per agent used by fallbacks. Each fallback flush chooses the connection
+with fewer outstanding requests to its target agent. Started losing requests
+retain their slot until they finish draining; cancellation cannot make a blocked
+connection appear idle.
 
 When the original hedge decision permits racing, an unresolved fallback starts
 another candidate after the same hedge delay. This also applies after an early
@@ -98,7 +101,7 @@ source and record the client revision with each output. `-check=false` retains
 missed scenario expectations in the report; an exit-zero run is not a passed
 success-rate gate.
 
-## Final validation
+## Initial validation
 
 Three local runs per revision used the same pinned Mimir binary source,
 50-partition workloads, 30-second warmup, 60-second observation, `GOMAXPROCS=2`
@@ -114,5 +117,31 @@ were #127 (`6367ade`) and the complete fix (`0087567`).
 - Slow-agent hedge overhead increased from **22.7–22.9%** to **27.2–27.7%**
   above primary attempts; each fallback agent can also need an extra connection.
 
-The fixed timeout result is not a guarantee of full success: bounded candidate
-budgets, blocked fallback connections and the application deadline still apply.
+Passing that 50% scenario floor did not recover historical performance. The
+single fallback transport could still stall behind another fallback, even with
+zero health-gate suppression. This motivated balancing across two fallback
+connections per agent. The pool is bounded; it cannot guarantee success if both
+connections stall, the candidate budget runs out, or the HTTP deadline expires.
+
+## Released baseline and fallback balancing
+
+The same paired workload was repeated three times with released v0.1.4
+(`fc5c579`) and the same pinned Mimir source. v0.1.4 completed **107, 116, 110 / 120**
+timeout writes, worst **107/120**, confirming that the initial **74/120** result
+still regressed. Its slow-agent results were **113, 120, 118 / 120**.
+
+
+With two fallback connections balanced by outstanding requests, the timeout
+results were **120, 120, 117 / 120**, worst **117/120**. Slow-agent results were
+**120/120 in all three runs**. No faulty-fraction suppression occurred in the
+balanced timeout runs. Timeout hedge overhead was **19.7–21.2%**; slow-agent hedge
+overhead was **27.4–27.7%**, with **10.8–12.5%** of slow-agent HTTP writes taking
+over 2.5 seconds. The third timeout run still lost three writes to the HTTP
+deadline, so these runs establish an improvement over the released baseline,
+not a guarantee of lossless HTTP completion under injected stalls.
+
+The deterministic pool test holds a wire request open after its caller is
+canceled and verifies that the next fallback uses the other connection without
+waiting. A separate test verifies that load on one agent does not affect another
+agent's connection choice. Pool accounting is released only after the actual
+wire attempt returns, and idle agent entries are removed.

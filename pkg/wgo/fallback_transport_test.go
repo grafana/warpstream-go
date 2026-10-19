@@ -22,10 +22,13 @@ func TestKafkaDirectProducer_FallbackConnectionIsolation(t *testing.T) {
 		cfg.Dialer = original.client.OptValue(kgo.Dialer).(func(context.Context, string, string) (net.Conn, error))
 		hooks := &transportLifecycleHook{}
 		cfg.Hooks = []kgo.Hook{hooks}
-		primaryClient, fallbackClient, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
+		primaryClient, fallbackClients, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
 		require.NoError(t, err)
 		defer primaryClient.Close()
-		defer fallbackClient.Close()
+		for _, client := range fallbackClients {
+			defer client.Close()
+		}
+		fallbackClient := fallbackClients[0]
 		require.Equal(t, int64(1), hooks.created.Load())
 		primary := NewKafkaDirectProducer(primaryClient, original.topicID, original.version, original.cfg, original.metrics)
 		fallback := NewKafkaDirectProducer(fallbackClient, original.topicID, original.version, original.cfg, original.metrics)
@@ -73,11 +76,15 @@ func TestFallbackTransport_EmbeddedClientClose(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Address = original.client.OptValue(kgo.SeedBrokers).([]string)
 		cfg.Dialer = original.client.OptValue(kgo.Dialer).(func(context.Context, string, string) (net.Conn, error))
-		primary, fallback, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
+		primary, fallbacks, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
 		require.NoError(t, err)
-		defer fallback.Close()
+		for _, fallback := range fallbacks {
+			defer fallback.Close()
+		}
 		primary.Close()
-		require.ErrorIs(t, fallback.Context().Err(), context.Canceled)
+		for _, fallback := range fallbacks {
+			require.ErrorIs(t, fallback.Context().Err(), context.Canceled)
+		}
 	})
 }
 
@@ -86,9 +93,11 @@ func TestFallbackTransport_SASLClosesOnce(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Address = []string{"127.0.0.1:1"}
 	cfg.SASLOptions = []kgo.Opt{kgo.SASL(mechanism)}
-	primary, fallback, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
+	primary, fallbacks, err := newKgoClients(cfg, nopLogger{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, err)
-	fallback.Close()
+	for _, fallback := range fallbacks {
+		fallback.Close()
+	}
 	require.Zero(t, mechanism.closed.Load())
 	primary.Close()
 	require.Equal(t, int64(1), mechanism.closed.Load())
