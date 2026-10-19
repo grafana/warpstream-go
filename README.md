@@ -67,7 +67,7 @@ When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which
 
 - **Primary wins outright.** The primary leg returns first with a clean result; we surface it and the secondary never fires.
 - **Primary fails, cascade retries.** A leg counts as failed if *any* partition it sent errors (per-leg outcome is all-or-nothing — successful partitions are not credited when a sibling from the same call fails). Hedge legs from concurrent calls to the same agent can share one flush; each leg reads only the partitions it sent, so another call's outcome never resolves or fails it. The Hedger walks down the candidate list and re-attempts the unresolved partitions, up to `MaxHedgeAgents` total per partition. A broker-call failure local to one agent (unknown broker, a refused dial, or any other wire error) continues to the next candidate. On a fallback leg, a TLS failure, a closed client, a non-retriable Kafka error, or an error from outside the broker call stops the cascade; a primary failure always starts the fallback. Different partitions can land on different agents in the same wave when their candidate orderings diverge.
-- **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins, and the loser is cancelled.
+- **Hedge timer fires first.** The primary is taking longer than expected. The Hedger fires a fallback alongside the in-flight primary; whichever returns first with a usable result wins. Further retries on the losing leg stop; started wire requests drain under their original deadlines.
 
 Before accepting a primary response, the Hedger checks that it includes every requested topic-partition. An incomplete response triggers the existing retry path and logs a warning with the agent ID and first missing topic-partition, even if a retry succeeds. Partitions still unacknowledged after retries are exhausted are reported as failed.
 
@@ -102,6 +102,8 @@ Every produce attempt (primary or hedge wave) feeds latency and error data into 
 ### Wire layer: franz-go, used as a transport
 
 The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequest` to `kgo.Client.Broker().Request()`. We do not use `kgo.Client.Produce()` because that's where franz-go's leader-pinning lives. By dropping into the raw `Broker.Request` path we keep all of franz-go's connection pooling, TLS/SASL, and wire encoding while taking complete control of which broker each request actually goes to.
+
+An attempt canceled before it starts is not sent. Once started, it keeps the earlier of its inherited deadline and `ProduceRequestTimeout + ProduceRequestTimeoutOverhead`, even if a hedge wins first. Canceling a raw broker request would close its shared connection and fail other in-flight writes. Draining the losing request avoids those failures, preserves its actual latency and outcome for agent health, and does not delay returning the hedge winner. Closing the embedded franz-go client still interrupts the request.
 
 ### Hooks
 

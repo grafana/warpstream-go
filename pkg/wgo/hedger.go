@@ -211,10 +211,9 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	// and retries.
 	partitions := unrouteEncodedTopicPartitionRecords(routedPartitions)
 
-	// workCtx scopes both the primary and any hedge waves to this single
-	// ProduceSync call. Canceling it (fallback wins, or function returns)
-	// unwinds in-flight attempts at the next ctx check instead of letting
-	// them run out their per-attempt deadline.
+	// Cancellation stops retry scheduling and detaches buffered hedge legs.
+	// Started wire requests drain under their original deadlines so a losing
+	// race cannot close a shared connection and fail sibling writes.
 	workCtx, cancelWorkCtx := context.WithCancel(ctx)
 	defer cancelWorkCtx()
 
@@ -390,8 +389,8 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 
 // runHedgingAttemptsAndRaceWithPrimary races the hedge fallback against
 // the in-flight primary; the first to produce a usable outcome wins.
-// workCtx scopes both legs and is cancelled by the caller's deferred
-// cancel as soon as this function returns, which unwinds the losing leg.
+// workCtx scopes retry scheduling for both legs. Cancellation detaches
+// buffered hedge legs; started wire requests keep their original deadlines.
 // The reported attempts is the depth of the winning leg: 1 when the
 // primary wins, the fallback's own depth when the fallback wins.
 func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
