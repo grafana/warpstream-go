@@ -80,9 +80,10 @@ connection isolation, deadline collateral failures, late fallback wins, primary
 failure followed by a stalled fallback, and shared-resource shutdown.
 
 Isolation alone passed 59/120 HTTP writes in an initial local timeout run.
-Adding timed fallback races passed 79/120 in the next run. These are individual
-exploratory results; repeated matched comparisons of the complete fix are needed
-alongside the 25%-slow-agent case.
+Isolation plus timed races passed 95, 80 and 49 out of 120 across three runs;
+the last still failed the success gate after collateral errors suppressed
+hedging. The final health correction prevents that false signal while retaining
+genuine deadline failures. The complete matched comparison appears below.
 
 To reproduce using binaries built from each client revision:
 
@@ -96,3 +97,22 @@ Run from `pkg/internal/simulation/mimir`. Use `build-mimir.sh` for the pinned
 source and record the client revision with each output. `-check=false` retains
 missed scenario expectations in the report; an exit-zero run is not a passed
 success-rate gate.
+
+## Final validation
+
+Three local runs per revision used the same pinned Mimir binary source,
+50-partition workloads, 30-second warmup, 60-second observation, `GOMAXPROCS=2`
+and `-parallel 2` for the timeout and 25%-slow scenarios. The client revisions
+were #127 (`6367ade`) and the complete fix (`0087567`).
+
+- Timeout HTTP successes: **29, 18, 15 / 120** before; **86, 74, 120 / 120** after.
+  Worst-of-three improves from **15/120 to 74/120**. Every fixed run meets the
+  scenario's 50% success floor and 20-point advantage over kgo.
+- 25%-slow HTTP successes: **120/120 in all three runs** for both revisions.
+- No faulty-fraction hedge suppression occurred in the three corrected timeout
+  runs. Raw transport failures still appear in the diagnostic counters.
+- Slow-agent hedge overhead increased from **22.7–22.9%** to **27.2–27.7%**
+  above primary attempts; each fallback agent can also need an extra connection.
+
+The fixed timeout result is not a guarantee of full success: bounded candidate
+budgets, blocked fallback connections and the application deadline still apply.
