@@ -240,11 +240,11 @@ func TestGetProduceResultErr(t *testing.T) {
 		},
 		"wire unknown broker is named and retriable": {
 			err:  &wireError{err: errors.New("unknown broker")},
-			want: produceResultErr{reason: "unknown_broker", retriable: true, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "unknown_broker", retriable: true, code: kerr.BrokerNotAvailable.Code},
 		},
 		"wire refused dial is named and retriable": {
 			err:  &wireError{err: &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}},
-			want: produceResultErr{reason: "dial", retriable: true, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "dial", retriable: true, code: kerr.NetworkException.Code},
 		},
 		"wire client closed is named and not retriable": {
 			err:  &wireError{err: kgo.ErrClientClosed},
@@ -264,7 +264,7 @@ func TestGetProduceResultErr(t *testing.T) {
 		},
 		"wire unknown broker with a suffix is wire_other": {
 			err:  &wireError{err: errors.New("unknown broker 5")},
-			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.NetworkException.Code},
 		},
 		"wire plaintext record header is tls and not retriable": {
 			err:  &wireError{err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}},
@@ -276,7 +276,7 @@ func TestGetProduceResultErr(t *testing.T) {
 		},
 		"other wire error is one residual retriable reason": {
 			err:  &wireError{err: errors.New("broker replied with something new")},
-			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.NetworkException.Code},
 		},
 		"wire-wrapped transport error stays transport": {
 			err:  &wireError{err: io.EOF},
@@ -864,6 +864,30 @@ func TestSelectProduceResult(t *testing.T) {
 				require.Error(t, got.err)
 				assert.Equal(t, tc.want.err.Error(), got.err.Error())
 			}
+		})
+	}
+}
+
+func TestProduceResult_WireFailuresKeepRetryabilityInCodeOnlyResponses(t *testing.T) {
+	refusedDial := &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}
+	cases := map[string]struct {
+		err       error
+		want      *kerr.Error
+		retriable bool
+	}{
+		"dial":           {err: &wireError{err: refusedDial}, want: kerr.NetworkException, retriable: true},
+		"unknown broker": {err: &wireError{err: errors.New("unknown broker")}, want: kerr.BrokerNotAvailable, retriable: true},
+		"wire other":     {err: &wireError{err: errors.New("boom")}, want: kerr.NetworkException, retriable: true},
+		"client closed":  {err: &wireError{err: kgo.ErrClientClosed}, want: kerr.UnknownServerError, retriable: false},
+		"tls":            {err: &wireError{err: x509.UnknownAuthorityError{}}, want: kerr.UnknownServerError, retriable: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			acc := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+			acc.accumulate(ProduceResult{err: tc.err})
+			codeOnly := ProduceResult{resp: acc.result().resp}
+			require.ErrorIs(t, codeOnly.error(), tc.want)
+			assert.Equal(t, tc.retriable, getProduceResultErr(codeOnly.error()).retriable)
 		})
 	}
 }
