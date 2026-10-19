@@ -27,13 +27,7 @@ func Main(factory WorkloadFactory) {
 	profile := flag.String("profile", defaultProfile, "scenario profile: standard, all, or mimir-investigation (last two require external workloads)")
 	pattern := flag.String("scenario", "", "run scenarios whose names match this regular expression")
 	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
-	client := flag.String("client", "both", "client to run: both, wgo, or kgo")
 	flag.Parse()
-	clients, err := parseClients(*client)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
 	available, err := profileScenarios(*profile, factory != nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -48,7 +42,7 @@ func Main(factory WorkloadFactory) {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	res, err := run(ctx, factory, *parallel, selected, clients)
+	res, err := run(ctx, factory, *parallel, selected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "simulation failed: %v\n", err)
 		os.Exit(1)
@@ -109,7 +103,7 @@ func filterScenarios(pattern string, available []scenario) ([]scenario, error) {
 	return selected, nil
 }
 
-func run(ctx context.Context, factory WorkloadFactory, parallel int, scs []scenario, clients clientSelection) (scenarioResults, error) {
+func run(ctx context.Context, factory WorkloadFactory, parallel int, scs []scenario) (scenarioResults, error) {
 	if parallel <= 0 {
 		parallel = len(scs)
 	}
@@ -127,7 +121,7 @@ func run(ctx context.Context, factory WorkloadFactory, parallel int, scs []scena
 				errs[i] = ctx.Err()
 				return
 			}
-			out[i], errs[i] = runScenario(ctx, sc, factory, clients)
+			out[i], errs[i] = runScenario(ctx, sc, factory)
 		})
 	}
 	wg.Wait()
@@ -144,19 +138,15 @@ func run(ctx context.Context, factory WorkloadFactory, parallel int, scs []scena
 // driven by checkResult so a scenario that misses a slow-fraction or
 // success-delta gate cannot print as if it only had a success-rate floor.
 func printSummary(w io.Writer, r scenarioResults) {
-	fmt.Fprintln(w, "scenario summary (app-level success):")
+	fmt.Fprintln(w, "scenario summary (wgo app-level success):")
 	for _, res := range r.entries {
 		missed := checkResult(res)
 		status := "PASS"
 		if len(missed) > 0 {
 			status = "FAIL"
 		}
-		if res.clients == clientKgoOnly {
-			fmt.Fprintf(w, "  [%s] %-42s kgo %.1f%%\n", status, res.sc.name, 100*res.kgoSuccessRate())
-		} else {
-			fmt.Fprintf(w, "  [%s] %-42s %.1f%% (want >= %.1f%%)\n",
-				status, res.sc.name, 100*res.successRate(), 100*res.sc.expect.minWgoSuccessRate)
-		}
+		fmt.Fprintf(w, "  [%s] %-42s %.1f%% (want >= %.1f%%)\n",
+			status, res.sc.name, 100*res.successRate(), 100*res.sc.expect.minWgoSuccessRate)
 		for _, f := range missed {
 			fmt.Fprintf(w, "         %s\n", f.detail)
 		}

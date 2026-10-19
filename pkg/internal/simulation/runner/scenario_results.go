@@ -5,7 +5,6 @@ import "fmt"
 // scenarioResult holds everything the report and the pass/fail check need for one
 // scenario.
 type scenarioResult struct {
-	clients                                    clientSelection
 	sc                                         scenario
 	staleFallback                              *staleFallbackEvidence
 	windows                                    []windowResult
@@ -52,13 +51,13 @@ func successFraction(s observationsSummary) float64 {
 // hasSlowFractionGate reports whether r has both the config and the
 // measurement needed to evaluate the slow-fraction gate.
 func (r scenarioResult) hasSlowFractionGate() bool {
-	return r.clients.includes("wgo") && r.sc.expect.slowBudget != nil && r.sc.expect.maxWgoSlowFraction != nil && r.wgoSlowFraction != nil
+	return r.sc.expect.slowBudget != nil && r.sc.expect.maxWgoSlowFraction != nil && r.wgoSlowFraction != nil
 }
 
 // hasSuccessDeltaGate reports whether r's scenario asserts a
 // minSuccessDeltaVsKgo gate.
 func (r scenarioResult) hasSuccessDeltaGate() bool {
-	return r.clients == clientsBoth && r.sc.expect.minSuccessDeltaVsKgo != nil
+	return r.sc.expect.minSuccessDeltaVsKgo != nil
 }
 
 // scenarioResults is the outcome of running every scenario.
@@ -84,7 +83,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 	var out []scenarioFailure
 	exp := res.sc.expect
 
-	if got := res.successRate(); res.clients.includes("wgo") && got < exp.minWgoSuccessRate {
+	if got := res.successRate(); got < exp.minWgoSuccessRate {
 		out = append(out, scenarioFailure{
 			scenario: res.sc.name,
 			detail:   fmt.Sprintf("wgo success rate %.1f%% below required floor %.1f%%", 100*got, 100*exp.minWgoSuccessRate),
@@ -112,7 +111,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 
-	if res.sc.requireStaleFallback && res.clients.includes("wgo") {
+	if res.sc.requireStaleFallback {
 		if res.staleFallback == nil || res.staleFallback.BrokerOnlyWithdrawals == 0 || res.staleFallback.StaleRoutingResponses == 0 || res.staleFallback.FallbackErrors == 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "stale fallback was not exercised by both discovery paths and real client errors"})
 		}
@@ -128,9 +127,6 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			name  string
 			stats transportStats
 		}{{"wgo", res.wgoTransport}, {"kgo", res.kgoTransport}} {
-			if !res.clients.includes(client.name) {
-				continue
-			}
 			stats := client.stats.byBroker[phase.nodeID]
 			if (phase.action == killPod || phase.action == removePod || phase.action == withdrawPod) && stats.closedConnections == 0 || phase.action == blackholePod && stats.droppedBytes == 0 {
 				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s transport fault on broker %d did not affect live traffic", client.name, phase.nodeID)})
@@ -141,12 +137,12 @@ func checkResult(res scenarioResult) []scenarioFailure {
 				name      string
 				responses map[int32]int64
 			}{{"wgo", res.wgoMissingLeaders}, {"kgo", res.kgoMissingLeaders}} {
-				if res.clients.includes(client.name) && client.responses[phase.nodeID] == 0 {
+				if client.responses[phase.nodeID] == 0 {
 					out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s was served no Metadata response naming withdrawn broker %d as leader", client.name, phase.nodeID)})
 				}
 			}
 		}
-		if res.clients.includes("wgo") && (phase.action == restorePod || phase.action == replacePod) && res.wgoTransport.recoveredResponses[phase.nodeID] == 0 {
+		if (phase.action == restorePod || phase.action == replacePod) && res.wgoTransport.recoveredResponses[phase.nodeID] == 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("no successful recovery Produce response (including probes) reached restored broker %d", phase.nodeID)})
 		}
 	}
@@ -155,9 +151,6 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			name     string
 			selected map[int32]int64
 		}{{"wgo", res.wgoLatencySelections}, {"kgo", res.kgoLatencySelections}} {
-			if !res.clients.includes(lane.name) {
-				continue
-			}
 			var affected int64
 			for _, count := range lane.selected {
 				affected += count
@@ -168,11 +161,11 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 	for _, broker := range res.sc.requiredWgoDelayBrokers {
-		if res.clients.includes("wgo") && res.wgoLatencySelections[broker] == 0 {
+		if res.wgoLatencySelections[broker] == 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("wgo: no Produce response selected for injected delay on required broker %d", broker)})
 		}
 	}
-	if exp.recoveryFrom != nil && res.clients.includes("wgo") {
+	if exp.recoveryFrom != nil {
 		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, res.sc.spacing()))
 		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
 			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
@@ -182,7 +175,7 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: detail})
 		}
 	}
-	if exp.maxHedgeSurge != nil && res.clients.includes("wgo") {
+	if exp.maxHedgeSurge != nil {
 		if res.totalPrimary == 0 || float64(res.totalHedge)/float64(res.totalPrimary) > *exp.maxHedgeSurge {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("hedge surge: %d hedges / %d primaries exceeds %.0f%% budget", res.totalHedge, res.totalPrimary, 100**exp.maxHedgeSurge)})
 		}

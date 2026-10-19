@@ -5,7 +5,7 @@ const { discoverWorkloads } = require('./simulation-workloads.cjs');
 
 const marker = '<!-- wgo-simulation-report -->';
 
-function validateReport(rows, requiredClients = ['wgo', 'kgo']) {
+function validateReport(rows) {
   if (!Array.isArray(rows) || rows.length === 0) throw new Error('Empty simulation report');
   const names = new Set();
   for (const row of rows) {
@@ -13,10 +13,8 @@ function validateReport(rows, requiredClients = ['wgo', 'kgo']) {
       throw new Error('Invalid or duplicate scenario name');
     }
     names.add(row.scenario);
-    if (!['wgo', 'kgo'].some(client => row[client] !== undefined)) throw new Error('No client results');
     for (const client of ['wgo', 'kgo']) {
       const counts = row[client];
-      if (counts === undefined && !requiredClients.includes(client)) continue;
       if (!counts || !Number.isSafeInteger(counts.attempts) || counts.attempts <= 0 ||
           !Number.isSafeInteger(counts.passes) || counts.passes < 0 || counts.passes > counts.attempts) {
         throw new Error(`Invalid ${client} counts`);
@@ -38,12 +36,9 @@ function renderWorkload(title, reports) {
   const lines = [`### ${title}`, ''];
   for (let i = 0; i < reports.length; i++) {
     if (!reports[i]) lines.push(`Run ${i + 1} did not produce a report; see the failed CI job.`, '');
-    else for (const client of ['wgo', 'kgo']) {
-      if (reports[i].every(row => row[client] === undefined)) lines.push(`Run ${i + 1} did not produce a ${client} report; see the failed CI job.`, '');
-    }
   }
   if (!available.length) return lines.join('\n');
-  for (const rows of available) validateReport(rows, []);
+  for (const rows of available) validateReport(rows);
   const expected = available[0].map(r => r.scenario).sort();
   for (const rows of available) {
     if (JSON.stringify(rows.map(r => r.scenario).sort()) !== JSON.stringify(expected)) {
@@ -58,49 +53,32 @@ function renderWorkload(title, reports) {
     const cells = [];
     const successRates = [];
     for (const client of ['wgo', 'kgo']) {
-      const counts = rows.map(row => row?.[client]).filter(Boolean);
-      const attempts = counts.map(count => count.attempts);
+      const attempts = rows.filter(Boolean).map(row => row[client].attempts);
       if (attempts.some(value => value !== attempts[0])) throw new Error(`${title}: attempt counts differ between runs`);
-      const passes = counts.map(count => count.passes);
-      cells.push(counts.length === 3 ? `${Math.min(...passes)}/${attempts[0]}` : '—');
-      successRates.push(counts.length === 3 ? Math.min(...passes) / attempts[0] : NaN);
+      const passes = rows.filter(Boolean).map(row => row[client].passes);
+      cells.push(available.length === 3 ? `${Math.min(...passes)}/${attempts[0]}` : '—');
+      successRates.push(Math.min(...passes) / attempts[0]);
     }
-    const best = successRates.every(Number.isFinite) ? (successRates[0] >= successRates[1] ? 0 : 1) : -1;
+    const best = successRates[0] >= successRates[1] ? 0 : 1;
     const formatted = cells.map((cell, i) => cell !== '—' && i === best ? `**${cell}**` : cell);
     lines.push(`| ${escapeCell(name)} | ${formatted.join(' | ')} |`);
   }
   return lines.join('\n');
 }
 
-function mergeClientReports(wgo, kgo) {
-  for (const [client, rows] of [['wgo', wgo], ['kgo', kgo]]) {
-    if (!rows) continue;
-    validateReport(rows, [client]);
-    const other = client === 'wgo' ? 'kgo' : 'wgo';
-    if (rows.some(row => row[other] !== undefined)) throw new Error(`Unexpected ${other} results in ${client} report`);
-  }
-  if (!wgo || !kgo) return wgo || kgo;
-  const baseline = new Map(kgo.map(row => [row.scenario, row]));
-  if (wgo.length !== kgo.length || wgo.some(row => !baseline.has(row.scenario))) throw new Error('Client scenario names differ');
-  return wgo.map(row => ({ ...row, kgo: baseline.get(row.scenario).kgo }));
-}
-
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
-    'Each client runs on a separate runner, with three independent runs per scenario. Each client shows its lowest successful application writes / attempts across the three runs. Scenario gates are informational; build and harness errors still fail CI.', '',
+    'Three independent runs per scenario. Each client shows its lowest successful application writes / attempts across the three runs. Scenario gates are informational; build and harness errors still fail CI.', '',
     '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing. The same code can produce 110/120 successful writes in one run and 80/120 in another.', '',
     'All individual runs, scenario gates, latency, fault and error details are available in the run artifacts.', ''];
   for (const workload of discoverWorkloads()) {
     const key = workload.name;
     const title = key === 'direct' ? 'Direct client' : key[0].toUpperCase() + key.slice(1);
     const reports = [1, 2, 3].map(run => {
-      const clients = ['wgo', 'kgo'].map(client => {
-        const file = path.join(directory, `simulation-${key}-${client}-${run}`, 'report.json');
-        if (!fs.existsSync(file)) return null;
-        if (fs.statSync(file).size > 1024 * 1024) throw new Error('Simulation report too large');
-        return JSON.parse(fs.readFileSync(file, 'utf8'));
-      });
-      return mergeClientReports(...clients);
+      const file = path.join(directory, `simulation-${key}-${run}`, 'report.json');
+      if (!fs.existsSync(file)) return null;
+      if (fs.statSync(file).size > 1024 * 1024) throw new Error('Simulation report too large');
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
     });
     sections.push(renderWorkload(title, reports), '');
   }
@@ -132,7 +110,7 @@ function publish(directory) {
   console.log(JSON.parse(result).html_url);
 }
 
-module.exports = { buildReport, renderWorkload, validateReport, mergeClientReports };
+module.exports = { buildReport, renderWorkload, validateReport };
 if (require.main === module) {
   const directory = process.argv[2];
   if (!directory) throw new Error('Usage: simulation-report.cjs DIRECTORY [--publish]');

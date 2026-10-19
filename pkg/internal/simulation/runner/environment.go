@@ -104,7 +104,7 @@ type environment struct {
 	wgoMetadata, kgoMetadata *metadataView
 }
 
-func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, sc scenario, selected clientSelection) (_ *environment, err error) {
+func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, sc scenario) (_ *environment, err error) {
 	if sc.profile != nil && factory == nil {
 		return nil, fmt.Errorf("investigation topology requires an external workload")
 	}
@@ -182,98 +182,96 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 		}
 	}()
 
-	var (
-		wgoCluster, kgoCluster   *kfake.Cluster
-		wgoClient, kgoClient     produceClient
-		wgoNetwork, kgoNetwork   *transportNetwork
-		wgoMetadata, kgoMetadata *metadataView
-		wgoRegistry              *prometheus.Registry
-	)
-	if selected.includes("wgo") {
-		var wsAddr string
-		wgoCluster, wsAddr, err = createCluster()
-		if err != nil {
-			return nil, fmt.Errorf("create warpstream cluster: %w", err)
-		}
-		clusters = append(clusters, wgoCluster)
-		installFailureControl(wgoCluster, beh, clientTypeWgo)
+	//
+	// Warpstream client testing environment.
+	//
 
-		wgoNetwork = newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
-		networks = append(networks, wgoNetwork)
-		for nodeID, address := range wgoCluster.ListenAddrs() {
-			wgoNetwork.register(address, int32(nodeID))
-		}
+	wgoCluster, wsAddr, err := createCluster()
+	if err != nil {
+		return nil, fmt.Errorf("create warpstream cluster: %w", err)
+	}
+	clusters = append(clusters, wgoCluster)
+	installFailureControl(wgoCluster, beh, clientTypeWgo)
 
-		wgoMetadata, err = installMetadata(wgoCluster, wsAddr, wgoNetwork)
-		if err != nil {
-			return nil, err
-		}
-		wgoRegistry = prometheus.NewPedanticRegistry()
-		if factory == nil {
-			var raw *wgo.WarpstreamClient
-			raw, wgoRegistry, err = newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
-			if err == nil {
-				raw.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, hookErr error) {
-					beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
-					if hookErr == nil && ctx.Err() == nil && response != nil {
-						for _, topic := range response.Topics {
-							for _, partition := range topic.Partitions {
-								if partition.ErrorCode == 0 {
-									wgoNetwork.observeProduce(nodeID)
-									return
-								}
+	wgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	networks = append(networks, wgoNetwork)
+	for nodeID, address := range wgoCluster.ListenAddrs() {
+		wgoNetwork.register(address, int32(nodeID))
+	}
+
+	wgoMetadata, err := installMetadata(wgoCluster, wsAddr, wgoNetwork)
+	if err != nil {
+		return nil, err
+	}
+	wgoRegistry := prometheus.NewPedanticRegistry()
+	var wgoClient produceClient
+	if factory == nil {
+		var raw *wgo.WarpstreamClient
+		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
+		if err == nil {
+			raw.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, hookErr error) {
+				beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
+				if hookErr == nil && ctx.Err() == nil && response != nil {
+					for _, topic := range response.Topics {
+						for _, partition := range topic.Partitions {
+							if partition.ErrorCode == 0 {
+								wgoNetwork.observeProduce(nodeID)
+								return
 							}
 						}
 					}
-				})
-				wgoClient = raw
-			}
-		} else {
-			wgoClient, err = factory(workload("warpstream", wsAddr, wgoRegistry, wgoNetwork, beh))
+				}
+			})
+			wgoClient = raw
 		}
-		if err != nil {
-			return nil, fmt.Errorf("create warpstream workload: %w", err)
-		}
-		clients = append(clients, wgoClient)
+	} else {
+		wgoClient, err = factory(workload("warpstream", wsAddr, wgoRegistry, wgoNetwork, beh))
 	}
-	if selected.includes("kgo") {
-		var kgoAddr string
-		kgoCluster, kgoAddr, err = createCluster()
-		if err != nil {
-			return nil, fmt.Errorf("create kgo cluster: %w", err)
-		}
-		clusters = append(clusters, kgoCluster)
-		installFailureControl(kgoCluster, beh, clientTypeKgo)
-
-		// The kgo baseline keys latency by rec.Partition (not the underlying broker
-		// NodeID). Correct for this baseline because vanilla kgo with
-		// ManualPartitioner does not hedge or re-route: records for partition P
-		// always go to P's one designated leader, so "partition P is slow" and "P's
-		// leader is slow" are equivalent from the producer's perspective.
-		kgoNetwork = newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
-		networks = append(networks, kgoNetwork)
-		for nodeID, address := range kgoCluster.ListenAddrs() {
-			kgoNetwork.register(address, int32(nodeID))
-		}
-
-		kgoMetadata, err = installMetadata(kgoCluster, kgoAddr, kgoNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if factory == nil {
-			var inner *kgo.Client
-			inner, err = newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
-			if err == nil {
-				kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
-			}
-		} else {
-			kgoClient, err = factory(workload("kafka", kgoAddr, prometheus.NewPedanticRegistry(), kgoNetwork, beh))
-		}
-		if err != nil {
-			return nil, fmt.Errorf("create kafka workload: %w", err)
-		}
-		clients = append(clients, kgoClient)
+	if err != nil {
+		return nil, fmt.Errorf("create warpstream workload: %w", err)
 	}
+	clients = append(clients, wgoClient)
+
+	//
+	// franz-go client testing environment.
+	//
+
+	kgoCluster, kgoAddr, err := createCluster()
+	if err != nil {
+		return nil, fmt.Errorf("create kgo cluster: %w", err)
+	}
+	clusters = append(clusters, kgoCluster)
+	installFailureControl(kgoCluster, beh, clientTypeKgo)
+
+	// The kgo baseline keys latency by rec.Partition (not the underlying broker
+	// NodeID). Correct for this baseline because vanilla kgo with
+	// ManualPartitioner does not hedge or re-route: records for partition P
+	// always go to P's one designated leader, so "partition P is slow" and "P's
+	// leader is slow" are equivalent from the producer's perspective.
+	kgoNetwork := newTransportNetwork((&net.Dialer{Timeout: clientDialTimeout}).DialContext)
+	networks = append(networks, kgoNetwork)
+	for nodeID, address := range kgoCluster.ListenAddrs() {
+		kgoNetwork.register(address, int32(nodeID))
+	}
+
+	kgoMetadata, err := installMetadata(kgoCluster, kgoAddr, kgoNetwork)
+	if err != nil {
+		return nil, err
+	}
+	var kgoClient produceClient
+	if factory == nil {
+		var inner *kgo.Client
+		inner, err = newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
+		if err == nil {
+			kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
+		}
+	} else {
+		kgoClient, err = factory(workload("kafka", kgoAddr, prometheus.NewPedanticRegistry(), kgoNetwork, beh))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create kafka workload: %w", err)
+	}
+	clients = append(clients, kgoClient)
 
 	return &environment{
 		topic:         topicName,
@@ -291,21 +289,12 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 
 // Close releases both clients and both clusters.
 func (env *environment) Close() {
-	for _, client := range []produceClient{env.wgoClient, env.kgoClient} {
-		if client != nil {
-			client.Close()
-		}
-	}
-	for _, network := range []*transportNetwork{env.wgoNetwork, env.kgoNetwork} {
-		if network != nil {
-			network.Close()
-		}
-	}
-	for _, cluster := range []*kfake.Cluster{env.wgoCluster, env.kgoCluster} {
-		if cluster != nil {
-			cluster.Close()
-		}
-	}
+	env.wgoClient.Close()
+	env.kgoClient.Close()
+	env.wgoNetwork.Close()
+	env.kgoNetwork.Close()
+	env.wgoCluster.Close()
+	env.kgoCluster.Close()
 }
 
 // installFailureControl installs the per-broker FAILURE-injection control

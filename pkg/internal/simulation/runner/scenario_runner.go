@@ -17,8 +17,8 @@ import (
 // wgo's stats tracker qualifies a baseline before the scenario behaviours are
 // swapped in; its observations are discarded. The observed phase then drives the
 // comparison.
-func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory, selected clientSelection) (scenarioResult, error) {
-	env, err := newScenarioEnvironment(sc.healthyBehaviours(), factory, sc, selected)
+func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (scenarioResult, error) {
+	env, err := newScenarioEnvironment(sc.healthyBehaviours(), factory, sc)
 	if err != nil {
 		return scenarioResult{}, err
 	}
@@ -49,7 +49,7 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory, sele
 		metrics = external
 	}
 	var initialFallback *staleFallbackEvidence
-	if sc.requireStaleFallback && selected.includes("wgo") {
+	if sc.requireStaleFallback {
 		prefix := ""
 		if builder, ok := env.wgoClient.(eventBuilder); ok {
 			prefix = builder.MetricsPrefix()
@@ -59,17 +59,14 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory, sele
 			return scenarioResult{}, err
 		}
 	}
-	var sampler *counterSampler
-	if selected.includes("wgo") {
-		sampler = startCounterSampler(observedStart, reportBucket, func() (int64, int64) {
-			if builder, ok := env.wgoClient.(eventBuilder); ok {
-				return gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_primary_total"), gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_hedge_total")
-			}
-			return readProduceCounters(env.wgoRegistry)
-		})
-	}
+	sampler := startCounterSampler(observedStart, reportBucket, func() (int64, int64) {
+		if builder, ok := env.wgoClient.(eventBuilder); ok {
+			return gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_primary_total"), gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_hedge_total")
+		}
+		return readProduceCounters(env.wgoRegistry)
+	})
 	defer sampler.stop()
-	if sc.expect.recoveryFrom != nil && selected.includes("wgo") {
+	if sc.expect.recoveryFrom != nil {
 		env.wgoNetwork.mu.Lock()
 		env.wgoNetwork.recoveryStart = observedStart.Add(*sc.expect.recoveryFrom)
 		env.wgoNetwork.mu.Unlock()
@@ -105,7 +102,6 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory, sele
 	wgoSnapshot := wgoObservations.snapshot()
 	kgoSnapshot := kgoObservations.snapshot()
 	res := scenarioResult{
-		clients:           selected,
 		wgoMissingLeaders: env.wgoMetadata.missingLeaders(), kgoMissingLeaders: env.kgoMetadata.missingLeaders(),
 		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
 		sc:                   sc,
@@ -124,28 +120,24 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory, sele
 		res.totalPrimary = last.primary - first.primary
 		res.totalHedge = last.hedge - first.hedge
 	}
-	if sc.expect.slowBudget != nil && selected.includes("wgo") {
+	if sc.expect.slowBudget != nil {
 		f := wgoSnapshot.slowFraction(*sc.expect.slowBudget)
 		res.wgoSlowFraction = &f
 	}
-	if sc.expect.recoveryFrom != nil && selected.includes("wgo") {
+	if sc.expect.recoveryFrom != nil {
 		recovery := wgoSnapshot.scheduledSince(observedStart.Add(*sc.expect.recoveryFrom))
 		res.wgoRecovery = recovery.summary()
-		if sc.expect.slowBudget != nil && selected.includes("wgo") {
+		if sc.expect.slowBudget != nil {
 			res.wgoRecoverySlowFraction = recovery.slowFraction(*sc.expect.slowBudget)
 		}
 	}
 	if profile, ok := env.wgoClient.(interface{ RecoveryResponseDescription() string }); ok {
 		res.recoveryResponseDescription = profile.RecoveryResponseDescription()
 	}
-	descriptionClient := env.wgoClient
-	if descriptionClient == nil {
-		descriptionClient = env.kgoClient
-	}
-	if profile, ok := descriptionClient.(interface{ Describe() (string, string) }); ok {
+	if profile, ok := env.wgoClient.(interface{ Describe() (string, string) }); ok {
 		res.workloadDescription, res.workloadConfiguration = profile.Describe()
 	}
-	if sc.requireStaleFallback && selected.includes("wgo") {
+	if sc.requireStaleFallback {
 		prefix := ""
 		if builder, ok := env.wgoClient.(eventBuilder); ok {
 			prefix = builder.MetricsPrefix()
@@ -199,9 +191,6 @@ func runScenarioWarmupWithSpacing(ctx context.Context, env *environment, spacing
 		// Continue the series sequence; replaying the first batch cannot reach a
 		// partition that its hashes missed.
 		events := func(client produceClient) []scenarioEvent {
-			if client == nil {
-				return nil
-			}
 			if builder, ok := client.(eventBuilder); ok {
 				return []scenarioEvent{{records: builder.EventRecords(env.topic, env.numPartitions, at)}}
 			}
