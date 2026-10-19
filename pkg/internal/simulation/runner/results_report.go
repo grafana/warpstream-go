@@ -38,19 +38,21 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 		Kgo         clientResults `json:"kgo"`
 	}
 	type scenarioSuccess struct {
-		Scenario          string                 `json:"scenario"`
-		StaleFallback     *staleFallbackEvidence `json:"stale_fallback,omitempty"`
-		Wgo               clientResults          `json:"wgo"`
-		Kgo               clientResults          `json:"kgo"`
-		Failures          []string               `json:"failures,omitempty"`
-		Windows           []windowSuccess        `json:"windows,omitempty"`
-		WgoInjectedDelays map[int32]int64        `json:"wgo_injected_delay_selections,omitempty"`
-		KgoInjectedDelays map[int32]int64        `json:"kgo_injected_delay_selections,omitempty"`
+		Scenario          string                    `json:"scenario"`
+		StaleFallback     *staleFallbackEvidence    `json:"stale_fallback,omitempty"`
+		Wgo               clientResults             `json:"wgo"`
+		Kgo               clientResults             `json:"kgo"`
+		Failures          []string                  `json:"failures,omitempty"`
+		Windows           []windowSuccess           `json:"windows,omitempty"`
+		WgoInjectedDelays map[int32]int64           `json:"wgo_injected_delay_selections,omitempty"`
+		KgoInjectedDelays map[int32]int64           `json:"kgo_injected_delay_selections,omitempty"`
+		HedgeDiagnostics  []hedgeDiagnosticInterval `json:"hedge_diagnostics,omitempty"`
 	}
 	results := make([]scenarioSuccess, 0, len(rr.results.entries))
 	for _, res := range rr.results.entries {
 		entry := scenarioSuccess{
 			Scenario:          res.sc.name,
+			HedgeDiagnostics:  res.hedgeDiagnostics,
 			StaleFallback:     res.staleFallback,
 			WgoInjectedDelays: res.wgoLatencySelections, KgoInjectedDelays: res.kgoLatencySelections,
 			Wgo: clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
@@ -228,6 +230,7 @@ func (rr *resultsReport) writeScenarioSection(b *strings.Builder, res scenarioRe
 		b.WriteString("\n")
 	}
 	rr.writeBucketTable(b, res)
+	rr.writeHedgeDiagnostics(b, res.hedgeDiagnostics)
 	rr.writeErrorTable(b, res)
 	b.WriteString("\n")
 }

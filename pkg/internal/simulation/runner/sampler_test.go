@@ -17,8 +17,8 @@ func TestCounterSampler_RecordsInitialAndBucketBoundaries(t *testing.T) {
 	hedg := prometheus.NewCounter(prometheus.CounterOpts{Name: "h_total"})
 	reg.MustRegister(prim, hedg)
 
-	read := func() (int64, int64) {
-		return int64(testutil.ToFloat64(prim)), int64(testutil.ToFloat64(hedg))
+	read := func() counterSample {
+		return counterSample{primary: int64(testutil.ToFloat64(prim)), hedge: int64(testutil.ToFloat64(hedg))}
 	}
 
 	start := time.Now()
@@ -58,8 +58,8 @@ func TestCounterSampler_BoundariesAreAbsolute(t *testing.T) {
 
 	prim := prometheus.NewCounter(prometheus.CounterOpts{Name: "p"})
 	hedg := prometheus.NewCounter(prometheus.CounterOpts{Name: "h"})
-	read := func() (int64, int64) {
-		return int64(testutil.ToFloat64(prim)), int64(testutil.ToFloat64(hedg))
+	read := func() counterSample {
+		return counterSample{primary: int64(testutil.ToFloat64(prim)), hedge: int64(testutil.ToFloat64(hedg))}
 	}
 
 	start := time.Now()

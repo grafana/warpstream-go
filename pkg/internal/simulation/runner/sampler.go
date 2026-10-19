@@ -12,9 +12,10 @@ import (
 // counterSample is one snapshot of (primary, hedge) Produce request counts at a
 // known wall-clock time.
 type counterSample struct {
-	at      time.Time
-	primary int64
-	hedge   int64
+	at          time.Time
+	primary     int64
+	hedge       int64
+	diagnostics *hedgeDiagnostics
 }
 
 // counterSampler captures (primary, hedge) snapshots at exact bucket boundaries.
@@ -29,7 +30,7 @@ type counterSample struct {
 // instead of using a periodic ticker.
 type counterSampler struct {
 	bucketSize time.Duration
-	read       func() (primary, hedge int64)
+	read       func() counterSample
 
 	mu            sync.Mutex
 	start         time.Time
@@ -44,7 +45,7 @@ type counterSampler struct {
 
 // startCounterSampler takes the initial sample synchronously at start and then
 // schedules background samples at start + N*bucketSize.
-func startCounterSampler(start time.Time, bucketSize time.Duration, read func() (primary, hedge int64)) *counterSampler {
+func startCounterSampler(start time.Time, bucketSize time.Duration, read func() counterSample) *counterSampler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &counterSampler{
 		bucketSize: bucketSize,
@@ -59,9 +60,10 @@ func startCounterSampler(start time.Time, bucketSize time.Duration, read func() 
 }
 
 func (s *counterSampler) record(at time.Time) {
-	p, h := s.read()
+	sample := s.read()
+	sample.at = at
 	s.mu.Lock()
-	s.liveSnapshots = append(s.liveSnapshots, counterSample{at: at, primary: p, hedge: h})
+	s.liveSnapshots = append(s.liveSnapshots, sample)
 	s.mu.Unlock()
 }
 
@@ -124,19 +126,11 @@ func bucketDeltas(samples []counterSample) []counterBucketDelta {
 	return out
 }
 
-// readProduceCounters returns the (primary, hedge) Produce wire-request counts
-// from a wgo registry. Lookup is by metric name, which is the public Prometheus
-// contract.
-func readProduceCounters(reg prometheus.Gatherer) (primary, hedge int64) {
-	return gatherCounter(reg, "warpstream_produce_requests_primary_total"),
-		gatherCounter(reg, "warpstream_produce_requests_hedge_total")
-}
-
 // gatherCounter returns the value of the named counter from reg. It panics if
 // the metric is not registered — that's a contract bug the simulation should
 // fail fast on. The panic names the coupling: this package looks up Prometheus
 // names as exported by github.com/grafana/warpstream-go/pkg/wgo, so a rename
-// there must be mirrored here (see readProduceCounters).
+// there must be mirrored here (see readCounterSample).
 func gatherCounter(reg prometheus.Gatherer, name string) int64 {
 	mfs, err := reg.Gather()
 	if err != nil {
