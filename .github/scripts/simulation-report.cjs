@@ -69,6 +69,7 @@ function renderWorkload(title, reports) {
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
     'Three independent runs per scenario. Each client shows its lowest successful application writes / attempts across the three runs. Scenario gates are informational; build and harness errors still fail CI.', '',
+    '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing. The same code can produce 110/120 successful writes in one run and 80/120 in another.', '',
     'All individual runs, scenario gates, latency, fault and error details are available in the run artifacts.', ''];
   for (const workload of discoverWorkloads()) {
     const key = workload.name;

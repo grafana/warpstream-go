@@ -55,6 +55,10 @@ three runs. Integration harness unit tests run once in a separate job, in
 parallel with the build.
 Each run's full latency, fault and error report is retained as a CI artifact.
 
+Results below 100% success can vary because of randomness and wall-clock timing
+during testing. The same code can produce 110/120 successful writes in one run
+and 80/120 in another.
+
 CI uses `-check=false`: missed scenario expectations are included in the report,
 while build, unit-test and harness errors still fail their jobs. Local commands
 check expectations by default. PR comments are published for branches in this
