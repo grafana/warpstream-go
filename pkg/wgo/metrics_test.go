@@ -65,7 +65,7 @@ func TestFilteringRegisterer_DropsBlockedNames(t *testing.T) {
 // concepts. If kprom renames or adds one, this fails so the names this client
 // registers (and the filter that drops kprom's versions) can be kept in sync.
 func TestProducerStateMetricsMatchKprom(t *testing.T) {
-	// Unfiltered kprom, built from the same config newKgoClient uses, so this
+	// Unfiltered kprom, built from the same config newKgoClients uses, so this
 	// observes exactly the names a real client would (before the filter drops
 	// the producer-state ones).
 	reg := prometheus.NewPedanticRegistry()

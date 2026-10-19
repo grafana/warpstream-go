@@ -53,16 +53,30 @@ and **54% of agents classified faulty**. The default 30% faulty-fraction gate th
 suppresses proactive hedges. Disabling that gate alone did not improve success,
 so it does not explain the regression by itself.
 
-## Scope and follow-up
+## Fix
 
-The stacked investigation adds interval diagnostics and deterministic coverage of
-ordered-response blocking and deadline collateral failures. It preserves the
-transport and health policy from #127; the timeout regression remains open.
+Primary and fallback requests use separate franz-go clients and broker
+connections. A blocked primary cannot hold a fallback behind it. Both transports
+use the same authentication, deadlines and broker hooks. Only the primary owns
+SASL shutdown and lifecycle hooks, so sharing does not double-close credential
+resources or register metrics twice. One additional Produce connection may be
+opened per agent used by fallbacks.
 
-Further experiments should isolate stalled connections from fallback traffic or
-let an unresolved fallback race another candidate within the existing attempt
-budget. Any policy change needs matched timeout and 25%-slow-agent comparisons:
-restoring early connection cancellation would reintroduce the failure #127 fixes.
+When the original hedge decision permits racing, an unresolved fallback starts
+another candidate after the same hedge delay. This also applies after an early
+primary failure. Earlier legs stay eligible to win; exhausting the candidate
+budget stops dispatch but still waits for outstanding legs. Suppressed hedge
+decisions keep sequential failure retries. The maximum distinct-agent budget and
+bounded draining remain unchanged.
+
+The diagnostics and deterministic tests cover response ordering, primary/fallback
+connection isolation, deadline collateral failures, late fallback wins, primary
+failure followed by a stalled fallback, and shared-resource shutdown.
+
+Isolation alone passed 59/120 HTTP writes in an initial local timeout run.
+Adding timed fallback races passed 79/120 in the next run. These are individual
+exploratory results; repeated matched comparisons of the complete fix are needed
+alongside the 25%-slow-agent case.
 
 To reproduce using binaries built from each client revision:
 

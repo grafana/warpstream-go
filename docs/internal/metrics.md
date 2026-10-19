@@ -13,7 +13,9 @@ Connection and request-transport metrics (`connects_total`,
 `connect_errors_total`, `disconnects_total`, `write_bytes_total`,
 `write_errors_total`, `read_bytes_total`, `read_errors_total`, the request
 E2E/throttle histograms, …) come from kprom, attached as a hook on the embedded
-franz-go client.
+franz-go client. Primary and fallback transports share the same broker hooks and
+collectors; the fallback forwards only broker events, so it does not register or
+unregister collectors a second time.
 
 The client's produce requests still travel over franz-go's broker connections,
 so kprom's connection and transport hooks fire normally and these metrics need

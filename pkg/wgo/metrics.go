@@ -21,7 +21,7 @@ import (
 //   - Producer-state metrics (produceWire*) use franz-go/kprom-compatible names
 //     with no prefix, so this client is a drop-in replacement for a franz-go
 //     producer. They're tracked here because this client bypasses franz-go's
-//     producer state machine (see the kprom hook wired in newKgoClient).
+//     producer state machine (see the kprom hook wired in newKgoClients).
 type metrics struct {
 	hedgeAttemptsTotal           prometheus.Counter
 	hedgeWinsTotal               prometheus.Counter
