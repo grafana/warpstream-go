@@ -398,7 +398,7 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 			got := getProduceResultErr(res.error())
 			assert.Equal(t, "unknown_broker", got.reason)
 			assert.True(t, got.retriable)
-			assert.Equal(t, kerr.UnknownServerError.Code, got.code)
+			assert.Equal(t, kerr.BrokerNotAvailable.Code, got.code)
 
 			require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
 				# HELP warpstream_produce_direct_requests_failed_total Total number of direct Produce requests issued to a Warpstream agent that failed, by failure reason and routing-time agent state (healthy, or demoted if any partition in the attempt is a probe). The reason is a small set: canceled, timeout, transport, kafka_retriable_error, kafka_non_retriable_error, unknown, or a broker-call failure named unknown_broker, dial, tls, client_closed, or wire_other (a dial timeout is transport, not dial). Each retry counts as a separate request.

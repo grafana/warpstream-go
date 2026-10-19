@@ -141,23 +141,22 @@ func getProduceResultErr(err error) produceResultErr {
 		return produceResultErr{err: err, reason: "kafka_non_retriable_error", retriable: false, code: kerrErr.Code}
 	}
 	// The failure is local to this connection, so another agent may succeed.
-	// TLS and a closed client are not.
+	// TLS and a closed client are not. A retriable failure carries a retriable
+	// Kafka code because only the code survives a combined response, and
+	// UNKNOWN_SERVER_ERROR reads as non-retriable there.
 	if wire := (*wireError)(nil); errors.As(err, &wire) {
-		reason := "wire_other"
-		retriable := true
+		reason, code, retriable := "wire_other", kerr.NetworkException.Code, true
 		switch {
 		case errors.Is(err, kgo.ErrClientClosed):
-			reason = "client_closed"
-			retriable = false
+			reason, code, retriable = "client_closed", kerr.UnknownServerError.Code, false
 		case isTLSErr(err):
-			reason = "tls"
-			retriable = false
+			reason, code, retriable = "tls", kerr.UnknownServerError.Code, false
 		case isUnknownBrokerErr(err):
-			reason = "unknown_broker"
+			reason, code = "unknown_broker", kerr.BrokerNotAvailable.Code
 		case isNonTimeoutDialErr(err):
 			reason = "dial"
 		}
-		return produceResultErr{err: err, reason: reason, retriable: retriable, code: kerr.UnknownServerError.Code}
+		return produceResultErr{err: err, reason: reason, retriable: retriable, code: code}
 	}
 	return produceResultErr{err: err, reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code}
 }
