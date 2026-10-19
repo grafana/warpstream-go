@@ -51,7 +51,9 @@ completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
 jobs and posts each client's worst success count in one updated PR comment.
 The Mimir binary and simulation harness are built once and shared across the
-three runs. Integration harness unit tests run once in a separate job, in
+three runs. Each CI run splits the 20 scenarios into five batches of four on
+separate runners. Both clients run together within each scenario, preserving
+all comparison gates. Integration harness unit tests run once in a separate job, in
 parallel with the build.
 Each run's full latency, fault and error report is retained as a CI artifact.
 
@@ -70,6 +72,8 @@ Use the pinned source and current client checkout for comparisons with CI.
 Reports identify the supplied binary's Go version and linked client version;
 the default builder source pin does not assert the source of a supplied binary.
 Use `-scenario` with a regular expression to rerun selected scenarios.
+Use `-batch 1 -batches 5` to run the first of five batches. Batches select every
+fifth scenario after filtering, spreading the investigation cases across runners.
 Run `go test -race ./...` here for proxy, remote-write and observer unit tests.
 
 ## Investigation profile

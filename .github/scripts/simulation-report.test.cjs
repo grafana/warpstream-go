@@ -1,6 +1,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { renderWorkload, validateReport } = require('./simulation-report.cjs');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildReport, renderWorkload, validateReport } = require('./simulation-report.cjs');
 
 const row = (passes, failures = []) => ({ scenario: 'rolling restart', wgo: { attempts: 120, passes }, kgo: { attempts: 120, passes: 29 }, failures });
 
@@ -45,4 +48,42 @@ test('scenario expectation failures remain informational', () => {
   const report = renderWorkload('Direct client', reports);
   assert.match(report, /0\/120/);
   assert.match(report, /\*\*120\/120\*\*/);
+});
+
+function batchReports(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'simulation-batch-reports-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  for (const run of [1, 2, 3]) for (const batch of [1, 2, 3, 4, 5]) {
+    const target = path.join(directory, `simulation-mimir-${run}-batch-${batch}`);
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'report.json'), JSON.stringify([{ ...row(120 - run), scenario: `scenario ${batch}` }]));
+  }
+  return directory;
+}
+
+test('combines all scenario batches before computing worst of three', t => {
+  const output = buildReport(batchReports(t));
+  for (const batch of [1, 2, 3, 4, 5]) assert.ok(output.includes(`| scenario ${batch} | **117/120** | 29/120 |`));
+});
+
+test('missing batches invalidate only their scenario results', t => {
+  const directory = batchReports(t);
+  fs.rmSync(path.join(directory, 'simulation-mimir-2-batch-3'), { recursive: true });
+  const output = buildReport(directory);
+  assert.match(output, /Mimir: run 2, batch 3\/5 did not produce a report/);
+  assert.ok(output.includes('| scenario 3 | — | — |'));
+  assert.ok(output.includes('| scenario 1 | **117/120** | 29/120 |'));
+});
+
+test('rejects duplicated scenarios across batches', t => {
+  const directory = batchReports(t);
+  fs.writeFileSync(path.join(directory, 'simulation-mimir-1-batch-2/report.json'), JSON.stringify([{ ...row(120), scenario: 'scenario 1' }]));
+  assert.throws(() => buildReport(directory), /duplicate scenario/);
+});
+
+test('rejects changed scenario coverage even when a batch is missing', t => {
+  const directory = batchReports(t);
+  fs.rmSync(path.join(directory, 'simulation-mimir-2-batch-3'), { recursive: true });
+  fs.writeFileSync(path.join(directory, 'simulation-mimir-2-batch-1/report.json'), JSON.stringify([row(120)]));
+  assert.throws(() => buildReport(directory), /batch 1 scenario names differ/);
 });
