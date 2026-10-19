@@ -2,9 +2,14 @@ package wgo
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -229,6 +234,62 @@ func TestGetProduceResultErr(t *testing.T) {
 			err:  errors.New("something we don't recognise"),
 			want: produceResultErr{reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code},
 		},
+		"unwrapped unknown broker stays unknown": {
+			err:  errors.New("unknown broker"),
+			want: produceResultErr{reason: "unknown", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire unknown broker is named and retriable": {
+			err:  &wireError{err: errors.New("unknown broker")},
+			want: produceResultErr{reason: "unknown_broker", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire refused dial is named and retriable": {
+			err:  &wireError{err: &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}},
+			want: produceResultErr{reason: "dial", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire client closed is named and not retriable": {
+			err:  &wireError{err: kgo.ErrClientClosed},
+			want: produceResultErr{reason: "client_closed", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire certificate error is named and not retriable": {
+			err:  &wireError{err: x509.UnknownAuthorityError{}},
+			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire handshake alert is named and not retriable": {
+			err:  &wireError{err: tls.AlertError(42)},
+			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire dial timeout stays transport": {
+			err:  &wireError{err: &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}},
+			want: produceResultErr{reason: "transport", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire unknown broker with a suffix is wire_other": {
+			err:  &wireError{err: errors.New("unknown broker 5")},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire plaintext record header is tls and not retriable": {
+			err:  &wireError{err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}},
+			want: produceResultErr{reason: "tls", retriable: false, code: kerr.UnknownServerError.Code},
+		},
+		"wire-wrapped cancel stays canceled": {
+			err:  &wireError{err: context.Canceled},
+			want: produceResultErr{reason: "canceled", retriable: false, code: kerr.RequestTimedOut.Code},
+		},
+		"other wire error is one residual retriable reason": {
+			err:  &wireError{err: errors.New("broker replied with something new")},
+			want: produceResultErr{reason: "wire_other", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire-wrapped transport error stays transport": {
+			err:  &wireError{err: io.EOF},
+			want: produceResultErr{reason: "transport", retriable: true, code: kerr.UnknownServerError.Code},
+		},
+		"wire-wrapped deadline stays timeout": {
+			err:  &wireError{err: context.DeadlineExceeded},
+			want: produceResultErr{reason: "timeout", retriable: true, code: kerr.RequestTimedOut.Code},
+		},
+		"wire-wrapped non-retriable kerr stays a kafka error": {
+			err:  &wireError{err: kerr.MessageTooLarge},
+			want: produceResultErr{reason: "kafka_non_retriable_error", retriable: false, code: kerr.MessageTooLarge.Code},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -330,6 +391,48 @@ func TestProduceResultAccumulator_Accumulate(t *testing.T) {
 
 		assert.False(t, a.done())
 		assert.ErrorIs(t, a.result().err, kerr.LeaderNotAvailable)
+		assert.Len(t, a.remaining(), 1)
+	})
+
+	t.Run("agent-local wire error is not aborted", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: errors.New("unknown broker")}})
+
+		assert.False(t, a.done())
+		assert.Equal(t, "unknown_broker", a.lastErr.reason)
+		assert.True(t, a.lastErr.retriable)
+		assert.Len(t, a.remaining(), 1)
+	})
+
+	t.Run("canceled wire error aborts", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: context.Canceled}})
+
+		assert.True(t, a.done())
+		assert.Equal(t, "canceled", a.lastErr.reason)
+		assert.False(t, a.lastErr.retriable)
+	})
+
+	t.Run("tls wire error aborts", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: x509.UnknownAuthorityError{}}})
+
+		assert.True(t, a.done())
+		assert.Equal(t, "tls", a.lastErr.reason)
+		assert.False(t, a.lastErr.retriable)
+	})
+
+	t.Run("wire-wrapped transport error is not aborted", func(t *testing.T) {
+		a := mustNewProduceResultAccumulator(t, []encodedTopicPartitionRecords{makeTopicPartitionRecords("t", 0)})
+
+		a.accumulate(ProduceResult{err: &wireError{err: io.EOF}})
+
+		assert.False(t, a.done())
+		assert.Equal(t, "transport", a.lastErr.reason)
+		assert.True(t, a.lastErr.retriable)
 		assert.Len(t, a.remaining(), 1)
 	})
 
