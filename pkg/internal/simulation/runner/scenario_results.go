@@ -1,11 +1,16 @@
-package main
+package runner
 
 import "fmt"
 
 // scenarioResult holds everything the report and the pass/fail check need for one
 // scenario.
 type scenarioResult struct {
-	sc scenario
+	sc                                         scenario
+	staleFallback                              *staleFallbackEvidence
+	windows                                    []windowResult
+	wgoLatencySelections, kgoLatencySelections map[int32]int64
+	workloadDescription, workloadConfiguration string
+	recoveryResponseDescription                string
 
 	wgoSummary, kgoSummary         observationsSummary
 	wgoBuckets, kgoBuckets         []observationsSummary
@@ -106,6 +111,17 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 
+	if res.sc.requireStaleFallback {
+		if res.staleFallback == nil || res.staleFallback.BrokerOnlyWithdrawals == 0 || res.staleFallback.StaleRoutingResponses == 0 || res.staleFallback.FallbackErrors == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "stale fallback was not exercised by both discovery paths and real client errors"})
+		}
+		if res.staleFallback == nil || res.staleFallback.ThirdAttemptSuccesses == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no write completed after continuing to a third agent"})
+		}
+		if res.staleFallback != nil && res.staleFallback.TerminalErrors > 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%d retry cascades stopped at a terminal error", res.staleFallback.TerminalErrors)})
+		}
+	}
 	for _, phase := range res.sc.transportPhases {
 		for _, client := range []struct {
 			name  string
@@ -130,8 +146,27 @@ func checkResult(res scenarioResult) []scenarioFailure {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("no successful recovery Produce response (including probes) reached restored broker %d", phase.nodeID)})
 		}
 	}
+	if res.sc.hasInjectedDelays() {
+		for _, lane := range []struct {
+			name     string
+			selected map[int32]int64
+		}{{"wgo", res.wgoLatencySelections}, {"kgo", res.kgoLatencySelections}} {
+			var affected int64
+			for _, count := range lane.selected {
+				affected += count
+			}
+			if affected == 0 {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s: no Produce response selected for injected delay", lane.name)})
+			}
+		}
+	}
+	for _, broker := range res.sc.requiredWgoDelayBrokers {
+		if res.wgoLatencySelections[broker] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("wgo: no Produce response selected for injected delay on required broker %d", broker)})
+		}
+	}
 	if exp.recoveryFrom != nil {
-		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, eventSpacing))
+		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, res.sc.spacing()))
 		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
 			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
 			if exp.slowBudget != nil {

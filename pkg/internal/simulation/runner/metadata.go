@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"cmp"
@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
@@ -23,16 +24,47 @@ type metadataView struct {
 	template               *kmsg.MetadataResponse
 	mu                     sync.Mutex
 	missingLeaderResponses map[int32]int64
+	brokerOnlyWithdrawals  int64
+	staleRoutingResponses  int64
 }
 
 func installMetadataControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider) *metadataView {
+	return installMetadataPlacementControl(cluster, template, behaviours, false, false, -1)
+}
+
+func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider, singleAgent, dynamic bool, retainedFallback int32) *metadataView {
 	view := &metadataView{template: template}
 	view.current.Store(template)
 	cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
 		cluster.KeepControl()
 		// kfake reshuffles leaders during membership changes. Publish a complete
 		// scenario view so unrelated partitions never inherit those random leaders.
-		response := metadataWithoutBrokers(view.current.Load(), req.GetVersion(), behaviours.get().missingBrokers)
+		behaviour := behaviours.get()
+		response := metadataWithoutBrokers(view.current.Load(), req.GetVersion(), behaviour.missingBrokers)
+		if singleAgent {
+			preferred := int32(0)
+			if dynamic {
+				preferred = cluster.CurrentNode()
+			}
+			response = metadataPreferredPlacement(response, preferred, 3, retainedFallback)
+		}
+		metadataRequest := req.(*kmsg.MetadataRequest)
+		if len(behaviour.brokerOnlyMissing) > 0 {
+			brokerOnly := metadataRequest.Topics != nil && len(metadataRequest.Topics) == 0
+			if !brokerOnly && behaviour.topicMetadataDelay > 0 {
+				cluster.SleepControl(func() { time.Sleep(behaviour.topicMetadataDelay) })
+			}
+			if brokerOnly {
+				response = metadataWithoutBrokers(response, req.GetVersion(), behaviour.brokerOnlyMissing)
+			}
+			view.mu.Lock()
+			if brokerOnly {
+				view.brokerOnlyWithdrawals++
+			} else {
+				view.staleRoutingResponses++
+			}
+			view.mu.Unlock()
+		}
 		view.observeMissingLeaders(response)
 		return response, nil, true
 	})
@@ -131,4 +163,36 @@ func (view *metadataView) updateBroker(nodeID int32, broker *kmsg.MetadataRespon
 	}
 
 	view.current.Store(&next)
+}
+
+func metadataPreferredPlacement(template *kmsg.MetadataResponse, preferred int32, advertised int, retainedFallback int32) *kmsg.MetadataResponse {
+	response := *template
+	response.Brokers = nil
+	index := slices.IndexFunc(template.Brokers, func(b kmsg.MetadataResponseBroker) bool { return b.NodeID == preferred })
+	if index < 0 {
+		return template
+	}
+	for i := 0; i < min(advertised, len(template.Brokers)); i++ {
+		response.Brokers = append(response.Brokers, template.Brokers[(index+i)%len(template.Brokers)])
+	}
+	if len(response.Brokers) > 1 && !slices.ContainsFunc(response.Brokers, func(b kmsg.MetadataResponseBroker) bool { return b.NodeID == retainedFallback }) {
+		for _, broker := range template.Brokers {
+			if broker.NodeID == retainedFallback {
+				response.Brokers[len(response.Brokers)-1] = broker
+				break
+			}
+		}
+	}
+	response.Topics = slices.Clone(template.Topics)
+	for i := range response.Topics {
+		topic := &response.Topics[i]
+		topic.Partitions = slices.Clone(topic.Partitions)
+		for j := range topic.Partitions {
+			partition := &topic.Partitions[j]
+			partition.Leader = preferred
+			partition.Replicas = []int32{preferred}
+			partition.ISR = []int32{preferred}
+		}
+	}
+	return &response
 }
