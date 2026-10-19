@@ -134,7 +134,7 @@ jobs:
         run: go test -mod=mod -race -p 2 ./...
 
   simulation:
-    name: Simulation (${{ matrix.workload.name }}, ${{ matrix.run }})
+    name: Simulation (${{ matrix.workload.name }}, ${{ matrix.client }}, ${{ matrix.run }})
     needs: [simulation-workloads, simulation-build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -143,6 +143,7 @@ jobs:
       matrix:
         workload: ${{ fromJSON(needs.simulation-workloads.outputs.workloads) }}
         run: [1, 2, 3]
+        client: [wgo, kgo]
     defaults:
       run:
         working-directory: ${{ matrix.workload.directory }}
@@ -165,17 +166,18 @@ jobs:
       - name: Run simulation
         env:
           SIMULATION_TIMEOUT: ${{ matrix.workload.timeout }}
+          SIMULATION_CLIENT: ${{ matrix.client }}
           SIMULATION_BINARY: ${{ runner.temp }}/simulation-build/workload/${{ matrix.workload.name }}
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-report"
-          "$RUNNER_TEMP/simulation-build/harness" -timeout "$SIMULATION_TIMEOUT" -check=false \
+          "$RUNNER_TEMP/simulation-build/harness" -client "$SIMULATION_CLIENT" -timeout "$SIMULATION_TIMEOUT" -check=false \
             -report-filepath "$RUNNER_TEMP/simulation-report/report.md" \
             -json-report-filepath "$RUNNER_TEMP/simulation-report/report.json"
       - name: Upload simulation report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: simulation-${{ matrix.workload.name }}-${{ matrix.run }}
+          name: simulation-${{ matrix.workload.name }}-${{ matrix.client }}-${{ matrix.run }}
           path: ${{ runner.temp }}/simulation-report/
           if-no-files-found: ignore
       - name: Publish simulation report

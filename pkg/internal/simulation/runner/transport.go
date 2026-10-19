@@ -194,6 +194,9 @@ func (n *transportNetwork) observeProduce(nodeID int32) {
 }
 
 func (n *transportNetwork) snapshot() transportStats {
+	if n == nil {
+		return transportStats{}
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return transportStats{

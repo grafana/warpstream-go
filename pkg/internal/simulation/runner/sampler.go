@@ -89,6 +89,9 @@ func (s *counterSampler) run(ctx context.Context) {
 // current wall-clock time. Idempotent: the first call captures the defensive copy;
 // later calls return that same copy without recording again.
 func (s *counterSampler) stop() []counterSample {
+	if s == nil {
+		return nil
+	}
 	s.stopOnce.Do(func() {
 		s.cancel()
 		s.wg.Wait()

@@ -36,6 +36,9 @@ type eventBuilder interface {
 }
 
 func eventsForClient(client produceClient, topic string, partitions int32, duration, spacing time.Duration) []scenarioEvent {
+	if client == nil {
+		return nil
+	}
 	if builder, ok := client.(eventBuilder); ok {
 		var events []scenarioEvent
 		for at := time.Duration(0); at < duration; at += spacing {

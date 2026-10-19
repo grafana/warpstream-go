@@ -103,6 +103,9 @@ func (view *metadataView) observeMissingLeaders(response *kmsg.MetadataResponse)
 }
 
 func (view *metadataView) missingLeaders() map[int32]int64 {
+	if view == nil {
+		return nil
+	}
 	view.mu.Lock()
 	defer view.mu.Unlock()
 	return maps.Clone(view.missingLeaderResponses)

@@ -5,7 +5,7 @@ revision pinned in `mimir-version.txt` and builds its actual `cmd/mimir` with a
 `go.mod` replacement pointing at this checkout. Mimir source is unchanged. Build
 artifacts and the linked module manifest live under `.build/`.
 
-Each standard scenario launches two separate distributor processes, using Mimir's
+With both clients enabled, each standard scenario launches two separate distributor processes, using Mimir's
 `warpstream` and `kafka` ingest backends. Requests enter through the public
 Prometheus remote-write HTTP endpoint, with one tenant and 1600 series per request
 across 50 ingest partitions. The harness imports no Mimir implementation code.
@@ -29,8 +29,9 @@ degradation, pod kills, network blackholes, and rolling replacements. Produce
 responses receive the shared per-broker latency distributions on the TCP wire.
 Response order is preserved, while delays for concurrent requests overlap.
 
-Four scenarios run at a time by default, launching up to sixteen Mimir processes;
-use `-parallel` to change that limit. The default `all` profile includes all 15
+Four scenarios run at a time by default, launching up to sixteen Mimir processes
+with both clients locally, or eight in each CI client job. Use `-parallel` to
+change that limit. The default `all` profile includes all 15
 standard and five investigation scenarios
 and takes roughly 10–15 minutes plus binary build time. Use `-profile standard`
 for only the standard suite. During rolling restarts,
@@ -51,8 +52,9 @@ completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
 jobs and posts each client's worst success count in one updated PR comment.
 The Mimir binary and simulation harness are built once and shared across the
-three runs. Integration harness unit tests run once in a separate job, in
-parallel with the build.
+three runs of each client. The `wgo` and `kgo` clients run on separate runners;
+the report publisher combines their results by scenario. Integration harness
+unit tests run once in a separate job, in parallel with the build.
 Each run's full latency, fault and error report is retained as a CI artifact.
 
 Results below 100% success can vary because of randomness and wall-clock timing
@@ -70,6 +72,10 @@ Use the pinned source and current client checkout for comparisons with CI.
 Reports identify the supplied binary's Go version and linked client version;
 the default builder source pin does not assert the source of a supplied binary.
 Use `-scenario` with a regular expression to rerun selected scenarios.
+Use `-client wgo` or `-client kgo` to run one client; the default `-client both`
+runs both clients locally. Success-delta gates require both clients and are
+omitted from single-client runs. Each lane checks its own fault evidence; wgo
+also retains its availability, latency, and recovery gates.
 Run `go test -race ./...` here for proxy, remote-write and observer unit tests.
 
 ## Investigation profile

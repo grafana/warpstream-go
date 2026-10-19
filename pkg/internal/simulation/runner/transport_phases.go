@@ -55,6 +55,9 @@ func (env *environment) applyTransportPhase(phase transportPhase) error {
 	}{
 		{env.wgoCluster, env.wgoNetwork, env.wgoMetadata}, {env.kgoCluster, env.kgoNetwork, env.kgoMetadata},
 	} {
+		if target.cluster == nil {
+			continue
+		}
 		switch phase.action {
 		case killPod:
 			target.network.setFault(phase.nodeID, transportKilled)
