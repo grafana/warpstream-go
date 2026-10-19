@@ -140,6 +140,8 @@ jobs:
   simulation:
     name: Simulation (${{ matrix.workload.name }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
     needs: [simulation-workloads, simulation-build]
+    # A failed workload build must not suppress suites with usable artifacts.
+    if: ${{ !cancelled() && needs.simulation-workloads.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
