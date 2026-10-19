@@ -50,6 +50,9 @@ Fake brokers acknowledge without persisting writes. Results measure HTTP
 completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
 jobs and posts each client's worst success count in one updated PR comment.
+The Mimir binary and simulation harness are built once and shared across the
+three runs. Integration harness unit tests run once in a separate job, in
+parallel with the build.
 Each run's full latency, fault and error report is retained as a CI artifact.
 
 CI uses `-check=false`: missed scenario expectations are included in the report,
