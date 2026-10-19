@@ -69,6 +69,12 @@ budget stops dispatch but still waits for outstanding legs. Suppressed hedge
 decisions keep sequential failure retries. The maximum distinct-agent budget and
 bounded draining remain unchanged.
 
+Canceled losing primary legs can still hit retained deadlines and close their
+connections. Collateral connection errors after cancellation remain in raw metrics but are
+excluded from agent health. Actual request deadlines, live leg failures and
+broker-reported errors still count. This prevents completed
+writes' losing drains from building a false cluster-wide fault signal.
+
 The diagnostics and deterministic tests cover response ordering, primary/fallback
 connection isolation, deadline collateral failures, late fallback wins, primary
 failure followed by a stalled fallback, and shared-resource shutdown.

@@ -19,7 +19,9 @@ unregister collectors a second time.
 
 The client's produce requests still travel over franz-go's broker connections,
 so kprom's connection and transport hooks fire normally and these metrics need
-no special handling.
+no special handling. Raw transport failures are counted even after a hedge loses;
+the agent-health tracker separately excludes collateral connection failures on
+canceled legs, while retaining actual deadlines and broker-reported errors.
 
 ## 2. Producer-state metrics — tracked by the client, under kprom names
 
