@@ -17,7 +17,11 @@ type scenarioResult struct {
 	// wgoSlowFraction is the fraction of wgo observations whose latency
 	// exceeded sc.expect.slowBudget. Set only when that expectation is
 	// configured; nil otherwise.
-	wgoSlowFraction *float64
+	wgoSlowFraction                      *float64
+	wgoRecovery                          observationsSummary
+	wgoRecoverySlowFraction              float64
+	wgoTransport, kgoTransport           transportStats
+	wgoMissingLeaders, kgoMissingLeaders map[int32]int64
 }
 
 // successRate returns the wgo app-level success fraction, or 0 when nothing was
@@ -102,6 +106,45 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 
+	for _, phase := range res.sc.transportPhases {
+		for _, client := range []struct {
+			name  string
+			stats transportStats
+		}{{"wgo", res.wgoTransport}, {"kgo", res.kgoTransport}} {
+			stats := client.stats.byBroker[phase.nodeID]
+			if (phase.action == killPod || phase.action == removePod || phase.action == withdrawPod) && stats.closedConnections == 0 || phase.action == blackholePod && stats.droppedBytes == 0 {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s transport fault on broker %d did not affect live traffic", client.name, phase.nodeID)})
+			}
+		}
+		if phase.action == withdrawPod {
+			for _, client := range []struct {
+				name      string
+				responses map[int32]int64
+			}{{"wgo", res.wgoMissingLeaders}, {"kgo", res.kgoMissingLeaders}} {
+				if client.responses[phase.nodeID] == 0 {
+					out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s was served no Metadata response naming withdrawn broker %d as leader", client.name, phase.nodeID)})
+				}
+			}
+		}
+		if (phase.action == restorePod || phase.action == replacePod) && res.wgoTransport.recoveredResponses[phase.nodeID] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("no successful recovery Produce response (including probes) reached restored broker %d", phase.nodeID)})
+		}
+	}
+	if exp.recoveryFrom != nil {
+		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, eventSpacing))
+		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
+			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
+			if exp.slowBudget != nil {
+				detail += fmt.Sprintf("; %.1f%% slower than %s", 100*res.wgoRecoverySlowFraction, *exp.slowBudget)
+			}
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: detail})
+		}
+	}
+	if exp.maxHedgeSurge != nil {
+		if res.totalPrimary == 0 || float64(res.totalHedge)/float64(res.totalPrimary) > *exp.maxHedgeSurge {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("hedge surge: %d hedges / %d primaries exceeds %.0f%% budget", res.totalHedge, res.totalPrimary, 100**exp.maxHedgeSurge)})
+		}
+	}
 	return out
 }
 
