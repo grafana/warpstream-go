@@ -10,6 +10,7 @@ test('discovers the direct suite without requiring integration modules', t => {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'pkg/internal/simulation'), { recursive: true });
   assert.deepEqual(discoverWorkloads(root).map(w => w.name), ['direct']);
+  assert.equal(discoverWorkloads(root)[0].batches, 1);
 });
 
 test('discovers nested Go modules and skips ordinary source directories', t => {
@@ -22,6 +23,7 @@ test('discovers nested Go modules and skips ordinary source directories', t => {
   assert.deepEqual(discoverWorkloads(root).map(w => w.name), ['direct', 'integration']);
   assert.equal(discoverWorkloads(root)[1].goVersionFile, 'pkg/internal/simulation/integration/go.mod');
   assert.equal(discoverWorkloads(root)[1].timeout, '20m');
+  assert.equal(discoverWorkloads(root)[1].batches, 5);
 });
 
 test('rejects names that cannot safely identify CI artifacts', t => {

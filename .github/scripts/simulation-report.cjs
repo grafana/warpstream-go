@@ -31,7 +31,7 @@ function escapeCell(value) {
   return value.replaceAll('|', '\\|').replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('@', '@\u200b').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-function renderWorkload(title, reports) {
+function renderWorkload(title, reports, incomplete = false) {
   const available = reports.filter(Boolean);
   const lines = [`### ${title}`, ''];
   for (let i = 0; i < reports.length; i++) {
@@ -39,9 +39,9 @@ function renderWorkload(title, reports) {
   }
   if (!available.length) return lines.join('\n');
   for (const rows of available) validateReport(rows);
-  const expected = available[0].map(r => r.scenario).sort();
+  const expected = [...new Set(available.flatMap(rows => rows.map(r => r.scenario)))].sort();
   for (const rows of available) {
-    if (JSON.stringify(rows.map(r => r.scenario).sort()) !== JSON.stringify(expected)) {
+    if (!incomplete && JSON.stringify(rows.map(r => r.scenario).sort()) !== JSON.stringify(expected)) {
       throw new Error(`${title}: scenario names differ between runs`);
     }
   }
@@ -56,7 +56,7 @@ function renderWorkload(title, reports) {
       const attempts = rows.filter(Boolean).map(row => row[client].attempts);
       if (attempts.some(value => value !== attempts[0])) throw new Error(`${title}: attempt counts differ between runs`);
       const passes = rows.filter(Boolean).map(row => row[client].passes);
-      cells.push(available.length === 3 ? `${Math.min(...passes)}/${attempts[0]}` : '—');
+      cells.push(passes.length === 3 ? `${Math.min(...passes)}/${attempts[0]}` : '—');
       successRates.push(Math.min(...passes) / attempts[0]);
     }
     const best = successRates[0] >= successRates[1] ? 0 : 1;
@@ -69,17 +69,32 @@ function renderWorkload(title, reports) {
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
     'Three independent runs per scenario. Each client shows its lowest successful application writes / attempts across the three runs. Scenario gates are informational; build and harness errors still fail CI.', '',
+    '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing. The same code can produce 110/120 successful writes in one run and 80/120 in another.', '',
     'All individual runs, scenario gates, latency, fault and error details are available in the run artifacts.', ''];
   for (const workload of discoverWorkloads()) {
     const key = workload.name;
     const title = key === 'direct' ? 'Direct client' : key[0].toUpperCase() + key.slice(1);
+    let incomplete = false;
+    const batchNames = new Map();
     const reports = [1, 2, 3].map(run => {
-      const file = path.join(directory, `simulation-${key}-${run}`, 'report.json');
-      if (!fs.existsSync(file)) return null;
-      if (fs.statSync(file).size > 1024 * 1024) throw new Error('Simulation report too large');
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
+      const rows = [];
+      for (let batch = 1; batch <= workload.batches; batch++) {
+        const file = path.join(directory, `simulation-${key}-${run}-batch-${batch}`, 'report.json');
+        if (!fs.existsSync(file)) {
+          incomplete = true;
+          sections.push(`${title}: run ${run}, batch ${batch}/${workload.batches} did not produce a report; see the failed CI job.`, '');
+          continue;
+        }
+        if (fs.statSync(file).size > 1024 * 1024) throw new Error('Simulation report too large');
+        const batchRows = validateReport(JSON.parse(fs.readFileSync(file, 'utf8')));
+        const names = JSON.stringify(batchRows.map(row => row.scenario).sort());
+        if (batchNames.has(batch) && batchNames.get(batch) !== names) throw new Error(`${title}: batch ${batch} scenario names differ between runs`);
+        batchNames.set(batch, names);
+        rows.push(...batchRows);
+      }
+      return rows.length ? validateReport(rows) : null;
     });
-    sections.push(renderWorkload(title, reports), '');
+    sections.push(renderWorkload(title, reports, incomplete), '');
   }
   if (source) sections.push(source, '');
   sections.push('**Bold** marks the better success rate in each row; ties highlight wgo only.', '');

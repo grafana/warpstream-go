@@ -43,15 +43,23 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       workloads: ${{ steps.workloads.outputs.workloads }}
+      integrations: ${{ steps.workloads.outputs.integrations }}
+      batches: ${{ steps.workloads.outputs.batches }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: workloads
-        run: echo "workloads=$(node .github/scripts/simulation-workloads.cjs)" >> "$GITHUB_OUTPUT"
+        run: |
+          workloads=$(node .github/scripts/simulation-workloads.cjs)
+          {
+            echo "workloads=$workloads"
+            echo "integrations=$(jq -c '[.[] | select(.name != "direct")]' <<< "$workloads")"
+            echo "batches=$(node .github/scripts/simulation-workloads.cjs --batches)"
+          } >> "$GITHUB_OUTPUT"
 
-  simulation:
-    name: Simulation (${{ matrix.workload.name }}, ${{ matrix.run }})
+  simulation-build:
+    name: Build simulation (${{ matrix.workload.name }})
     needs: [simulation-workloads]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -59,7 +67,57 @@ jobs:
       fail-fast: false
       matrix:
         workload: ${{ fromJSON(needs.simulation-workloads.outputs.workloads) }}
-        run: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: ${{ matrix.workload.directory }}
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.workload.goVersionFile }}
+          # The faster test job must not claim the integration build's cache key.
+          cache-dependency-path: |
+            go.sum
+            pkg/internal/simulation/**/go.sum
+            pkg/internal/simulation/**/*-version.txt
+            pkg/internal/simulation/**/build-*.sh
+      - name: Build integration workload
+        if: matrix.workload.name != 'direct'
+        run: |
+          for build in build-*.sh; do
+            if [ -f "$build" ]; then
+              bash "$build" "$RUNNER_TEMP/simulation-build/workload"
+            fi
+          done
+      - name: Build simulation harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/simulation-build"
+          go build -mod=mod -p 2 -o "$RUNNER_TEMP/simulation-build/harness" .
+      # Tar preserves executable permissions across artifact upload/download.
+      - name: Package simulation executables
+        run: tar -czf "$RUNNER_TEMP/simulation-build.tar.gz" -C "$RUNNER_TEMP/simulation-build" .
+      - name: Upload simulation executables
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-simulation-${{ matrix.workload.name }}
+          path: ${{ runner.temp }}/simulation-build.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+  simulation-harness-test:
+    name: Test integration harness (${{ matrix.workload.name }})
+    needs: [simulation-workloads]
+    if: needs.simulation-workloads.outputs.integrations != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: ${{ fromJSON(needs.simulation-workloads.outputs.integrations) }}
     defaults:
       run:
         working-directory: ${{ matrix.workload.directory }}
@@ -76,32 +134,57 @@ jobs:
             go.sum
             pkg/internal/simulation/**/go.sum
             pkg/internal/simulation/**/*-version.txt
-      - name: Build integration workload
-        if: matrix.workload.name != 'direct'
-        run: |
-          for build in build-*.sh; do
-            if [ -f "$build" ]; then
-              bash "$build" "$RUNNER_TEMP/simulation-build"
-            fi
-          done
       - name: Test integration harness
-        if: matrix.workload.name != 'direct'
         run: go test -mod=mod -race -p 2 ./...
+
+  simulation:
+    name: Simulation (${{ matrix.workload.name }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
+    needs: [simulation-workloads, simulation-build]
+    # A failed workload build must not suppress suites with usable artifacts.
+    if: ${{ !cancelled() && needs.simulation-workloads.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: ${{ fromJSON(needs.simulation-workloads.outputs.batches) }}
+        run: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: ${{ matrix.workload.directory }}
+    env:
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download simulation executables
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-simulation-${{ matrix.workload.name }}
+          path: ${{ runner.temp }}
+      - name: Extract simulation executables
+        run: |
+          mkdir -p "$RUNNER_TEMP/simulation-build"
+          tar -xzf "$RUNNER_TEMP/simulation-build.tar.gz" -C "$RUNNER_TEMP/simulation-build"
       # Wall-clock outcomes vary between runs; report expectations without gating CI.
       - name: Run simulation
         env:
           SIMULATION_TIMEOUT: ${{ matrix.workload.timeout }}
-          SIMULATION_BINARY: ${{ runner.temp }}/simulation-build/${{ matrix.workload.name }}
+          SIMULATION_BATCH: ${{ matrix.workload.batch }}
+          SIMULATION_BATCHES: ${{ matrix.workload.batches }}
+          SIMULATION_BINARY: ${{ runner.temp }}/simulation-build/workload/${{ matrix.workload.name }}
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-report"
-          go run -mod=mod -p 2 . -timeout "$SIMULATION_TIMEOUT" -check=false \
+          "$RUNNER_TEMP/simulation-build/harness" -timeout "$SIMULATION_TIMEOUT" -check=false \
+            -batch "$SIMULATION_BATCH" -batches "$SIMULATION_BATCHES" \
             -report-filepath "$RUNNER_TEMP/simulation-report/report.md" \
             -json-report-filepath "$RUNNER_TEMP/simulation-report/report.json"
       - name: Upload simulation report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: simulation-${{ matrix.workload.name }}-${{ matrix.run }}
+          name: simulation-${{ matrix.workload.name }}-${{ matrix.run }}-batch-${{ matrix.workload.batch }}
           path: ${{ runner.temp }}/simulation-report/
           if-no-files-found: ignore
       - name: Publish simulation report

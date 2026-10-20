@@ -26,6 +26,8 @@ func Main(factory WorkloadFactory) {
 	}
 	profile := flag.String("profile", defaultProfile, "scenario profile: standard, all, or mimir-investigation (last two require external workloads)")
 	pattern := flag.String("scenario", "", "run scenarios whose names match this regular expression")
+	batch := flag.Int("batch", 1, "one-based scenario batch to run")
+	batches := flag.Int("batches", 1, "number of batches to split the selected scenarios across")
 	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
 	flag.Parse()
 	available, err := profileScenarios(*profile, factory != nil)
@@ -34,6 +36,11 @@ func Main(factory WorkloadFactory) {
 		os.Exit(1)
 	}
 	selected, err := filterScenarios(*pattern, available)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	selected, err = batchScenarios(selected, *batch, *batches)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -99,6 +106,19 @@ func filterScenarios(pattern string, available []scenario) ([]scenario, error) {
 	}
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no scenarios match %q", pattern)
+	}
+	return selected, nil
+}
+
+func batchScenarios(available []scenario, batch, batches int) ([]scenario, error) {
+	if batches < 1 || batch < 1 || batch > batches || batches > len(available) {
+		return nil, fmt.Errorf("invalid scenario batch %d/%d for %d scenarios", batch, batches, len(available))
+	}
+	var selected []scenario
+	for i, sc := range available {
+		if i%batches == batch-1 {
+			selected = append(selected, sc)
+		}
 	}
 	return selected, nil
 }
