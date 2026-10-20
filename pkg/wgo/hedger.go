@@ -222,6 +222,10 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	// already moved on to the fallback path.
 	primaryCh := make(chan ProduceResult, 1)
 	go func() {
+		if err := workCtx.Err(); err != nil {
+			primaryCh <- ProduceResult{err: err}
+			return
+		}
 		h.metrics.produceRequestsPrimaryTotal.Inc()
 		h.metrics.observeAttempt(attemptPrimary, sumEncodedStats(routedPartitions))
 		primaryCh <- h.withCoverageCheck(h.inner.ProduceSync(workCtx, agentFromRouted(primaryID, routedPartitions), partitions), primaryID, partitions)

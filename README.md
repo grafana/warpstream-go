@@ -105,6 +105,8 @@ The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequ
 
 An attempt canceled before it starts is not sent. Once started, it keeps the earlier of its inherited deadline and `ProduceRequestTimeout + ProduceRequestTimeoutOverhead`, even if a hedge wins first. Canceling a raw broker request would close its shared connection and fail other in-flight writes. Draining the losing request avoids those failures, preserves its actual latency and outcome for agent health, and does not delay returning the hedge winner. Closing the embedded franz-go client still interrupts the request.
 
+Primaries canceled before dispatch do not count toward primary-attempt metrics. Losing hedge legs drain, so they do not increment direct-request failures with reason `canceled`; that reason can still appear during client shutdown. See [metrics notes](docs/internal/metrics.md).
+
 ### Hooks
 
 The client accepts [franz-go hooks](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Hook)

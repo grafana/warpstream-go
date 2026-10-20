@@ -52,6 +52,13 @@ and attempt accounting, and client-boundary record counters. They carry a
 `warpstream_` prefix so they never collide with franz-go/kprom names and are
 unambiguously backend-specific.
 
+Started direct requests drain after a hedge wins, so hedge cancellation does
+not contribute to the `canceled` reason on direct-request failure counters or
+latency histograms. Attempts canceled before dispatch do not contribute to
+primary-attempt counters or direct-request metrics. The `canceled` reason can
+still occur when client shutdown interrupts an in-flight request; dashboards
+should not use it as a count of losing hedge legs.
+
 ## 4. Build info — `warpstream_client_build_info`
 
 One gauge, `warpstream_client_build_info`, is not behavioural. It is always
