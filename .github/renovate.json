@@ -38,6 +38,18 @@
                 "github.com/twmb/franz-go/pkg/kmsg"
             ],
             "enabled": false
+        },
+        {
+            "description": "Mimir imports these directly and ships older versions, a newer wgo requirement would move Mimir on revendor (see #130). Lift when Mimir bumps them",
+            "matchManagers": [
+                "gomod"
+            ],
+            "matchPackageNames": [
+                "github.com/klauspost/compress",
+                "github.com/pierrec/lz4/v4",
+                "github.com/prometheus/common"
+            ],
+            "enabled": false
         }
     ]
 }
