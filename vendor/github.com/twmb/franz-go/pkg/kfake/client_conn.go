@@ -1,7 +1,6 @@
 package kfake
 
 import (
-	"bufio"
 	"encoding/binary"
 	"io"
 	"net"
@@ -16,7 +15,6 @@ type (
 		c      *Cluster
 		b      *broker
 		conn   net.Conn
-		br     *bufio.Reader // buffers reads so a small request's size and body usually arrive in one read
 		respCh chan clientResp
 		done   chan struct{} // closed when read() returns
 		mute   chan bool     // capacity 1: serializes request processing per connection; false = stop reading
@@ -35,12 +33,13 @@ type (
 	}
 
 	clientReq struct {
-		cc     *clientConn
-		kreq   kmsg.Request
-		at     time.Time
-		cid    string
-		corr   int32
-		faults *faultCheck // faults that can match this request, see Fault
+		cc        *clientConn
+		kreq      kmsg.Request
+		at        time.Time
+		cid       string
+		corr      int32
+		seq       uint32
+		topicMeta topicMetaSnap // snapshot for group assignment (consumer/share)
 
 		// Pre-validated error topics to merge into the response,
 		// used when TopicID resolution fails for some topics while
@@ -52,7 +51,8 @@ type (
 		kresp kmsg.Response
 		corr  int32
 		err   error
-		skip  bool // acks=0 produce: nothing to write, just unmute
+		seq   uint32
+		skip  bool // acks=0 produce: nothing to write, just advance seq
 	}
 )
 
@@ -70,47 +70,54 @@ func (cc *clientConn) unmute(ok bool) {
 }
 
 // reply sends a response back to the client, respecting connection close
-// and cluster shutdown. It returns false if the client will never see the
-// response, either because the connection died or because the cluster is
-// shutting down.
-func (creq *clientReq) reply(kresp kmsg.Response) bool {
+// and cluster shutdown. Used by manage goroutines (groups, share groups)
+// that handle requests asynchronously.
+func (creq *clientReq) reply(kresp kmsg.Response) {
 	select {
-	case creq.cc.respCh <- clientResp{kresp: kresp, corr: creq.corr}:
-		return true
+	case creq.cc.respCh <- clientResp{kresp: kresp, corr: creq.corr, seq: creq.seq}:
 	case <-creq.cc.done:
 	case <-creq.cc.c.die:
 	}
-	return false
 }
 
 func (cc *clientConn) read() {
 	defer close(cc.done)
 	defer cc.conn.Close()
 
-	// The cluster dying closes the connection, which is what returns us
-	// from a blocked read (and write from a blocked write).
-	go func() {
-		select {
-		case <-cc.c.die:
-			cc.conn.Close()
-		case <-cc.done:
-		}
-	}()
-
+	type read struct {
+		body []byte
+		err  error
+	}
 	var (
-		who  = cc.conn.RemoteAddr()
-		size = make([]byte, 4)
+		who    = cc.conn.RemoteAddr()
+		size   = make([]byte, 4)
+		readCh = make(chan read, 1)
+		seq    uint32
 	)
 	for {
-		if _, err := io.ReadFull(cc.br, size); err != nil {
+		go func() {
+			if _, err := io.ReadFull(cc.conn, size); err != nil {
+				readCh <- read{err: err}
+				return
+			}
+			body := make([]byte, binary.BigEndian.Uint32(size))
+			_, err := io.ReadFull(cc.conn, body)
+			readCh <- read{body: body, err: err}
+		}()
+
+		var read read
+		select {
+		case <-cc.c.die:
 			return
+		case read = <-readCh:
 		}
-		body := make([]byte, binary.BigEndian.Uint32(size))
-		if _, err := io.ReadFull(cc.br, body); err != nil {
+
+		if err := read.err; err != nil {
 			return
 		}
 
 		var (
+			body     = read.body
 			reader   = kbin.Reader{Src: body}
 			key      = reader.Int16()
 			version  = reader.Int16()
@@ -148,7 +155,8 @@ func (cc *clientConn) read() {
 			return
 		}
 		select {
-		case cc.c.reqCh <- &clientReq{cc: cc, kreq: kreq, at: time.Now(), cid: cid, corr: corr}:
+		case cc.c.reqCh <- &clientReq{cc: cc, kreq: kreq, at: time.Now(), cid: cid, corr: corr, seq: seq}:
+			seq++
 		case <-cc.c.die:
 			return
 		}
@@ -159,20 +167,42 @@ func (cc *clientConn) write() {
 	defer cc.conn.Close()
 
 	var (
-		who = cc.conn.RemoteAddr()
-		buf []byte
+		who     = cc.conn.RemoteAddr()
+		writeCh = make(chan error, 1)
+		buf     []byte
+		seq     uint32
+
+		// If a request is by necessity slow (join&sync), and the
+		// client sends another request down the same conn, we can
+		// actually handle them out of order because group state is
+		// managed independently in its own loop. To ensure
+		// serialization, we capture out of order responses and only
+		// send them once the prior requests are replied to.
+		//
+		// (this is also why there is a seq in the clientReq)
+		oooresp = make(map[uint32]clientResp)
 	)
 	for {
-		var resp clientResp
-		select {
-		case resp = <-cc.respCh:
-		case <-cc.done:
-			return
-		case <-cc.c.die:
-			return
+		resp, ok := oooresp[seq]
+		if !ok {
+			select {
+			case resp = <-cc.respCh:
+				if resp.seq != seq {
+					oooresp[resp.seq] = resp
+					continue
+				}
+				seq = resp.seq + 1
+			case <-cc.done:
+				return
+			case <-cc.c.die:
+				return
+			}
+		} else {
+			delete(oooresp, seq)
+			seq++
 		}
-		// acks=0 produce: no response bytes exist, we only unmute so
-		// that read() can submit the next request.
+		// acks=0 produce: no response bytes exist for this sequence
+		// number; the sentinel only advances seq (above) and unmutes.
 		if resp.skip {
 			cc.unmute(true)
 			continue
@@ -192,7 +222,17 @@ func (cc *clientConn) write() {
 		binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
 		binary.BigEndian.PutUint32(buf[4:8], uint32(resp.corr))
 
-		_, err := cc.conn.Write(buf)
+		go func() {
+			_, err := cc.conn.Write(buf)
+			writeCh <- err
+		}()
+
+		var err error
+		select {
+		case <-cc.c.die:
+			return
+		case err = <-writeCh:
+		}
 		cc.unmute(err == nil)
 		if err != nil {
 			return

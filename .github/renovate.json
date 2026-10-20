@@ -16,5 +16,28 @@
     "vulnerabilityAlerts": {
         "enabled": true
     },
-    "osvVulnerabilityAlerts": true
+    "osvVulnerabilityAlerts": true,
+    "packageRules": [
+        {
+            "description": "Keep franz-go on what Mimir ships until Mimir can take 1.22.x (see #108, #129)",
+            "matchManagers": [
+                "gomod"
+            ],
+            "matchPackageNames": [
+                "github.com/twmb/franz-go"
+            ],
+            "allowedVersions": "<=1.21.6"
+        },
+        {
+            "description": "kfake digest bumps pull franz-go forward (#112), hold them too",
+            "matchManagers": [
+                "gomod"
+            ],
+            "matchPackageNames": [
+                "github.com/twmb/franz-go/pkg/kfake",
+                "github.com/twmb/franz-go/pkg/kmsg"
+            ],
+            "enabled": false
+        }
+    ]
 }

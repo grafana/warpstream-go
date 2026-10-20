@@ -118,12 +118,10 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	}
 	createCluster := func() (*kfake.Cluster, string, error) {
 		if sc.profile != nil && sc.profile.singleAgent {
-			cluster, createErr := kfake.NewCluster(kfake.NumBrokers(int(brokers)), kfake.SeedTopics(metadataPartitions, topicName))
+			// Seed both topics: Cluster.CreateTopic needs a kfake that requires franz-go >= 1.21.7.
+			cluster, createErr := kfake.NewCluster(kfake.NumBrokers(int(brokers)),
+				kfake.SeedTopics(metadataPartitions, topicName), kfake.SeedTopics(secondaryPartitions, secondaryTopicName))
 			if createErr != nil {
-				return nil, "", createErr
-			}
-			if createErr = cluster.CreateTopic(secondaryTopicName, secondaryPartitions, nil); createErr != nil {
-				cluster.Close()
 				return nil, "", createErr
 			}
 			return cluster, cluster.ListenAddrs()[0], nil

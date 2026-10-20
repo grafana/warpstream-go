@@ -8,9 +8,9 @@ require (
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/stretchr/testify v1.12.1
-	github.com/twmb/franz-go v1.22.2
-	github.com/twmb/franz-go/pkg/kfake v0.0.0-20261013022759-7b6cac30a57a
-	github.com/twmb/franz-go/pkg/kmsg v1.15.0
+	github.com/twmb/franz-go v1.21.6
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260820024614-9b174ed31afe
+	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	github.com/twmb/franz-go/plugin/kprom v1.5.0
 	google.golang.org/protobuf v1.36.12
 )
