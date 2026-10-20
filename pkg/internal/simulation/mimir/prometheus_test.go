@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/snappy"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -55,6 +58,45 @@ func TestPrometheus_RetryRemoteWrite(t *testing.T) {
 	require.Positive(t, evidence["samples_retried_total"])
 	require.Zero(t, evidence["samples_failed_total"])
 	require.Positive(t, evidence["samples_total"])
+	var accepted, rejected int64
+	for _, attempt := range attempts {
+		if attempt.Error == nil {
+			accepted += attempt.Samples
+		} else {
+			rejected += attempt.Samples
+		}
+	}
+	require.Positive(t, accepted)
+	require.Positive(t, rejected)
+	require.Equal(t, float64(accepted), evidence["samples_accepted_observed_total"])
+}
+
+func TestPrometheus_CountSamplesPreservesPayload(t *testing.T) {
+	request := prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{Samples: []prompb.Sample{{Value: 1}, {Value: 2}}},
+		{Samples: []prompb.Sample{{Value: 3}}},
+	}}
+	data, err := request.Marshal()
+	require.NoError(t, err)
+	body := snappy.Encode(nil, data)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/push", bytes.NewReader(body))
+	count, err := remoteWriteSamples(r)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), count)
+	forwarded, err := io.ReadAll(r.Body)
+	require.NoError(t, err)
+	require.Equal(t, body, forwarded)
+}
+
+func TestPrometheus_RejectInvalidSampleMeasurement(t *testing.T) {
+	for _, body := range [][]byte{[]byte("bad snappy"), snappy.Encode(nil, []byte{0xff})} {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/push", bytes.NewReader(body))
+		_, err := remoteWriteSamples(r)
+		require.Error(t, err)
+		forwarded, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.Equal(t, body, forwarded)
+	}
 }
 
 func TestPrometheus_RecordsDoNotInjectHTTP(t *testing.T) {

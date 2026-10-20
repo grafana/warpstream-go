@@ -22,6 +22,10 @@ function validateReport(rows) {
           !Number.isSafeInteger(counts.passes) || counts.passes < 0 || counts.passes > counts.attempts) {
         throw new Error(`Invalid ${client} counts`);
       }
+      const samples = row[`${client}_sender`]?.samples_accepted_observed_total;
+      if (samples !== undefined && (!Number.isSafeInteger(samples) || samples < 0)) {
+        throw new Error(`Invalid ${client} accepted sample count`);
+      }
     }
     if (row.failures !== undefined && (!Array.isArray(row.failures) || row.failures.some(f => typeof f !== 'string'))) {
       throw new Error('Invalid expectation failures');
@@ -32,6 +36,31 @@ function validateReport(rows) {
 
 function escapeCell(value) {
   return value.replaceAll('|', '\\|').replaceAll('\n', ' ').replaceAll('\r', ' ').replaceAll('@', '@\u200b').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+function percentage(value) {
+  let precision = 2;
+  while (precision < 15 && value > 0 && value < 100 && [0, 100].includes(Number(value.toFixed(precision)))) precision++;
+  return value.toFixed(precision);
+}
+
+function successRange(counts) {
+  const rates = counts.map(c => c.passes / c.attempts);
+  const low = Math.min(...rates), high = Math.max(...rates);
+  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))}% ± ${percentage(50 * (high - low))} pp`, rate: low };
+}
+
+function sampleRange(runs, client) {
+  const counts = runs.map(row => row?.[`${client}_sender`]?.samples_accepted_observed_total);
+  if (counts.length !== 3 || counts.some(c => c === undefined)) return { cell: '—', rate: -1 };
+  const low = Math.min(...counts), high = Math.max(...counts);
+  return { cell: `${((low + high) / 2).toLocaleString('en-US')} ± ${((high - low) / 2).toLocaleString('en-US')}`, rate: low };
+}
+
+function comparisonCells(columns) {
+  const bestRate = Math.max(...columns.map(c => c.rate));
+  const best = columns.findIndex(c => c.rate === bestRate);
+  return columns.map((column, i) => column.cell !== '—' && i === best ? `**${column.cell}**` : column.cell).join(' | ');
 }
 
 function renderWorkload(title, reports, mainReports = [null, null, null], incomplete = false) {
@@ -66,30 +95,35 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
     const columns = [[pr, 'wgo'], [main, 'wgo'], [pr, 'kgo']].map(([runs, client]) => {
       const counts = runs.filter(Boolean).map(row => row[client]);
       if (counts.length !== 3) return { cell: '—', rate: -1 };
-      const worst = counts.reduce((a, b) => a.passes / a.attempts <= b.passes / b.attempts ? a : b);
-      return { cell: `${worst.passes}/${worst.attempts}`, rate: worst.passes / worst.attempts };
+      return successRange(counts);
     });
-    return { name, variableAttempts, columns };
+    const samples = [[pr, 'wgo'], [main, 'wgo'], [pr, 'kgo']].map(([runs, client]) => sampleRange(runs, client));
+    return { name, variableAttempts, columns, samples };
   });
   entries.sort((a, b) => a.columns[0].rate - b.columns[0].rate ||
     Math.min(...a.columns.slice(1).map(c => c.rate)) - Math.min(...b.columns.slice(1).map(c => c.rate)) ||
     a.name.localeCompare(b.name));
-  lines.push('| Scenario | wgo (PR) worst of 3 | wgo (main) worst of 3 | kgo worst of 3 |');
+  lines.push('| Scenario | wgo (PR) success | wgo (main) success | kgo success |');
   lines.push('| --- | ---: | ---: | ---: |');
   for (const entry of entries) {
-    const bestRate = Math.max(...entry.columns.map(c => c.rate));
-    const best = entry.columns.findIndex(c => c.rate === bestRate);
-    const cells = entry.columns.map((column, i) => column.cell !== '—' && i === best ? `**${column.cell}**` : column.cell);
-    lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${cells.join(' | ')} |`);
+    lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${comparisonCells(entry.columns)} |`);
+  }
+  const remoteEntries = entries.filter(entry => entry.variableAttempts);
+  if (remoteEntries.length) {
+    lines.push('', '#### Samples acknowledged by Mimir', '',
+      '| Scenario | wgo (PR) samples | wgo (main) samples | kgo samples |',
+      '| --- | ---: | ---: | ---: |');
+    for (const entry of remoteEntries) lines.push(`| ${escapeCell(entry.name)} | ${comparisonCells(entry.samples)} |`);
   }
   return lines.join('\n');
 }
 
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
-    'Three independent runs per client variant and scenario, using the same PR harness. Each column shows its lowest success rate with the corresponding passes / attempts. Rows are sorted by PR wgo success rate, worst first. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
+    'Three independent runs per client variant and scenario, using the same PR harness. Success is normalized to percentages. Partial results show the midpoint ± half the observed min/max range, in percentage points (pp); 100% means all three runs were perfect. This is an observed range, not a confidence interval. Rows are sorted by the lowest PR wgo success rate, worst first. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
     '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing.', '',
     'kgo comes from the PR runs. Main-run kgo measurements are retained in the artifacts. All runs, gates, latency, sender, fault and error details are available in the artifacts.', ''];
+  sections.push('Sample counts show midpoint ± half-range across three runs; more is better. They count samples in remote-write requests issued during the observation window that receive HTTP 2xx, including their bounded drain. Warmup and failed attempts are excluded. Acknowledgements do not establish unique or durably stored samples.', '');
   const mainSHAs = new Set();
   const harnessSHAs = new Set();
   for (const workload of discoverWorkloads()) {
@@ -134,7 +168,7 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   if (mainSHAs.size > 1 || harnessSHAs.size > 1) throw new Error('Client variants did not use one main revision and one PR harness');
   if (mainSHAs.size) sections.push(`Main client: \`${[...mainSHAs][0]}\` · Harness: \`${[...harnessSHAs][0]}\``, '');
   if (source) sections.push(source, '');
-  sections.push('**Bold** marks the highest success rate in each row; ties highlight the first matching column, preferring PR wgo.', '');
+  sections.push('**Bold** marks the best lower bound in each row (success or acknowledged samples); ties highlight the first matching column, preferring PR wgo.', '');
   return sections.join('\n');
 }
 

@@ -199,15 +199,24 @@ conversion of packet delays or an exact outage replay.
 The fault case observes 180s and reports pre-fault, degraded and recovery windows
 by HTTP issue time. An event is a real remote-write **attempt**, including retries;
 failed attempts do not establish sample loss. Attempts vary by client and run,
-so CI displays the worst success ratio with its matching denominator. Synthetic
-scenarios retain exact attempt-count validation. No assertion requires a client
+so CI normalizes each run to a success percentage. Partial results show the
+midpoint ± half the three-run min/max range in percentage points; 100% requires
+all three runs to be perfect. Sorting and bold comparisons use the lower bound.
+Synthetic scenarios retain exact attempt-count validation. No assertion requires a client
 to win. HTTP availability targets remain strict and informational in CI. The
 fault case also rejects permanently failed or dropped sender samples and requires
 the source-to-sent lag to be at most 5s at collection, so successful recent HTTP
 requests cannot hide an old WAL backlog.
 
 Reports retain Mimir timeout/hedge-suppression evidence and sender counters since
-process start: sent, permanently failed, retried, dropped and queued samples.
+process start: attempted, permanently failed, retried, dropped and queued samples.
+The Prometheus `samples_total` counter includes retries and is not a delivered
+sample count. The CI sample table instead counts decoded samples in requests
+issued during the observation window that receive HTTP 2xx, including the bounded
+request drain and excluding warmup and failed attempts. It shows the midpoint ±
+half the three-run min/max range; higher counts mean more acknowledged throughput.
+The JSON field is `samples_accepted_observed_total` in each lane's sender evidence.
+This does not deduplicate samples or prove durable storage.
 Current enqueue-to-sent and source-to-sent timestamp lags are reported separately.
 Queue pending counts exclude unread WAL; highest-sent timestamps do not prove
 all shards have caught up. These gauges are diagnostics, not a complete sample

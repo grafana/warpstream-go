@@ -8,11 +8,11 @@ const { renderWorkload, validateReport } = require('./simulation-report.cjs');
 
 const row = (passes, failures = []) => ({ scenario: 'rolling restart', wgo: { attempts: 120, passes }, kgo: { attempts: 120, passes: 29 }, failures });
 
-test('shows the independent minimum for each client without requiring equal pass counts', () => {
+test('shows the independent observed range for each client without requiring equal pass counts', () => {
   const first = row(120); first.kgo.passes = 25;
   const output = renderWorkload('Mimir', [[first], [row(118, ['success below floor'])], [row(119, ['success below floor'])]]);
-  assert.ok(output.includes('| rolling restart | **118/120** | — | 25/120 |'));
-  assert.match(output, /wgo \(PR\) worst of 3 \| wgo \(main\) worst of 3 \| kgo worst of 3/);
+  assert.ok(output.includes('| rolling restart | **99.17% ± 0.83 pp** | — | 22.50% ± 1.67 pp |'));
+  assert.match(output, /wgo \(PR\) success \| wgo \(main\) success \| kgo success/);
   assert.doesNotMatch(output, /gates met/);
 });
 
@@ -24,7 +24,7 @@ test('reports missing runs without fabricating successes', () => {
 });
 
 test('includes a zero-pass worst run', () => {
-  assert.ok(renderWorkload('Mimir', [[row(120)], [row(0)], [row(119)]]).includes('| rolling restart | 0/120 | — | **29/120** |'));
+  assert.ok(renderWorkload('Mimir', [[row(120)], [row(0)], [row(119)]]).includes('| rolling restart | 50.00% ± 50.00 pp | — | **24.17% ± 0.00 pp** |'));
 });
 
 test('rejects incomplete scenario coverage and inconsistent attempt counts', () => {
@@ -47,14 +47,14 @@ test('escapes table delimiters and neutralizes mentions', () => {
 test('scenario expectation failures remain informational', () => {
   const reports = [1, 2, 3].map(() => [{scenario: 'unstable', wgo: {attempts: 120, passes: 0}, kgo: {attempts: 120, passes: 120}, failures: ['success rate below floor']}]);
   const report = renderWorkload('Direct client', reports);
-  assert.match(report, /0\/120/);
-  assert.match(report, /\*\*120\/120\*\*/);
+  assert.match(report, /0.00% ± 0.00 pp/);
+  assert.match(report, /\*\*100%\*\*/);
 });
 
-test('keeps the denominator of the worst real remote-write ratio', () => {
+test('normalizes each real remote-write run before computing its range', () => {
   const remote = (attempts, passes) => ({ scenario: 'prometheus', observation_kind: 'remote_write_http_attempt', wgo: { attempts, passes }, kgo: { attempts: 100, passes: 75 } });
   const output = renderWorkload('Mimir', [[remote(10, 9)], [remote(100, 80)], [remote(200, 170)]]);
-  assert.ok(output.includes('| prometheus (HTTP attempts) | **80/100** | — | 75/100 |'));
+  assert.ok(output.includes('| prometheus (HTTP attempts) | **85.00% ± 5.00 pp** | — | 75.00% ± 0.00 pp |'));
 });
 
 test('rejects inconsistent observation kinds and unknown event kinds', () => {
@@ -68,7 +68,7 @@ test('compares PR and main through the same scenarios', () => {
   const pr = [[row(110)], [row(105)], [row(108)]];
   const main = [[row(100)], [row(101)], [row(102)]];
   const output = renderWorkload('Mimir', pr, main);
-  assert.ok(output.includes('| rolling restart | **105/120** | 100/120 | 29/120 |'));
+  assert.ok(output.includes('| rolling restart | **89.58% ± 2.08 pp** | 84.17% ± 0.83 pp | 24.17% ± 0.00 pp |'));
   assert.throws(() => renderWorkload('Mimir', pr, [[{ ...row(100), scenario: 'other' }], ...main.slice(1)]), /scenario names differ/);
 });
 
@@ -82,7 +82,7 @@ test('sorts the weakest PR result first, independently of the main result', () =
 test('ties highlight PR wgo only across three columns', () => {
   const rows = [{ ...row(120), kgo: { attempts: 120, passes: 120 } }];
   const output = renderWorkload('Mimir', [rows, rows, rows], [rows, rows, rows]);
-  assert.ok(output.includes('| rolling restart | **120/120** | 120/120 | 120/120 |'));
+  assert.ok(output.includes('| rolling restart | **100%** | 100% | 100% |'));
 });
 
 test('validates frozen main and common harness provenance', t => {
@@ -131,9 +131,9 @@ function batchReports(t) {
   return directory;
 }
 
-test('combines all scenario batches before computing worst of three', t => {
+test('combines all scenario batches before computing ranges', t => {
   const output = buildReport(batchReports(t));
-  for (const batch of [1, 2, 3, 4, 5]) assert.ok(output.includes(`| scenario ${batch} | **117/120** | 117/120 | 29/120 |`));
+  for (const batch of [1, 2, 3, 4, 5]) assert.ok(output.includes(`| scenario ${batch} | **98.33% ± 0.83 pp** | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |`));
 });
 
 test('missing batches invalidate only their scenario results', t => {
@@ -141,8 +141,8 @@ test('missing batches invalidate only their scenario results', t => {
   fs.rmSync(path.join(directory, 'simulation-mimir-pr-2-batch-3'), { recursive: true });
   const output = buildReport(directory);
   assert.match(output, /Mimir: pr run 2, batch 3\/5 did not produce a report/);
-  assert.ok(output.includes('| scenario 3 | — | **117/120** | — |'));
-  assert.ok(output.includes('| scenario 1 | **117/120** | 117/120 | 29/120 |'));
+  assert.ok(output.includes('| scenario 3 | — | **98.33% ± 0.83 pp** | — |'));
+  assert.ok(output.includes('| scenario 1 | **98.33% ± 0.83 pp** | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |'));
 });
 
 test('rejects duplicated scenarios across batches', t => {
@@ -155,7 +155,7 @@ test('retains scenarios absent from the first available run', t => {
   const directory = batchReports(t);
   fs.rmSync(path.join(directory, 'simulation-mimir-pr-1-batch-3'), { recursive: true });
   const output = buildReport(directory);
-  assert.ok(output.includes('| scenario 3 | — | **117/120** | — |'));
+  assert.ok(output.includes('| scenario 3 | — | **98.33% ± 0.83 pp** | — |'));
 });
 
 test('rejects changed scenario coverage even when a batch is missing', t => {
@@ -163,4 +163,28 @@ test('rejects changed scenario coverage even when a batch is missing', t => {
   fs.rmSync(path.join(directory, 'simulation-mimir-pr-2-batch-3'), { recursive: true });
   fs.writeFileSync(path.join(directory, 'simulation-mimir-pr-2-batch-1/report.json'), JSON.stringify([row(120)]));
   assert.throws(() => buildReport(directory), /batch 1 scenario names differ/);
+});
+
+
+test('reports acknowledged sample ranges independently of HTTP attempts', () => {
+  const remote = samples => ({ ...row(120), observation_kind: 'remote_write_http_attempt',
+    wgo_sender: { samples_accepted_observed_total: samples },
+    kgo_sender: { samples_accepted_observed_total: 500 } });
+  const output = renderWorkload('Mimir', [[remote(1000)], [remote(3000)], [remote(2000)]]);
+  assert.ok(output.includes('| rolling restart | **2,000 ± 1,000** | — | 500 ± 0 |'));
+  assert.match(output, /Samples acknowledged by Mimir/);
+  assert.match(output, /\*\*100%\*\*/);
+});
+
+test('does not invent sample measurements when evidence is missing', () => {
+  const remote = { ...row(120), observation_kind: 'remote_write_http_attempt' };
+  const output = renderWorkload('Mimir', [[remote], [remote], [remote]]);
+  assert.ok(output.includes('| rolling restart | — | — | — |'));
+  assert.throws(() => validateReport([{ ...remote, wgo_sender: { samples_accepted_observed_total: -1 } }]), /accepted sample count/);
+});
+
+test('rounding never presents partial success as perfect', () => {
+  const remote = { ...row(120), observation_kind: 'remote_write_http_attempt', wgo: { attempts: 1000000, passes: 999999 } };
+  const output = renderWorkload('Mimir', [[remote], [remote], [remote]]);
+  assert.match(output, /99.9999% ± 0.00 pp/);
 });

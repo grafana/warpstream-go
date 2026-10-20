@@ -53,6 +53,7 @@ type ApplicationObservation struct {
 	Started  time.Time
 	Duration time.Duration
 	Error    error
+	Samples  int64
 }
 
 type ObservedWorkload interface {

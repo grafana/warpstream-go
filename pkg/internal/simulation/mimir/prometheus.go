@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,8 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/grafana/warpstream-go/pkg/internal/simulation/runner"
@@ -37,12 +40,14 @@ type prometheusSender struct {
 	mu                 sync.Mutex
 	attempts           []runner.ApplicationObservation
 	active             map[*http.Request]time.Time
+	measurementErr     error
 	once               sync.Once
 }
 
 type prometheusWorkload struct {
 	*distributorWriters
-	senders []*prometheusSender
+	senders         []*prometheusSender
+	observedSamples atomic.Int64
 }
 
 func newPrometheusWorkload(binary, prometheusBinary string, cfg runner.WorkloadConfig, options distributorOptions) (_ runner.Producer, err error) {
@@ -102,13 +107,17 @@ func newPrometheusSender(binary string, client *distributorClient, logs string) 
 		s.active[r] = start
 		s.mu.Unlock()
 		tracked := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		samples, measurementErr := remoteWriteSamples(r)
 		proxy.ServeHTTP(tracked, r)
 		var attemptErr error
 		if tracked.status < 200 || tracked.status >= 300 {
 			attemptErr = fmt.Errorf("mimir HTTP %d", tracked.status)
 		}
 		s.mu.Lock()
-		s.attempts = append(s.attempts, runner.ApplicationObservation{Started: start, Duration: time.Since(start), Error: attemptErr})
+		if measurementErr != nil {
+			s.measurementErr = measurementErr
+		}
+		s.attempts = append(s.attempts, runner.ApplicationObservation{Started: start, Duration: time.Since(start), Error: attemptErr, Samples: samples})
 		delete(s.active, r)
 		s.mu.Unlock()
 	}))
@@ -172,6 +181,28 @@ remote_write:
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func remoteWriteSamples(r *http.Request) (int64, error) {
+	body, err := io.ReadAll(r.Body)
+	// Restore the exact wire payload so measurement does not change Mimir's input.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	decoded, err := snappy.Decode(nil, body)
+	if err != nil {
+		return 0, err
+	}
+	var request prompb.WriteRequest
+	if err := request.Unmarshal(decoded); err != nil {
+		return 0, err
+	}
+	var samples int64
+	for _, series := range request.Timeseries {
+		samples += int64(len(series.Samples))
+	}
+	return samples, nil
 }
 
 type statusWriter struct {
@@ -260,6 +291,13 @@ func (p *prometheusWorkload) Observe(ctx context.Context, start time.Time, durat
 			if len(attempts) == 0 {
 				return nil, fmt.Errorf("prometheus issued no remote-write attempts")
 			}
+			var samples int64
+			for _, attempt := range attempts {
+				if attempt.Error == nil {
+					samples += attempt.Samples
+				}
+			}
+			p.observedSamples.Store(samples)
 			return attempts, nil
 		}
 		select {
@@ -278,6 +316,7 @@ func (p *prometheusWorkload) Describe() (string, string) {
 
 func (p *prometheusWorkload) SenderEvidence() (map[string]float64, error) {
 	out := map[string]float64{"samples_total": 0, "samples_failed_total": 0, "samples_retried_total": 0, "samples_dropped_total": 0, "samples_pending": 0}
+	out["samples_accepted_observed_total"] = float64(p.observedSamples.Load())
 	for _, sender := range p.senders {
 		response, err := sender.client.http.Get(sender.address + "/metrics")
 		if err != nil {
@@ -315,6 +354,12 @@ func (p *prometheusWorkload) Validate() error {
 		return err
 	}
 	for _, sender := range p.senders {
+		sender.mu.Lock()
+		measurementErr := sender.measurementErr
+		sender.mu.Unlock()
+		if measurementErr != nil {
+			return fmt.Errorf("count remote-write samples: %w", measurementErr)
+		}
 		select {
 		case <-sender.done:
 			return fmt.Errorf("prometheus exited before completion")

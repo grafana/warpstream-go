@@ -198,7 +198,7 @@ func (rr *resultsReport) writeScenarioSection(b *strings.Builder, res scenarioRe
 		if len(sender.evidence) == 0 {
 			continue
 		}
-		fmt.Fprintf(b, "Prometheus sender %s (counters since process start; gauges at collection):\n\n", sender.name)
+		fmt.Fprintf(b, "Prometheus sender %s (counters since process start, except samples_accepted_observed_total for the observation window; gauges at collection):\n\n", sender.name)
 		for _, name := range slices.Sorted(maps.Keys(sender.evidence)) {
 			if strings.HasSuffix(name, "_seconds") {
 				fmt.Fprintf(b, "- %s: %.3f\n", name, sender.evidence[name])
