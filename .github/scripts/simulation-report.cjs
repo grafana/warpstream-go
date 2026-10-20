@@ -39,7 +39,7 @@ function escapeCell(value) {
 }
 
 function percentage(value) {
-  let precision = 2;
+  let precision = 1;
   while (precision < 15 && value > 0 && value < 100 && [0, 100].includes(Number(value.toFixed(precision)))) precision++;
   return value.toFixed(precision);
 }
@@ -47,7 +47,7 @@ function percentage(value) {
 function successRange(counts) {
   const rates = counts.map(c => c.passes / c.attempts);
   const low = Math.min(...rates), high = Math.max(...rates);
-  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))}% ± ${percentage(50 * (high - low))} pp`, rate: low, high };
+  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))} ± ${percentage(50 * (high - low))} %`, rate: low, high };
 }
 
 function sampleRange(runs, client) {
@@ -122,7 +122,7 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
 
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
-    'Three independent runs per client variant and scenario, using the same PR harness. Success is normalized to percentages. Partial results show the midpoint ± half the observed min/max range, in percentage points (pp); 100% means all three runs were perfect. This is an observed range, not a confidence interval. Rows are sorted by the lowest PR wgo success rate, worst first. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
+    'Three independent runs per client variant and scenario, using the same PR harness. Success is normalized to percentages. Partial results show the midpoint ± half the observed min/max range, with one percent sign for both numbers (for example, 25.0 ± 5.0 % spans 20–30%); 100% means all three runs were perfect. This is an observed range, not a confidence interval. Rows are sorted by the lowest PR wgo success rate, worst first. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
     '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing.', '',
     'kgo comes from the PR runs. Main-run kgo measurements are retained in the artifacts. All runs, gates, latency, sender, fault and error details are available in the artifacts.', ''];
   sections.push('Sample counts show midpoint ± half-range across three runs; more is better. They count samples in remote-write requests issued during the observation window that receive HTTP 2xx, including their bounded drain. Warmup and failed attempts are excluded. Acknowledgements do not establish unique or durably stored samples.', '');
