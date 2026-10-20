@@ -62,7 +62,7 @@ function comparisonCells(columns) {
   const best = perfect !== -1 ? perfect : columns.findIndex((candidate, i) =>
     candidate.cell !== '—' && columns.every((other, j) =>
       i === j || other.cell === '—' || candidate.rate > other.high));
-  return columns.map((column, i) => column.cell !== '—' && i === best ? `${perfect !== -1 ? '✅' : '🏆'} **${column.cell}**` : column.cell).join(' | ');
+  return columns.map((column, i) => column.cell !== '—' && i === best ? `✅ **${column.cell}**` : column.cell).join(' | ');
 }
 
 function renderWorkload(title, reports, mainReports = [null, null, null], incomplete = false) {
@@ -170,7 +170,7 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   if (mainSHAs.size > 1 || harnessSHAs.size > 1) throw new Error('Client variants did not use one main revision and one PR harness');
   if (mainSHAs.size) sections.push(`Main client: \`${[...mainSHAs][0]}\` · Harness: \`${[...harnessSHAs][0]}\``, '');
   if (source) sections.push(source, '');
-  sections.push('🏆 **Bold** marks a range entirely above every other available range. Overlapping or touching ranges have no highlighted winner. ✅ **100%** marks perfect success; ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
+  sections.push('✅ **Bold** marks a range entirely above every other available range, or perfect 100% success. Overlapping or touching partial ranges have no highlighted winner. Perfect ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
   return sections.join('\n');
 }
 
