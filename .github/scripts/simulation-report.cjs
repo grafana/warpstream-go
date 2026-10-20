@@ -47,19 +47,21 @@ function percentage(value) {
 function successRange(counts) {
   const rates = counts.map(c => c.passes / c.attempts);
   const low = Math.min(...rates), high = Math.max(...rates);
-  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))}% ± ${percentage(50 * (high - low))} pp`, rate: low };
+  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))}% ± ${percentage(50 * (high - low))} pp`, rate: low, high };
 }
 
 function sampleRange(runs, client) {
   const counts = runs.map(row => row?.[`${client}_sender`]?.samples_accepted_observed_total);
   if (counts.length !== 3 || counts.some(c => c === undefined)) return { cell: '—', rate: -1 };
   const low = Math.min(...counts), high = Math.max(...counts);
-  return { cell: `${((low + high) / 2).toLocaleString('en-US')} ± ${((high - low) / 2).toLocaleString('en-US')}`, rate: low };
+  return { cell: `${((low + high) / 2).toLocaleString('en-US')} ± ${((high - low) / 2).toLocaleString('en-US')}`, rate: low, high };
 }
 
 function comparisonCells(columns) {
-  const bestRate = Math.max(...columns.map(c => c.rate));
-  const best = columns.findIndex(c => c.rate === bestRate);
+  const perfect = columns.findIndex(c => c.cell === '100%');
+  const best = perfect !== -1 ? perfect : columns.findIndex((candidate, i) =>
+    candidate.cell !== '—' && columns.every((other, j) =>
+      i === j || other.cell === '—' || candidate.rate > other.high));
   return columns.map((column, i) => column.cell !== '—' && i === best ? `**${column.cell}**` : column.cell).join(' | ');
 }
 
@@ -168,7 +170,7 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   if (mainSHAs.size > 1 || harnessSHAs.size > 1) throw new Error('Client variants did not use one main revision and one PR harness');
   if (mainSHAs.size) sections.push(`Main client: \`${[...mainSHAs][0]}\` · Harness: \`${[...harnessSHAs][0]}\``, '');
   if (source) sections.push(source, '');
-  sections.push('**Bold** marks the best lower bound in each row (success or acknowledged samples); ties highlight the first matching column, preferring PR wgo.', '');
+  sections.push('**Bold** marks a range entirely above every other available range. Overlapping or touching ranges have no highlighted winner. Perfect 100% results are highlighted; ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
   return sections.join('\n');
 }
 

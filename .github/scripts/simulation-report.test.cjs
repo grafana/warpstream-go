@@ -24,7 +24,7 @@ test('reports missing runs without fabricating successes', () => {
 });
 
 test('includes a zero-pass worst run', () => {
-  assert.ok(renderWorkload('Mimir', [[row(120)], [row(0)], [row(119)]]).includes('| rolling restart | 50.00% ± 50.00 pp | — | **24.17% ± 0.00 pp** |'));
+  assert.ok(renderWorkload('Mimir', [[row(120)], [row(0)], [row(119)]]).includes('| rolling restart | 50.00% ± 50.00 pp | — | 24.17% ± 0.00 pp |'));
 });
 
 test('rejects incomplete scenario coverage and inconsistent attempt counts', () => {
@@ -133,7 +133,7 @@ function batchReports(t) {
 
 test('combines all scenario batches before computing ranges', t => {
   const output = buildReport(batchReports(t));
-  for (const batch of [1, 2, 3, 4, 5]) assert.ok(output.includes(`| scenario ${batch} | **98.33% ± 0.83 pp** | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |`));
+  for (const batch of [1, 2, 3, 4, 5]) assert.ok(output.includes(`| scenario ${batch} | 98.33% ± 0.83 pp | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |`));
 });
 
 test('missing batches invalidate only their scenario results', t => {
@@ -142,7 +142,7 @@ test('missing batches invalidate only their scenario results', t => {
   const output = buildReport(directory);
   assert.match(output, /Mimir: pr run 2, batch 3\/5 did not produce a report/);
   assert.ok(output.includes('| scenario 3 | — | **98.33% ± 0.83 pp** | — |'));
-  assert.ok(output.includes('| scenario 1 | **98.33% ± 0.83 pp** | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |'));
+  assert.ok(output.includes('| scenario 1 | 98.33% ± 0.83 pp | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |'));
 });
 
 test('rejects duplicated scenarios across batches', t => {
@@ -187,4 +187,25 @@ test('rounding never presents partial success as perfect', () => {
   const remote = { ...row(120), observation_kind: 'remote_write_http_attempt', wgo: { attempts: 1000000, passes: 999999 } };
   const output = renderWorkload('Mimir', [[remote], [remote], [remote]]);
   assert.match(output, /99.9999% ± 0.00 pp/);
+});
+
+
+test('overlapping success ranges have no highlighted winner', () => {
+  const rows = (low, high) => [low, high, low].map(passes => [{ ...row(passes), kgo: { attempts: 120, passes: 0 } }]);
+  const output = renderWorkload('Mimir', rows(12, 46), rows(24, 37));
+  assert.ok(output.includes('| rolling restart | 24.17% ± 14.17 pp | 25.42% ± 5.42 pp | 0.00% ± 0.00 pp |'));
+  assert.doesNotMatch(output, /\*\*/);
+});
+
+test('touching success ranges have no highlighted winner', () => {
+  const rows = passes => passes.map(p => [{ ...row(p), kgo: { attempts: 120, passes: 0 } }]);
+  assert.doesNotMatch(renderWorkload('Mimir', rows([30, 60, 45]), rows([60, 90, 75])), /\*\*/);
+});
+
+test('overlapping sample ranges have no highlighted winner', () => {
+  const rows = samples => samples.map(n => [{ ...row(120), observation_kind: 'remote_write_http_attempt',
+    wgo_sender: { samples_accepted_observed_total: n },
+    kgo_sender: { samples_accepted_observed_total: 0 } }]);
+  const output = renderWorkload('Mimir', rows([100, 400, 250]), rows([200, 300, 250]));
+  assert.ok(output.includes('| rolling restart | 250 ± 150 | 250 ± 50 | 0 ± 0 |'));
 });

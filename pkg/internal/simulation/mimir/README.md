@@ -201,7 +201,9 @@ by HTTP issue time. An event is a real remote-write **attempt**, including retri
 failed attempts do not establish sample loss. Attempts vary by client and run,
 so CI normalizes each run to a success percentage. Partial results show the
 midpoint ± half the three-run min/max range in percentage points; 100% requires
-all three runs to be perfect. Sorting and bold comparisons use the lower bound.
+all three runs to be perfect. Sorting uses the lower bound. Bold marks a range
+entirely above its peers; overlapping or touching ranges have no highlighted
+winner. Perfect 100% results are highlighted, with ties preferring PR wgo.
 Synthetic scenarios retain exact attempt-count validation. No assertion requires a client
 to win. HTTP availability targets remain strict and informational in CI. The
 fault case also rejects permanently failed or dropped sender samples and requires
