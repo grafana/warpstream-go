@@ -71,12 +71,18 @@ func newDistributorWithOptions(binary string, cfg runner.WorkloadConfig, options
 			c.Close()
 		}
 	}()
-	proxy := newBrokerProxy(observedDialer(cfg.Dialer, cfg.ObserveProduce, func(partition int32) {
-		c.mu.Lock()
-		c.partitions[partition] = true
-		c.mu.Unlock()
-	}))
+	proxy := newBrokerProxy(cfg.Dialer)
+	proxy.observe = func(address string, version int16, frame []byte) {
+		if observeProduceResponse(frame, version, func(partition int32) {
+			c.mu.Lock()
+			c.partitions[partition] = true
+			c.mu.Unlock()
+		}) {
+			cfg.ObserveProduce(address)
+		}
+	}
 	proxy.latency = cfg.ProduceLatency
+	proxy.enforceProduceTimeout = cfg.EnforceProduceTimeout
 	c.cleanup = append(c.cleanup, proxy.Close)
 	address, err := proxy.address(cfg.Address)
 	if err != nil {

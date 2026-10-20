@@ -10,8 +10,11 @@ import (
 const secondaryTopicName = "wgo-simulation-secondary"
 
 type workloadProfile struct {
+	prometheus                         bool
+	enforceProduceTimeout              bool
 	brokers, partitions                int32
 	singleAgent, dynamicPlacement      bool
+	advertisedAgents                   int
 	secondaryPartitions                int32
 	seriesPerRequest                   int
 	spacing, writeTimeout, dialTimeout time.Duration
@@ -58,7 +61,12 @@ func profileScenarios(profile string, external bool) ([]scenario, error) {
 		if !external {
 			return nil, fmt.Errorf("all requires an external workload")
 		}
-		return append(scenarios(), investigationScenarios()...), nil
+		return append(append(scenarios(), investigationScenarios()...), storagePressureScenarios()...), nil
+	case "mimir-prometheus":
+		if !external {
+			return nil, fmt.Errorf("mimir-prometheus requires an external workload")
+		}
+		return storagePressureScenarios(), nil
 	case "standard":
 		return scenarios(), nil
 	case "mimir-investigation":

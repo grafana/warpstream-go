@@ -14,7 +14,11 @@ func TestScenarioBatches_CoverEveryScenarioOnce(t *testing.T) {
 	for batch := 1; batch <= 5; batch++ {
 		selected, err := batchScenarios(available, batch, 5)
 		require.NoError(t, err)
-		require.Len(t, selected, 4)
+		expected := len(available) / 5
+		if batch <= len(available)%5 {
+			expected++
+		}
+		require.Len(t, selected, expected)
 		for _, sc := range selected {
 			assert.False(t, seen[sc.name])
 			seen[sc.name] = true

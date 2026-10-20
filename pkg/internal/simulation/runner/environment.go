@@ -144,7 +144,11 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 		if sc.profile != nil && sc.profile.dynamicPlacement {
 			retainedFallback = brokers - 1
 		}
-		return installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviourProvider, sc.profile != nil && sc.profile.singleAgent, sc.profile != nil && sc.profile.dynamicPlacement, retainedFallback), nil
+		advertised := 0
+		if sc.profile != nil {
+			advertised = sc.profile.advertisedAgents
+		}
+		return installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviourProvider, sc.profile != nil && sc.profile.singleAgent, sc.profile != nil && sc.profile.dynamicPlacement, retainedFallback, advertised), nil
 	}
 	workload := func(backend, address string, registry *prometheus.Registry, network *transportNetwork, behaviours *brokersBehaviourProvider) WorkloadConfig {
 		cfg := workloadConfig(backend, address, registry, network, behaviours)
@@ -153,6 +157,8 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 			cfg.SecondaryTopic = secondaryTopicName
 			cfg.SecondaryPartitions = secondaryPartitions
 			cfg.SeriesPerRequest = sc.profile.seriesPerRequest
+			cfg.EnforceProduceTimeout = sc.profile.enforceProduceTimeout
+			cfg.Prometheus = sc.profile.prometheus
 			cfg.WriteTimeout, cfg.DialTimeout = sc.profile.writeTimeout, sc.profile.dialTimeout
 			cfg.RemoteTimeout, cfg.ArtificialDelay = appRequestTimeout, 500*time.Millisecond
 		}

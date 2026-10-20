@@ -48,12 +48,19 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	if external, ok := env.wgoClient.(prometheus.Gatherer); ok {
 		metrics = external
 	}
+	prefix := ""
+	if builder, ok := env.wgoClient.(eventBuilder); ok {
+		prefix = builder.MetricsPrefix()
+	}
+	var initialEvidence *clientEvidence
+	if sc.collectClientEvidence {
+		initialEvidence, err = readClientEvidence(metrics, prefix)
+		if err != nil {
+			return scenarioResult{}, err
+		}
+	}
 	var initialFallback *staleFallbackEvidence
 	if sc.requireStaleFallback {
-		prefix := ""
-		if builder, ok := env.wgoClient.(eventBuilder); ok {
-			prefix = builder.MetricsPrefix()
-		}
 		initialFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
@@ -82,10 +89,13 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		}
 		phaseDone <- err
 	}()
-	wgoObservations, kgoObservations := runScenarioObservedEvents(runCtx, env, observedStart, wgoEvents, kgoEvents)
+	wgoObservations, kgoObservations, observedErr := observeWorkloads(runCtx, env, observedStart, sc.duration(), wgoEvents, kgoEvents)
 	stopPhases()
 	if err := <-phaseDone; err != nil {
 		return scenarioResult{}, fmt.Errorf("scenario %q transport phases: %w", sc.name, err)
+	}
+	if observedErr != nil {
+		return scenarioResult{}, observedErr
 	}
 	samples := sampler.stop()
 
@@ -134,14 +144,13 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	if profile, ok := env.wgoClient.(interface{ RecoveryResponseDescription() string }); ok {
 		res.recoveryResponseDescription = profile.RecoveryResponseDescription()
 	}
+	if observed, ok := env.wgoClient.(ObservedWorkload); ok {
+		res.observationDescription = observed.ObservationDescription()
+	}
 	if profile, ok := env.wgoClient.(interface{ Describe() (string, string) }); ok {
 		res.workloadDescription, res.workloadConfiguration = profile.Describe()
 	}
 	if sc.requireStaleFallback {
-		prefix := ""
-		if builder, ok := env.wgoClient.(eventBuilder); ok {
-			prefix = builder.MetricsPrefix()
-		}
 		res.staleFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
@@ -152,6 +161,28 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		}
 		res.staleFallback.ThirdAttemptSuccesses -= initialFallback.ThirdAttemptSuccesses
 		res.staleFallback.TerminalErrors -= initialFallback.TerminalErrors
+	}
+	if initialEvidence != nil {
+		res.clientEvidence, err = readClientEvidence(metrics, prefix)
+		if err != nil {
+			return scenarioResult{}, err
+		}
+		res.clientEvidence.subtract(initialEvidence)
+	}
+	for i, client := range []produceClient{env.wgoClient, env.kgoClient} {
+		if sender, ok := client.(interface {
+			SenderEvidence() (map[string]float64, error)
+		}); ok {
+			evidence, evidenceErr := sender.SenderEvidence()
+			if evidenceErr != nil {
+				return scenarioResult{}, evidenceErr
+			}
+			if i == 0 {
+				res.wgoSender = evidence
+			} else {
+				res.kgoSender = evidence
+			}
+		}
 	}
 	return res, nil
 }

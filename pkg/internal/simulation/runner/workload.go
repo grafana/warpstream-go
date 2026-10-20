@@ -20,6 +20,8 @@ type WorkloadConfig struct {
 	SecondaryTopic                                  string
 	SecondaryPartitions                             int32
 	SeriesPerRequest                                int
+	Prometheus                                      bool
+	EnforceProduceTimeout                           bool
 	RemoteTimeout, ArtificialDelay                  time.Duration
 	Registry                                        *prometheus.Registry
 	Dialer                                          func(context.Context, string, string) (net.Conn, error)
@@ -44,4 +46,16 @@ func eventsForClient(client produceClient, topic string, partitions int32, durat
 		return events
 	}
 	return buildScenarioEvents(topic, partitions, duration, spacing)
+}
+
+// ApplicationObservation is an actual external workload attempt, including retries.
+type ApplicationObservation struct {
+	Started  time.Time
+	Duration time.Duration
+	Error    error
+}
+
+type ObservedWorkload interface {
+	Observe(context.Context, time.Time, time.Duration) ([]ApplicationObservation, error)
+	ObservationDescription() string
 }

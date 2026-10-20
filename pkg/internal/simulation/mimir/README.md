@@ -31,7 +31,7 @@ Response order is preserved, while delays for concurrent requests overlap.
 
 Four scenarios run at a time by default, launching up to sixteen Mimir processes;
 use `-parallel` to change that limit. The default `all` profile includes all 15
-standard and five investigation scenarios
+standard, five investigation, and two real Prometheus scenarios
 and takes roughly 10–15 minutes plus binary build time. Use `-profile standard`
 for only the standard suite. During rolling restarts,
 each of three pods disappears for 20s while partition assignments still name it.
@@ -56,6 +56,11 @@ separate runners. Both clients run together within each scenario, preserving
 all comparison gates. Integration harness unit tests run once in a separate job, in
 parallel with the build.
 Each run's full latency, fault and error report is retained as a CI artifact.
+CI freezes one `main` client revision, then runs both clients against the PR's
+harness three times per variant. The comment compares PR wgo, main wgo and the
+PR-run kgo reference, sorted by PR wgo success rate with the weakest first.
+Artifacts record client and harness revisions; mixed revisions or scenario
+coverage are rejected. Main-run kgo results remain available in the artifacts.
 
 Results below 100% success can vary because of randomness and wall-clock timing
 during testing. The same code can produce 110/120 successful writes in one run
@@ -161,3 +166,60 @@ Compare runs with the same machine, profile, writer count, binary source and
 overlay, and inspect the linked module manifests for dependency differences.
 Use `-mimir-writers=1` to isolate the main writer; the default is two for the
 investigation profile and one for the standard suite.
+
+## Real Prometheus remote-write profile
+
+`-profile mimir-prometheus` runs a healthy control and a sustained partial outage.
+Both are included in the default `all` profile and its three-run CI report.
+The build creates both the actual pinned Mimir binary and a pinned Prometheus
+binary. Supply `-prometheus-binary` to use an existing build; otherwise the harness
+looks beside the Mimir binary. `PROMETHEUS_BINARY` also supplies this path.
+
+Each lane launches two actual Prometheus processes in agent mode. Each scrapes
+32,000 fixed series every second, writes its WAL, and remote-writes to an
+independent Mimir distributor. Prometheus controls batching, shard scaling,
+backoff, retries and the default 30s HTTP timeout. Labels are identical across
+lanes; only the Mimir backend changes. The harness observes requests without
+changing the sender's payload or implementing its retry logic.
+
+Ten agents advertise all ten peers. Metadata assigns partitions to its responding
+agent. The distributors use separate 1001- and 60-partition topics, a 4s Kafka
+write budget, 2s overhead and 500ms dial timeout. Mimir derives each backend's
+wire timeout. Warmup requires successful Kafka acknowledgements for every
+partition before observation starts.
+
+From 10s to 130s, one agent takes 6s to acknowledge and four take 3s; five remain
+at 50ms. The proxy reads `Produce.TimeoutMillis` from each real Kafka request.
+Agent work exceeding it returns `REQUEST_TIMED_OUT` at that deadline. With this
+budget Mimir sends 2s through wgo and 4s through franz-go: the same 3s operation
+can produce different broker outcomes. Concurrent service times overlap while
+TCP response order is preserved. These are acknowledgement-stall inputs, not a
+conversion of packet delays or an exact outage replay.
+
+The fault case observes 180s and reports pre-fault, degraded and recovery windows
+by HTTP issue time. An event is a real remote-write **attempt**, including retries;
+failed attempts do not establish sample loss. Attempts vary by client and run,
+so CI displays the worst success ratio with its matching denominator. Synthetic
+scenarios retain exact attempt-count validation. No assertion requires a client
+to win. HTTP availability targets remain strict and informational in CI. The
+fault case also rejects permanently failed or dropped sender samples and requires
+the source-to-sent lag to be at most 5s at collection, so successful recent HTTP
+requests cannot hide an old WAL backlog.
+
+Reports retain Mimir timeout/hedge-suppression evidence and sender counters since
+process start: sent, permanently failed, retried, dropped and queued samples.
+Current enqueue-to-sent and source-to-sent timestamp lags are reported separately.
+Queue pending counts exclude unread WAL; highest-sent timestamps do not prove
+all shards have caught up. These gauges are diagnostics, not a complete sample
+loss or delivery guarantee. Fake agents do not persist data or provide queries.
+
+```sh
+go run . -mimir-binary /absolute/path/to/mimir \
+  -prometheus-binary /absolute/path/to/prometheus -profile mimir-prometheus \
+  -parallel 1 -check=false -report-filepath /private/tmp/remote-write.md \
+  -json-report-filepath /private/tmp/remote-write.json
+```
+
+Run `PROMETHEUS_BINARY=/absolute/path/to/prometheus go test -race -run TestPrometheus`
+for the real sender retry integration test. It verifies that temporary HTTP 500s
+increase retries while subsequent writes succeed without permanent sample failure.

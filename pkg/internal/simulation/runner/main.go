@@ -24,7 +24,7 @@ func Main(factory WorkloadFactory) {
 	if factory != nil {
 		defaultProfile = "all"
 	}
-	profile := flag.String("profile", defaultProfile, "scenario profile: standard, all, or mimir-investigation (last two require external workloads)")
+	profile := flag.String("profile", defaultProfile, "scenario profile: standard, all, mimir-investigation, or mimir-prometheus (last three require external workloads)")
 	pattern := flag.String("scenario", "", "run scenarios whose names match this regular expression")
 	batch := flag.Int("batch", 1, "one-based scenario batch to run")
 	batches := flag.Int("batches", 1, "number of batches to split the selected scenarios across")
