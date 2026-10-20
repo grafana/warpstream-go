@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/kversion"
+	"github.com/twmb/franz-go/pkg/sasl"
 )
 
 // ProduceAPIVersion is the Kafka Produce API version this client emits. v11
@@ -76,12 +77,14 @@ type WarpstreamClient struct {
 	// client's own produce path.
 	produceHooks produceHooks
 
-	pool           *AgentPool
-	tracker        *CachedAgentStatsTracker
-	demoter        *Demoter
-	directProducer *KafkaDirectProducer
-	hedger         *Hedger
-	buffer         *ClusterBuffer[routedTopicPartitionRecords]
+	pool              *AgentPool
+	tracker           *CachedAgentStatsTracker
+	demoter           *Demoter
+	directProducer    *KafkaDirectProducer
+	fallbackProducers []*KafkaDirectProducer
+	fallbackClients   []*kgo.Client
+	hedger            *Hedger
+	buffer            *ClusterBuffer[routedTopicPartitionRecords]
 
 	// refreshCtx is canceled by Close. It both signals the background
 	// refresh goroutine to exit and interrupts any in-flight Refresh.
@@ -114,7 +117,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 		return nil, fmt.Errorf("invalid warpstream client config: %w", err)
 	}
 
-	kgoClient, err := newKgoClient(cfg, logger, reg)
+	kgoClient, fallbackClients, err := newKgoClients(cfg, logger, reg)
 	if err != nil {
 		return nil, fmt.Errorf("creating kgo client: %w", err)
 	}
@@ -123,6 +126,9 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	pool := NewAgentPool(kgoClient)
 	_, dropped, err := pool.refresh(context.Background())
 	if err != nil {
+		for _, client := range fallbackClients {
+			client.Close()
+		}
 		kgoClient.Close()
 		return nil, fmt.Errorf("initial agent pool refresh: %w", err)
 	}
@@ -136,20 +142,30 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	// so the agent stats here reflect per-attempt quality and the Hedger
 	// reacts to it without a layered retry mechanism dampening the signal.
 	trackingProducer := NewTrackingProducer(directProducer, tracker)
+	var fallbackProducers []*KafkaDirectProducer
+	var fallbackTransports []DirectProducer
+	for _, client := range fallbackClients {
+		producer := NewKafkaDirectProducer(client, pool.TopicID, ProduceAPIVersion, cfg.DirectProducer, m)
+		fallbackProducers = append(fallbackProducers, producer)
+		fallbackTransports = append(fallbackTransports, producer)
+	}
+	fallbackTrackingProducer := NewTrackingProducer(newBalancedProducer(fallbackTransports), tracker)
 
 	refreshCtx, refreshCancel := context.WithCancel(context.Background())
 	c := &WarpstreamClient{
-		cfg:            cfg,
-		logger:         logger,
-		metrics:        m,
-		produceHooks:   newProduceHooks(cfg.Hooks),
-		Client:         kgoClient,
-		pool:           pool,
-		tracker:        tracker,
-		directProducer: directProducer,
-		refreshCtx:     refreshCtx,
-		refreshCancel:  refreshCancel,
-		refreshNowCh:   make(chan struct{}, 1),
+		cfg:               cfg,
+		logger:            logger,
+		metrics:           m,
+		produceHooks:      newProduceHooks(cfg.Hooks),
+		Client:            kgoClient,
+		pool:              pool,
+		tracker:           tracker,
+		directProducer:    directProducer,
+		fallbackProducers: fallbackProducers,
+		fallbackClients:   fallbackClients,
+		refreshCtx:        refreshCtx,
+		refreshCancel:     refreshCancel,
+		refreshNowCh:      make(chan struct{}, 1),
 	}
 	// Publish the excluded-leader count and do not nudge: the refresh goroutine starts below.
 	// The periodic tick fetches the next snapshot.
@@ -159,7 +175,7 @@ func NewWarpstreamClient(logger kgo.Logger, reg prometheus.Registerer, opts ...O
 	// per-agent probe-timing state persists across refreshes.
 	lazy := NewLazyPartitionAssignmentStrategy(pool.Strategy)
 	c.demoter = NewDemoter(lazy, tracker, cfg.HealthCheck, cfg.Demoter, logger, reg)
-	c.hedger = NewHedger(trackingProducer, tracker, c.demoter, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.BatchMaxBytes, m, logger)
+	c.hedger = newHedger(trackingProducer, fallbackTrackingProducer, tracker, c.demoter, cfg.HealthCheck, cfg.Hedger, cfg.Linger, cfg.BatchMaxBytes, m, logger)
 	// The cluster buffer's AgentFlushFunc is the Hedger, wrapped only to
 	// bound each flush by WriteTimeout. Hedger.ProduceSync still takes a
 	// nodeID so it composes directly with the buffer.
@@ -380,16 +396,22 @@ func (c *WarpstreamClient) BufferedProduceRecords() int64 {
 // tests that simulate per-agent latency. Production code does not set this.
 func (c *WarpstreamClient) SetTestProduceResponseHook(fn func(ctx context.Context, nodeID int32, resp *kmsg.ProduceResponse, err error)) {
 	c.directProducer.onProduceResponse = fn
+	for _, producer := range c.fallbackProducers {
+		producer.onProduceResponse = fn
+	}
 }
 
 // Close stops the background metadata refresh, flushes pending batches, and
-// closes the underlying kgo.Client. Idempotent.
+// closes both primary and fallback transports. Idempotent.
 func (c *WarpstreamClient) Close() {
 	c.closeOnce.Do(func() {
 		c.refreshCancel()
 		c.refreshWG.Wait()
 		c.buffer.Close()
 		c.hedger.Close()
+		for _, client := range c.fallbackClients {
+			client.Close()
+		}
 		c.Client.Close()
 	})
 }
@@ -498,6 +520,11 @@ func (c *WarpstreamClient) refreshPool(trigger metadataRefreshTrigger) {
 		c.tracker.PurgeAgents(removed)
 	}
 	c.demoter.Refresh(c.pool.Agents())
+	for _, client := range c.fallbackClients {
+		if len(client.DiscoveredBrokers()) > 0 {
+			client.ForceMetadataRefresh()
+		}
+	}
 	// Nudge so a stand-in does not wait for the next periodic tick. Produce does
 	// not block. The refresh loop paces the follow-up.
 	c.noteLeaderDrops(dropped, true)
@@ -692,10 +719,8 @@ func recordErrFromResult(res ProduceResult, topic string, partition int32) error
 	return err
 }
 
-// newKgoClient constructs the kgo.Client used by the WarpstreamClient for
-// connection management and metadata. It wires the kprom transport-metrics
-// hook (registered on reg) alongside any caller hooks from cfg.
-func newKgoClient(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kgo.Client, error) {
+// newKgoClients isolates primary and fallback connections while sharing transport metrics.
+func newKgoClients(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kgo.Client, []*kgo.Client, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Address...),
 		kgo.ClientID(cfg.ClientID),
@@ -736,15 +761,35 @@ func newKgoClient(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kg
 	if cfg.TLSEnabled {
 		opts = append(opts, kgo.DialTLSConfig(cfg.TLSConfig))
 	}
-	opts = append(opts, cfg.SASLOptions...)
 
 	// kprom tracks the transport-level metrics. The filtering registerer drops
 	// the producer-state metrics this client tracks itself. Caller hooks are appended on top.
 	kpromMetrics := newKpromMetrics(newFilteringRegisterer(reg, kpromProducerStateMetricNames...))
 	hooks := append([]kgo.Hook{kpromMetrics}, cfg.Hooks...)
-	opts = append(opts, kgo.WithHooks(hooks...))
-
-	return kgo.NewClient(opts...)
+	primaryOpts := append(append([]kgo.Opt(nil), opts...), cfg.SASLOptions...)
+	primaryOpts = append(primaryOpts, kgo.WithHooks(hooks...))
+	primary, err := kgo.NewClient(primaryOpts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The primary owns SASL resources and lifecycle hooks; fallback shares only their use.
+	var mechanisms []sasl.Mechanism
+	for _, mechanism := range primary.OptValue(kgo.SASL).([]sasl.Mechanism) {
+		mechanisms = append(mechanisms, sharedSASLMechanism{mechanism})
+	}
+	var fallbacks []*kgo.Client
+	for range 2 {
+		fallback, err := kgo.NewClient(append(opts, kgo.WithHooks(sharedBrokerHooks{hooks: hooks}), kgo.WithContext(primary.Context()), kgo.SASL(mechanisms...))...)
+		if err != nil {
+			for _, client := range fallbacks {
+				client.Close()
+			}
+			primary.Close()
+			return nil, nil, err
+		}
+		fallbacks = append(fallbacks, fallback)
+	}
+	return primary, fallbacks, nil
 }
 
 // produceMaxVersions returns a kversion.Versions snapshot identical to
@@ -778,3 +823,6 @@ func log(logger kgo.Logger, level kgo.LogLevel, msg string, keyvals ...any) {
 		logger.Log(level, msg, keyvals...)
 	}
 }
+
+// Only the primary transport owns mechanism shutdown.
+type sharedSASLMechanism struct{ sasl.Mechanism }

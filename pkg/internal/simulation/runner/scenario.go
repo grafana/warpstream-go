@@ -187,15 +187,10 @@ func scenarios() []scenario {
 		{
 			name: "1% timeouts across all agents",
 			description: "Every agent has a 1% per-request chance of an extra ~10s delay (= WriteTimeout). " +
-				"The burst matches the flush deadline, so a hit on the primary can't be recovered within budget. " +
-				"With 50 partitions per request, P(no partition trips a burst) = 0.99^50 ≈ 0.605, so app success sits ~60%.",
+				"Hedging must recover stalled requests within the application deadline. " +
+				"In the Mimir workload, ordered TCP responses let one stall block later responses on the same connection; the direct workload delays individual completed requests.",
 			behaviours: burstyLatencyBehaviours(0.01, 10*time.Second),
-			// The 50% floor alone is blind: a non-hedging client already
-			// clears it at ~60% by construction (see the description). The
-			// delta is the actual assertion — wgo should hedge the stalled
-			// leg away well inside appRequestTimeout, so it should beat a
-			// non-rerouting client by a wide margin even though both clear
-			// the floor.
+			// Check both useful application throughput and a material advantage over the non-rerouting client.
 			expect: scenarioExpectations{minWgoSuccessRate: 0.50, minSuccessDeltaVsKgo: ptr(0.20)},
 		},
 		{

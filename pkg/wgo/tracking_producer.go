@@ -2,6 +2,7 @@ package wgo
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -22,9 +23,16 @@ func NewTrackingProducer(inner DirectProducer, tracker AgentStatsTracker) *Track
 func (p *TrackingProducer) ProduceSync(ctx context.Context, target Agent, partitions []encodedTopicPartitionRecords) ProduceResult {
 	start := time.Now()
 	res := p.inner.ProduceSync(ctx, target, partitions)
-	// Use ProduceResult.error() so the tracked error is consistent with what
-	// the Hedger sees: per-partition response codes count as agent errors,
-	// not just transport-level failures.
-	p.tracker.TrackAgentRequest(time.Now(), target.NodeID, time.Since(start), res.error())
+	// Per-partition broker errors must count even when the transport returns no error.
+	healthErr := res.error()
+	var wire *wireError
+	if errors.Is(ctx.Err(), context.Canceled) && errors.As(healthErr, &wire) {
+		reason := getProduceResultErr(healthErr).reason
+		if reason == "transport" {
+			// After cancellation, connection failures can come from a sibling's retained deadline.
+			healthErr = context.Canceled
+		}
+	}
+	p.tracker.TrackAgentRequest(time.Now(), target.NodeID, time.Since(start), healthErr)
 	return res
 }

@@ -15,6 +15,7 @@ type scenarioResult struct {
 	wgoSummary, kgoSummary         observationsSummary
 	wgoBuckets, kgoBuckets         []observationsSummary
 	produceDeltas                  []counterBucketDelta
+	hedgeDiagnostics               []hedgeDiagnosticInterval
 	totalPrimary                   int64
 	totalHedge                     int64
 	wgoErrorCounts, kgoErrorCounts map[string]int

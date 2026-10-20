@@ -97,7 +97,7 @@ const (
 //     merges whichever finishes first. A zero delay does not imply a probe,
 //     so the trigger is read from the decision.
 //
-// Per-partition fanout lives inside runHedgingAttempt: each wave picks
+// Per-partition fanout lives inside runHedgingAttempts: each wave picks
 // the next per-partition candidate (so partitions whose strategy
 // orderings differ end up at different agents in the same wave), groups
 // by chosen agent, and fans out concurrently through hedgeBuffer.
@@ -137,6 +137,10 @@ type Hedger struct {
 
 // NewHedger wraps inner with the orchestration described on Hedger.
 func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy PartitionAssignmentStrategy, health HealthCheckConfig, cfg HedgerConfig, linger time.Duration, batchMaxBytes int32, m *metrics, logger kgo.Logger) *Hedger {
+	return newHedger(inner, inner, tracker, strategy, health, cfg, linger, batchMaxBytes, m, logger)
+}
+
+func newHedger(inner, fallback DirectProducer, tracker AgentStatsReader, strategy PartitionAssignmentStrategy, health HealthCheckConfig, cfg HedgerConfig, linger time.Duration, batchMaxBytes int32, m *metrics, logger kgo.Logger) *Hedger {
 	if logger == nil {
 		logger = nopLogger{}
 	}
@@ -158,7 +162,7 @@ func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy Partitio
 
 		// DirectProducer takes unrouted partitions (the target Agent is specified
 		// separately), so we strip the routing.
-		return inner.ProduceSync(ctx, agentFromRouted(nodeID, parts), unrouteEncodedTopicPartitionRecords(parts))
+		return fallback.ProduceSync(ctx, agentFromRouted(nodeID, parts), unrouteEncodedTopicPartitionRecords(parts))
 	}, m, nil) // nil reg: the client's main buffer owns the buffered-producer gauges.
 	return h
 }
@@ -232,13 +236,17 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 	}()
 
 	candidates := newHedgerCandidates(h.strategy, h.cfg.MaxHedgeAgents)
+	var fallbackDelay time.Duration
+	if decision.eligible {
+		fallbackDelay = max(decision.delay, h.cfg.MinHedgeDelay, time.Nanosecond)
+	}
 
 	// raceWithPrimary starts the fallback cascade alongside the still-in-flight
 	// primary and returns whichever produces a usable outcome first. Shared by
 	// the delay==0 fast path and the timer.C branch below, so a future edit to
 	// this behavior can't land in only one of them.
 	raceWithPrimary := func(trigger hedgeTrigger) ProduceResult {
-		hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh, trigger)
+		hedged := h.runHedgingAttemptsAndRaceWithPrimary(workCtx, primaryID, partitions, candidates, primaryCh, trigger, fallbackDelay)
 		observeAttempts(hedged.result, hedged.attempts, hedged.stop)
 		return hedged.result
 	}
@@ -261,7 +269,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 				return primaryResult
 			}
 
-			hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
+			hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure, fallbackDelay)
 			result := selectProduceResult(primaryResult, hedged.result)
 			if hedged.result.succeeded() {
 				h.observeHedgeWin(hedgeTriggerPrimaryFailure)
@@ -281,7 +289,7 @@ func (h *Hedger) ProduceSync(ctx context.Context, primaryID int32, routedPartiti
 		return primaryResult
 	}
 
-	hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure)
+	hedged := h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, hedgeTriggerPrimaryFailure, fallbackDelay)
 	result := selectProduceResult(primaryResult, hedged.result)
 	if hedged.result.succeeded() {
 		h.observeHedgeWin(hedgeTriggerPrimaryFailure)
@@ -397,10 +405,10 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 // buffered hedge legs; started wire requests keep their original deadlines.
 // The reported attempts is the depth of the winning leg: 1 when the
 // primary wins, the fallback's own depth when the fallback wins.
-func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
+func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger, delay time.Duration) hedgerProduceResult {
 	fallbackCh := make(chan hedgerProduceResult, 1)
 	go func() {
-		fallbackCh <- h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, trigger)
+		fallbackCh <- h.runHedgingAttempts(workCtx, primaryID, partitions, candidates, trigger, delay)
 	}()
 
 	// Either side's "wait for the other" branch is bounded: both legs
@@ -444,11 +452,12 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 }
 
 // runHedgingAttempts runs the per-partition retry loop across other
-// agents, returning when every partition is resolved, has exhausted
-// MaxHedgeAgents, or ctx is canceled. The reported attempts is the total
+// agents, returning when every partition is resolved, all candidates and
+// in-flight results are exhausted, or ctx is canceled. Proactive races also
+// advance on their hedge delay while retaining earlier in-flight legs. The reported attempts is the total
 // attempt depth: 1 (the primary, which this function models as the first
 // tried agent) plus one per hedge wave dispatched.
-func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, trigger hedgeTrigger) (out hedgerProduceResult) {
+func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, trigger hedgeTrigger, delay time.Duration) (out hedgerProduceResult) {
 	h.metrics.hedgeAttemptsTotal.Inc()
 	h.metrics.hedgeTriggers[trigger].Inc()
 
@@ -473,15 +482,95 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 	// The primary is attempt 1; each dispatched hedge wave adds one. A wave
 	// that bails before dispatching (candidates exhausted) must not count.
 	out.attempts = 1
-	exhausted := false
-	for workCtx.Err() == nil {
-		dispatched, canRetry, waveExhausted := h.runHedgingAttempt(workCtx, acc, tried, candidates)
-		if dispatched {
-			out.attempts++
+	capacity := 0
+	for _, p := range partitions {
+		capacity += len(candidates.fetch(topicPartition{topic: p.topic, partition: p.partition}))
+	}
+	results := make(chan scopedProduceResult, capacity)
+	attemptCtx, cancel := context.WithCancel(workCtx)
+	defer cancel()
+	active := 0
+	dispatch := func() bool {
+		if workCtx.Err() != nil {
+			return false
 		}
-		if !canRetry {
-			exhausted = waveExhausted
-			break
+		groups := h.nextHedgeGroups(acc.remaining(), tried, candidates)
+		if len(groups) == 0 {
+			return false
+		}
+		out.attempts++
+		for agent, parts := range groups {
+			own := make(map[topicPartition]struct{}, len(parts))
+			for _, p := range parts {
+				own[topicPartition{topic: p.topic, partition: p.partition}] = struct{}{}
+			}
+			var once sync.Once
+			legDone := func(res ProduceResult) {
+				once.Do(func() { results <- scopeProduceResultToPartitions(res, own) })
+			}
+			active++
+			h.hedgeBuffer.MultiAdd(attemptCtx, newMultiRoutedEncodedTopicPartitionRecords(parts, agent, legDone))
+		}
+		return true
+	}
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	resetTimer := func() {
+		if delay <= 0 {
+			return
+		}
+		if timer == nil {
+			timer = time.NewTimer(delay)
+		} else {
+			timer.Reset(delay)
+		}
+		timerC = timer.C
+	}
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	exhausted := !dispatch()
+	if !exhausted {
+		resetTimer()
+	}
+loop:
+	for active > 0 && !acc.done() {
+		select {
+		case res := <-results:
+			active--
+			// A later wave may already have resolved this leg's partitions.
+			own := map[topicPartition]struct{}{}
+			for _, p := range acc.remaining() {
+				tp := topicPartition{topic: p.topic, partition: p.partition}
+				if _, ok := res.own[tp]; ok {
+					own[tp] = struct{}{}
+				}
+			}
+			if len(own) > 0 {
+				scoped := scopeProduceResultToPartitions(res.raw, own)
+				scoped.err = res.err
+				acc.accumulate(scoped)
+			}
+			if acc.done() {
+				break loop
+			}
+			if active == 0 {
+				exhausted = !dispatch()
+				if !exhausted {
+					resetTimer()
+				}
+			}
+		case <-timerC:
+			timerC = nil
+			if dispatch() {
+				resetTimer()
+			} else {
+				exhausted = true
+			}
+		case <-workCtx.Done():
+			break loop
 		}
 	}
 
@@ -500,99 +589,32 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 	return out
 }
 
-// runHedgingAttempt runs one wave of the per-partition retry loop, fanning
-// out per agent. dispatched reports whether this wave actually issued any
-// produce requests (false when it bailed before dispatching: nothing
-// pending or a partition exhausted its candidates). canRetry reports
-// whether the caller should iterate again — false when no further work
-// would change the outcome (every partition resolved, accumulator aborted,
-// a partition exhausted candidates, or ctx canceled mid-wave). exhausted is
-// set only for the candidate-budget stop.
-func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAccumulator, tried map[topicPartition][]int32, candidates *hedgerCandidates) (dispatched, canRetry, exhausted bool) {
-	pending := acc.remaining()
-	if len(pending) == 0 {
-		return false, false, false
-	}
-
-	// Pick the next candidate per partition; group by chosen agent.
-	// If any partition has exhausted its candidates we stop the whole
-	// loop: the batch can never produce every partition successfully, so
-	// further waves on the remaining partitions waste effort. Pending
-	// partitions will surface as per-partition errors in result().
+func (h *Hedger) nextHedgeGroups(pending []encodedTopicPartitionRecords, tried map[topicPartition][]int32, candidates *hedgerCandidates) map[int32][]encodedTopicPartitionRecords {
 	groups := map[int32][]encodedTopicPartitionRecords{}
 	for _, p := range pending {
 		tp := topicPartition{topic: p.topic, partition: p.partition}
-
-		// Hard cap on distinct agents tried per partition. The candidate
-		// list is memoized per (topic, partition) for the call, so it's
-		// stable across waves; this is a defensive bound guaranteeing loop
-		// termination even if a strategy returns more entries (or
-		// duplicates) than MaxHedgeAgents.
 		if len(tried[tp]) >= h.cfg.MaxHedgeAgents {
-			return false, false, true
+			return nil
 		}
-
-		var (
-			next  int32
-			found bool
-		)
+		found := false
 		for _, c := range candidates.fetch(tp) {
 			if !slices.Contains(tried[tp], c.NodeID) {
-				next = c.NodeID
+				groups[c.NodeID] = append(groups[c.NodeID], p)
 				found = true
 				break
 			}
 		}
-
-		// We exhausted all candidates for this partition. We give up.
 		if !found {
-			return false, false, true
+			return nil
 		}
-
-		tried[tp] = append(tried[tp], next)
-		groups[next] = append(groups[next], p)
 	}
-
-	// Wave-local workCtx so we can short-circuit the wait the moment the
-	// batch is fully resolved (or aborted). Cancellation flows through
-	// hedgeBuffer.MultiAdd's ctx-watch, making slow agents fire their legDone
-	// with ctx.Err() instead of blocking us on their actual flush.
-	attemptCtx, cancel := context.WithCancel(workCtx)
-	defer cancel()
-
-	// hedgeBuffer.MultiAdd is async: issue every group's MultiAdd then collect
-	// outcomes on a shared channel. One slot per group; sync.Once gates
-	// legDone so each group sends at most once. The buffered capacity
-	// ensures a late legDone (e.g. fired after we returned because the
-	// batch resolved early) never blocks the deliverer.
-	results := make(chan scopedProduceResult, len(groups))
 	for agent, parts := range groups {
-		own := make(map[topicPartition]struct{}, len(parts))
 		for _, p := range parts {
-			own[topicPartition{topic: p.topic, partition: p.partition}] = struct{}{}
-		}
-		var once sync.Once
-		legDone := func(res ProduceResult) {
-			once.Do(func() { results <- scopeProduceResultToPartitions(res, own) })
-		}
-		h.hedgeBuffer.MultiAdd(attemptCtx, newMultiRoutedEncodedTopicPartitionRecords(parts, agent, legDone))
-	}
-
-	for remaining := len(groups); remaining > 0; remaining-- {
-		select {
-		case res := <-results:
-			acc.accumulate(res)
-			if acc.done() {
-				// Either every partition resolved or a non-retriable
-				// err aborted the batch — either way, no further wave
-				// would change the outcome.
-				return true, false, false
-			}
-		case <-attemptCtx.Done():
-			return true, false, false
+			tp := topicPartition{topic: p.topic, partition: p.partition}
+			tried[tp] = append(tried[tp], agent)
 		}
 	}
-	return true, true, false
+	return groups
 }
 
 // shouldHedge returns the hedge decision for primaryID, reading the cause from

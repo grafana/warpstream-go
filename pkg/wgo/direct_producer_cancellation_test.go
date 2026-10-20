@@ -56,6 +56,32 @@ func TestKafkaDirectProducer_AlreadyCanceled(t *testing.T) {
 	})
 }
 
+func TestKafkaDirectProducer_DeadlineFailsSibling(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		producer, _, parts, started, release := gatedKafkaDirectProducer(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancel()
+		first, second := make(chan ProduceResult, 1), make(chan ProduceResult, 1)
+		go func() { first <- producer.ProduceSync(ctx, Agent{NodeID: 0}, parts) }()
+		<-started
+		go func() { second <- producer.ProduceSync(t.Context(), Agent{NodeID: 0}, parts) }()
+		synctest.Wait()
+		cancel()
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		require.ErrorIs(t, (<-first).error(), context.DeadlineExceeded)
+		// The sibling's own deadline is still 1.5s away; this is collateral connection failure.
+		select {
+		case result := <-second:
+			require.Error(t, result.error())
+			require.NotErrorIs(t, result.error(), context.DeadlineExceeded)
+		default:
+			t.Fatal("the shared connection deadline did not fail the sibling")
+		}
+		release()
+	})
+}
+
 func TestKafkaDirectProducer_CanceledAttemptKeepsDeadline(t *testing.T) {
 	for name, parentTimeout := range map[string]time.Duration{"parent deadline": 500 * time.Millisecond, "attempt deadline": 5 * time.Second} {
 		t.Run(name, func(t *testing.T) {

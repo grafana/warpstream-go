@@ -28,6 +28,16 @@ leaders, failing agents, slow agents, random failures and latency bursts, storag
 degradation, pod kills, network blackholes, and rolling replacements. Produce
 responses receive the shared per-broker latency distributions on the TCP wire.
 Response order is preserved, while delays for concurrent requests overlap.
+An injected long response delay also blocks later responses on that connection.
+The direct-client runner injects latency after the response has been read, so it
+does not model this head-of-line blocking.
+
+Reports include sampled hedge health diagnostics: per-interval suppression and
+direct-failure counters, plus the largest writer's last computed faulty fraction
+at each boundary. JSON retains all reasons. These distinguish injected stalls
+from collateral transport failures and subsequent hedge suppression. See
+[`timeout investigation`](../../../../docs/internal/timeout-investigation.md)
+for the comparison behind these diagnostics.
 
 Four scenarios run at a time by default, launching up to sixteen Mimir processes;
 use `-parallel` to change that limit. The default `all` profile includes all 15

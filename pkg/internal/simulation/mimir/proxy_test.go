@@ -124,40 +124,51 @@ func TestBrokerProxy_ResponseCorrelation(t *testing.T) {
 }
 
 func TestBrokerProxy_ConcurrentResponseDelays(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		backend, server := net.Pipe()
-		defer server.Close()
-		p := newBrokerProxy(func(context.Context, string, string) (net.Conn, error) { return backend, nil })
-		p.latency = func(string) time.Duration { return time.Second }
-		defer p.Close()
-		app, client := net.Pipe()
-		defer app.Close()
-		p.wg.Add(1)
-		go p.forward(client, "broker")
-		go func() {
-			for range 2 {
-				if _, err := readKafkaFrame(server); err != nil {
-					return
+	for _, firstDelay := range []time.Duration{time.Second, 10 * time.Second} {
+		t.Run(firstDelay.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				backend, server := net.Pipe()
+				defer server.Close()
+				p := newBrokerProxy(func(context.Context, string, string) (net.Conn, error) { return backend, nil })
+				draws := 0
+				p.latency = func(string) time.Duration {
+					draws++
+					if draws == 1 {
+						return firstDelay
+					}
+					return time.Second
 				}
-			}
-			for _, correlation := range []uint32{1, 2} {
-				if writeKafkaFrame(server, binary.BigEndian.AppendUint32(nil, correlation)) != nil {
-					return
+				defer p.Close()
+				app, client := net.Pipe()
+				defer app.Close()
+				p.wg.Add(1)
+				go p.forward(client, "broker")
+				go func() {
+					for range 2 {
+						if _, err := readKafkaFrame(server); err != nil {
+							return
+						}
+					}
+					for _, correlation := range []uint32{1, 2} {
+						if writeKafkaFrame(server, binary.BigEndian.AppendUint32(nil, correlation)) != nil {
+							return
+						}
+					}
+				}()
+				start := time.Now()
+				for _, correlation := range []uint32{1, 2} {
+					request := binary.BigEndian.AppendUint32([]byte{0, 0, 0, 11}, correlation)
+					require.NoError(t, writeKafkaFrame(app, request))
 				}
-			}
-		}()
-		start := time.Now()
-		for _, correlation := range []uint32{1, 2} {
-			request := binary.BigEndian.AppendUint32([]byte{0, 0, 0, 11}, correlation)
-			require.NoError(t, writeKafkaFrame(app, request))
-		}
-		for _, correlation := range []uint32{1, 2} {
-			frame, err := readKafkaFrame(app)
-			require.NoError(t, err)
-			require.Equal(t, correlation, binary.BigEndian.Uint32(frame))
-			require.Equal(t, time.Second, time.Since(start))
-		}
-	})
+				for _, correlation := range []uint32{1, 2} {
+					frame, err := readKafkaFrame(app)
+					require.NoError(t, err)
+					require.Equal(t, correlation, binary.BigEndian.Uint32(frame))
+					require.Equal(t, firstDelay, time.Since(start))
+				}
+			})
+		})
+	}
 }
 
 func TestBrokerProxy_CloseDuringDelay(t *testing.T) {

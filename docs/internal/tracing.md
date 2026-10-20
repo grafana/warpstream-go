@@ -44,3 +44,5 @@ the `kgo.HookProduceRecordBuffered`/`kgo.HookProduceRecordUnbuffered` interfaces
 Produce spans only. Consume-side tracing is unchanged franz-go behaviour via the embedded
 `*kgo.Client`. There are no per-hedge-leg or per-wire-request spans — matching kotel, which
 emits one span per record regardless of how many wire attempts a produce takes underneath.
+The separate fallback transports forward broker hooks only; they do not initialize
+the tracer or fire produce-record hooks again.

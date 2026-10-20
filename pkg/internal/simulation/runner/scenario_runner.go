@@ -59,11 +59,12 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 			return scenarioResult{}, err
 		}
 	}
-	sampler := startCounterSampler(observedStart, reportBucket, func() (int64, int64) {
-		if builder, ok := env.wgoClient.(eventBuilder); ok {
-			return gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_primary_total"), gatherCounter(metrics, builder.MetricsPrefix()+"warpstream_produce_requests_hedge_total")
-		}
-		return readProduceCounters(env.wgoRegistry)
+	prefix := ""
+	if builder, ok := env.wgoClient.(eventBuilder); ok {
+		prefix = builder.MetricsPrefix()
+	}
+	sampler := startCounterSampler(observedStart, reportBucket, func() counterSample {
+		return readCounterSample(metrics, prefix)
 	})
 	defer sampler.stop()
 	if sc.expect.recoveryFrom != nil {
@@ -106,14 +107,15 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
 		sc:                   sc,
 		wgoLatencySelections: env.behaviours.selectedLatencies(clientTypeWgo), kgoLatencySelections: env.behaviours.selectedLatencies(clientTypeKgo),
-		windows:        summarizeWindows(sc.windows, observedStart, wgoSnapshot, kgoSnapshot),
-		wgoSummary:     wgoSnapshot.summary(),
-		kgoSummary:     kgoSnapshot.summary(),
-		wgoBuckets:     wgoSnapshot.bucketedSummary(reportBucket),
-		kgoBuckets:     kgoSnapshot.bucketedSummary(reportBucket),
-		produceDeltas:  bucketDeltas(samples),
-		wgoErrorCounts: wgoSnapshot.errorCounts(),
-		kgoErrorCounts: kgoSnapshot.errorCounts(),
+		windows:          summarizeWindows(sc.windows, observedStart, wgoSnapshot, kgoSnapshot),
+		wgoSummary:       wgoSnapshot.summary(),
+		kgoSummary:       kgoSnapshot.summary(),
+		wgoBuckets:       wgoSnapshot.bucketedSummary(reportBucket),
+		kgoBuckets:       kgoSnapshot.bucketedSummary(reportBucket),
+		produceDeltas:    bucketDeltas(samples),
+		hedgeDiagnostics: diagnosticIntervals(samples),
+		wgoErrorCounts:   wgoSnapshot.errorCounts(),
+		kgoErrorCounts:   kgoSnapshot.errorCounts(),
 	}
 	if len(samples) >= 2 {
 		first, last := samples[0], samples[len(samples)-1]

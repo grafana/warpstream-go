@@ -13,11 +13,15 @@ Connection and request-transport metrics (`connects_total`,
 `connect_errors_total`, `disconnects_total`, `write_bytes_total`,
 `write_errors_total`, `read_bytes_total`, `read_errors_total`, the request
 E2E/throttle histograms, …) come from kprom, attached as a hook on the embedded
-franz-go client.
+franz-go client. Primary and fallback transports share the same broker hooks and
+collectors; the fallbacks forward only broker events, so they do not register or
+unregister collectors again.
 
 The client's produce requests still travel over franz-go's broker connections,
 so kprom's connection and transport hooks fire normally and these metrics need
-no special handling.
+no special handling. Raw transport failures are counted even after a hedge loses;
+the agent-health tracker separately excludes collateral connection failures on
+canceled legs, while retaining actual deadlines and broker-reported errors.
 
 ## 2. Producer-state metrics — tracked by the client, under kprom names
 
