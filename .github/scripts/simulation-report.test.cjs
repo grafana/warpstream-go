@@ -11,7 +11,7 @@ const row = (passes, failures = []) => ({ scenario: 'rolling restart', wgo: { at
 test('shows the independent observed range for each client without requiring equal pass counts', () => {
   const first = row(120); first.kgo.passes = 25;
   const output = renderWorkload('Mimir', [[first], [row(118, ['success below floor'])], [row(119, ['success below floor'])]]);
-  assert.ok(output.includes('| rolling restart | **99.17% ± 0.83 pp** | — | 22.50% ± 1.67 pp |'));
+  assert.ok(output.includes('| rolling restart | 🏆 **99.17% ± 0.83 pp** | — | 22.50% ± 1.67 pp |'));
   assert.match(output, /wgo \(PR\) success \| wgo \(main\) success \| kgo success/);
   assert.doesNotMatch(output, /gates met/);
 });
@@ -54,7 +54,7 @@ test('scenario expectation failures remain informational', () => {
 test('normalizes each real remote-write run before computing its range', () => {
   const remote = (attempts, passes) => ({ scenario: 'prometheus', observation_kind: 'remote_write_http_attempt', wgo: { attempts, passes }, kgo: { attempts: 100, passes: 75 } });
   const output = renderWorkload('Mimir', [[remote(10, 9)], [remote(100, 80)], [remote(200, 170)]]);
-  assert.ok(output.includes('| prometheus (HTTP attempts) | **85.00% ± 5.00 pp** | — | 75.00% ± 0.00 pp |'));
+  assert.ok(output.includes('| prometheus (HTTP attempts) | 🏆 **85.00% ± 5.00 pp** | — | 75.00% ± 0.00 pp |'));
 });
 
 test('rejects inconsistent observation kinds and unknown event kinds', () => {
@@ -68,7 +68,7 @@ test('compares PR and main through the same scenarios', () => {
   const pr = [[row(110)], [row(105)], [row(108)]];
   const main = [[row(100)], [row(101)], [row(102)]];
   const output = renderWorkload('Mimir', pr, main);
-  assert.ok(output.includes('| rolling restart | **89.58% ± 2.08 pp** | 84.17% ± 0.83 pp | 24.17% ± 0.00 pp |'));
+  assert.ok(output.includes('| rolling restart | 🏆 **89.58% ± 2.08 pp** | 84.17% ± 0.83 pp | 24.17% ± 0.00 pp |'));
   assert.throws(() => renderWorkload('Mimir', pr, [[{ ...row(100), scenario: 'other' }], ...main.slice(1)]), /scenario names differ/);
 });
 
@@ -82,7 +82,7 @@ test('sorts the weakest PR result first, independently of the main result', () =
 test('ties highlight PR wgo only across three columns', () => {
   const rows = [{ ...row(120), kgo: { attempts: 120, passes: 120 } }];
   const output = renderWorkload('Mimir', [rows, rows, rows], [rows, rows, rows]);
-  assert.ok(output.includes('| rolling restart | **100%** | 100% | 100% |'));
+  assert.ok(output.includes('| rolling restart | ✅ **100%** | 100% | 100% |'));
 });
 
 test('validates frozen main and common harness provenance', t => {
@@ -141,7 +141,7 @@ test('missing batches invalidate only their scenario results', t => {
   fs.rmSync(path.join(directory, 'simulation-mimir-pr-2-batch-3'), { recursive: true });
   const output = buildReport(directory);
   assert.match(output, /Mimir: pr run 2, batch 3\/5 did not produce a report/);
-  assert.ok(output.includes('| scenario 3 | — | **98.33% ± 0.83 pp** | — |'));
+  assert.ok(output.includes('| scenario 3 | — | 🏆 **98.33% ± 0.83 pp** | — |'));
   assert.ok(output.includes('| scenario 1 | 98.33% ± 0.83 pp | 98.33% ± 0.83 pp | 24.17% ± 0.00 pp |'));
 });
 
@@ -155,7 +155,7 @@ test('retains scenarios absent from the first available run', t => {
   const directory = batchReports(t);
   fs.rmSync(path.join(directory, 'simulation-mimir-pr-1-batch-3'), { recursive: true });
   const output = buildReport(directory);
-  assert.ok(output.includes('| scenario 3 | — | **98.33% ± 0.83 pp** | — |'));
+  assert.ok(output.includes('| scenario 3 | — | 🏆 **98.33% ± 0.83 pp** | — |'));
 });
 
 test('rejects changed scenario coverage even when a batch is missing', t => {
@@ -171,7 +171,7 @@ test('reports acknowledged sample ranges independently of HTTP attempts', () => 
     wgo_sender: { samples_accepted_observed_total: samples },
     kgo_sender: { samples_accepted_observed_total: 500 } });
   const output = renderWorkload('Mimir', [[remote(1000)], [remote(3000)], [remote(2000)]]);
-  assert.ok(output.includes('| rolling restart | **2,000 ± 1,000** | — | 500 ± 0 |'));
+  assert.ok(output.includes('| rolling restart | 🏆 **2,000 ± 1,000** | — | 500 ± 0 |'));
   assert.match(output, /Samples acknowledged by Mimir/);
   assert.match(output, /\*\*100%\*\*/);
 });
