@@ -59,7 +59,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   simulation-build:
-    name: Build simulation (${{ matrix.workload.name }})
+    name: Build simulation (${{ matrix.workload.name }}, wgo v0.1.4)
     needs: [simulation-workloads]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -72,6 +72,7 @@ jobs:
         working-directory: ${{ matrix.workload.directory }}
     env:
       GOMAXPROCS: "2"
+      WARPSTREAM_CLIENT_VERSION: v0.1.4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,6 +86,13 @@ jobs:
             pkg/internal/simulation/**/go.sum
             pkg/internal/simulation/**/*-version.txt
             pkg/internal/simulation/**/build-*.sh
+      # Keep the current harness and scenarios while replacing only the client.
+      - name: Use v0.1.4 client for direct simulation
+        if: matrix.workload.name == 'direct'
+        working-directory: .
+        run: |
+          git fetch --no-tags --depth=1 origin ecd45c8d3ba0004c4420ffdfd7341438dab8875a # v0.1.4
+          git restore --source=FETCH_HEAD --worktree -- pkg/wgo
       - name: Build integration workload
         if: matrix.workload.name != 'direct'
         run: |
@@ -138,7 +146,7 @@ jobs:
         run: go test -mod=mod -race -p 2 ./...
 
   simulation:
-    name: Simulation (${{ matrix.workload.name }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
+    name: Simulation (${{ matrix.workload.name }}, wgo v0.1.4, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
     needs: [simulation-workloads, simulation-build]
     # A failed workload build must not suppress suites with usable artifacts.
     if: ${{ !cancelled() && needs.simulation-workloads.result == 'success' }}
