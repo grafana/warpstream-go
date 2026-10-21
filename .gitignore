@@ -1,1 +1,11 @@
 pkg/internal/simulation/**/.reports/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+!.vscode/extensions.json
+
+# Operating System Files
+.DS_Store
+Thumbs.db
