@@ -58,6 +58,21 @@ func TestScenarioResults_Check_DeltaVsKgo(t *testing.T) {
 	assert.Equal(t, "no better than kgo", failures[0].scenario)
 }
 
+func TestScenarioResults_Check_CascadeContinuation(t *testing.T) {
+	t.Parallel()
+	result := scenarioResult{sc: scenario{requireCascadeContinuation: true}, staleFallback: &staleFallbackEvidence{FallbackErrors: 1, ThirdAttemptSuccesses: 1}}
+	require.Empty(t, checkResult(result))
+	for _, field := range []*int64{&result.staleFallback.FallbackErrors, &result.staleFallback.ThirdAttemptSuccesses} {
+		*field = 0
+		require.Len(t, checkResult(result), 1)
+		*field = 1
+	}
+	result.staleFallback.TerminalErrors = 1
+	require.Len(t, checkResult(result), 1)
+	result.staleFallback = nil
+	require.Len(t, checkResult(result), 2)
+}
+
 func TestScenarioResults_RecoveryAndSurge(t *testing.T) {
 	t.Parallel()
 	result := scenarioResult{

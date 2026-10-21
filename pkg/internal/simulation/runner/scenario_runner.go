@@ -60,7 +60,7 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		}
 	}
 	var initialFallback *staleFallbackEvidence
-	if sc.requireStaleFallback {
+	if sc.collectsCascadeEvidence() {
 		initialFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
@@ -113,6 +113,7 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	kgoSnapshot := kgoObservations.snapshot()
 	res := scenarioResult{
 		wgoMissingLeaders: env.wgoMetadata.missingLeaders(), kgoMissingLeaders: env.kgoMetadata.missingLeaders(),
+		wgoMetadataFailures: env.wgoMetadata.failedMetadata(), kgoMetadataFailures: env.kgoMetadata.failedMetadata(),
 		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
 		sc:                   sc,
 		wgoLatencySelections: env.behaviours.selectedLatencies(clientTypeWgo), kgoLatencySelections: env.behaviours.selectedLatencies(clientTypeKgo),
@@ -150,17 +151,12 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	if profile, ok := env.wgoClient.(interface{ Describe() (string, string) }); ok {
 		res.workloadDescription, res.workloadConfiguration = profile.Describe()
 	}
-	if sc.requireStaleFallback {
+	if sc.collectsCascadeEvidence() {
 		res.staleFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
 		}
-		res.staleFallback.FallbackErrors -= initialFallback.FallbackErrors
-		for reason, count := range initialFallback.FallbackErrorReasons {
-			res.staleFallback.FallbackErrorReasons[reason] -= count
-		}
-		res.staleFallback.ThirdAttemptSuccesses -= initialFallback.ThirdAttemptSuccesses
-		res.staleFallback.TerminalErrors -= initialFallback.TerminalErrors
+		res.staleFallback.subtract(initialFallback)
 	}
 	if initialEvidence != nil {
 		res.clientEvidence, err = readClientEvidence(metrics, prefix)

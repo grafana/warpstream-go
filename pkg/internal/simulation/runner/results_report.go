@@ -37,12 +37,26 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 		Wgo         clientResults `json:"wgo"`
 		Kgo         clientResults `json:"kgo"`
 	}
+	type successLatency struct {
+		MeanSeconds float64 `json:"mean_seconds"`
+		P50Seconds  float64 `json:"p50_seconds"`
+		P99Seconds  float64 `json:"p99_seconds"`
+	}
+	latencyOf := func(s observationsSummary) *successLatency {
+		if s.successes == 0 {
+			return nil
+		}
+		return &successLatency{s.successMeanLatency.Seconds(), s.successP50Latency.Seconds(), s.successP99Latency.Seconds()}
+	}
 	type scenarioSuccess struct {
 		ObservationKind   string                 `json:"observation_kind,omitempty"`
 		WgoSender         map[string]float64     `json:"wgo_sender,omitempty"`
 		KgoSender         map[string]float64     `json:"kgo_sender,omitempty"`
 		Scenario          string                 `json:"scenario"`
 		ClientEvidence    *clientEvidence        `json:"wgo_client_evidence,omitempty"`
+		HedgeStop         *hedgeStop             `json:"hedge_stop,omitempty"`
+		WgoSuccessLatency *successLatency        `json:"wgo_success_latency,omitempty"`
+		KgoSuccessLatency *successLatency        `json:"kgo_success_latency,omitempty"`
 		StaleFallback     *staleFallbackEvidence `json:"stale_fallback,omitempty"`
 		Wgo               clientResults          `json:"wgo"`
 		Kgo               clientResults          `json:"kgo"`
@@ -58,9 +72,13 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 			WgoSender: res.wgoSender, KgoSender: res.kgoSender,
 			StaleFallback:     res.staleFallback,
 			ClientEvidence:    res.clientEvidence,
+			WgoSuccessLatency: latencyOf(res.wgoSummary), KgoSuccessLatency: latencyOf(res.kgoSummary),
 			WgoInjectedDelays: res.wgoLatencySelections, KgoInjectedDelays: res.kgoLatencySelections,
 			Wgo: clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
 			Kgo: clientResults{Attempts: res.kgoSummary.total, Passes: res.kgoSummary.successes},
+		}
+		if stop := res.hedgeStop(); stop.worthReporting() {
+			entry.HedgeStop = stop
 		}
 		if res.observationDescription != "" {
 			entry.ObservationKind = "remote_write_http_attempt"
@@ -135,10 +153,40 @@ func (rr *resultsReport) generateMarkdown() string {
 	}
 	b.WriteString("\n")
 
+	rr.writeSuccessLatencyTable(&b)
+
+	var stops []hedgeStopRow
+	for _, res := range rr.results.entries {
+		if stop := res.hedgeStop(); stop.worthReporting() {
+			stops = append(stops, hedgeStopRow{res.sc.name, rr.appSuccessCell(res.wgoSummary), rr.appSuccessCell(res.kgoSummary), stop})
+		}
+	}
+	writeHedgeStopTable(&b, stops)
+
 	for _, res := range rr.results.entries {
 		rr.writeScenarioSection(&b, res)
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+// writeSuccessLatencyTable shows each client's success ratio, then the latency of
+// the writes that succeeded. A failure is a 5xx for the application, so it leads.
+func (rr *resultsReport) writeSuccessLatencyTable(b *strings.Builder) {
+	b.WriteString("### Latency of successful requests\n\nOnly requests that succeeded are timed, so a failure's deadline does not hide how fast the others were; `n/a` means none succeeded. Read it with the success columns, since a client that fails its slowest writes looks faster here. The summary above counts failures at their deadline.\n\n")
+	b.WriteString("| Scenario | wgo success | kgo success | wgo p50 | kgo p50 | wgo p99 | kgo p99 | wgo mean | kgo mean |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+	cell := func(s observationsSummary, d time.Duration) string {
+		if s.successes == 0 {
+			return "n/a"
+		}
+		return rr.formatDuration(d)
+	}
+	for _, res := range rr.results.entries {
+		w, k := res.wgoSummary, res.kgoSummary
+		fmt.Fprintf(b, "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", res.sc.name, rr.appSuccessCell(w), rr.appSuccessCell(k),
+			cell(w, w.successP50Latency), cell(k, k.successP50Latency), cell(w, w.successP99Latency), cell(k, k.successP99Latency),
+			cell(w, w.successMeanLatency), cell(k, k.successMeanLatency))
+	}
+	b.WriteString("\n")
 }
 
 // Include settings so readers can distinguish scenario effects from client
@@ -228,6 +276,9 @@ func (rr *resultsReport) writeScenarioSection(b *strings.Builder, res scenarioRe
 			}
 			fmt.Fprintf(b, "- %s: %s\n", group.name, strings.Join(values, ", "))
 		}
+		if stop := res.hedgeStop(); stop.worthReporting() {
+			fmt.Fprintf(b, "- %s\n", stop.line())
+		}
 		b.WriteString("\n")
 	}
 	if evidence := res.staleFallback; evidence != nil {
@@ -243,6 +294,9 @@ func (rr *resultsReport) writeScenarioSection(b *strings.Builder, res scenarioRe
 	fmt.Fprintf(b, "- wgo-kgo success delta: %s\n", rr.successDeltaLine(res))
 	if line := rr.slowFractionLine(res); line != "" {
 		fmt.Fprintf(b, "- %s\n", line)
+	}
+	if res.sc.failsMetadata() {
+		fmt.Fprintf(b, "- Metadata requests failed: wgo %d, kgo %d\n", res.wgoMetadataFailures, res.kgoMetadataFailures)
 	}
 	if len(res.sc.transportPhases) > 0 {
 		for _, phase := range res.sc.transportPhases {
@@ -386,8 +440,12 @@ func (rr *resultsReport) summaryLine(s observationsSummary) string {
 	if s.total > 0 {
 		rate = fmt.Sprintf("%d/%d (%.1f%%)", s.successes, s.total, 100*float64(s.successes)/float64(s.total))
 	}
-	return fmt.Sprintf("success=%s mean=%s p50=%s p99=%s",
+	line := fmt.Sprintf("success=%s mean=%s p50=%s p99=%s",
 		rate, rr.formatDuration(s.meanLatency), rr.formatDuration(s.p50Latency), rr.formatDuration(s.p99Latency))
+	if s.successes > 0 && s.failures > 0 {
+		line += fmt.Sprintf(" (successful only: mean=%s p50=%s p99=%s)", rr.formatDuration(s.successMeanLatency), rr.formatDuration(s.successP50Latency), rr.formatDuration(s.successP99Latency))
+	}
+	return line
 }
 
 // successDeltaCell renders wgo's success-rate margin over kgo, e.g.

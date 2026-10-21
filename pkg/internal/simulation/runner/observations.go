@@ -104,10 +104,13 @@ func (s observationsSnapshot) summary() observationsSummary {
 	if len(s.list) == 0 {
 		return out
 	}
-	var sum time.Duration
+	var sum, successSum time.Duration
+	var succeeded []observation
 	for _, ob := range s.list {
 		if ob.err == nil {
 			out.successes++
+			successSum += ob.latency
+			succeeded = append(succeeded, ob)
 		} else {
 			out.failures++
 		}
@@ -116,6 +119,12 @@ func (s observationsSnapshot) summary() observationsSummary {
 	out.meanLatency = sum / time.Duration(len(s.list))
 	out.p50Latency = s.latencyQuantile(0.50)
 	out.p99Latency = s.latencyQuantile(0.99)
+	if len(succeeded) > 0 {
+		successes := observationsSnapshot{list: succeeded}
+		out.successMeanLatency = successSum / time.Duration(len(succeeded))
+		out.successP50Latency = successes.latencyQuantile(0.50)
+		out.successP99Latency = successes.latencyQuantile(0.99)
+	}
 	return out
 }
 
@@ -159,6 +168,13 @@ type observationsSummary struct {
 	meanLatency time.Duration
 	p50Latency  time.Duration
 	p99Latency  time.Duration
+
+	// The latency of the successful observations alone. A failure's latency is its
+	// caller's deadline, so it hides how long the writes that did succeed took.
+	// All three are zero when nothing succeeded.
+	successMeanLatency time.Duration
+	successP50Latency  time.Duration
+	successP99Latency  time.Duration
 }
 
 func (s observationsSnapshot) scheduledSince(start time.Time) observationsSnapshot {
