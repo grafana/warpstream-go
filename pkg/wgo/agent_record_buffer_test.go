@@ -676,7 +676,7 @@ func TestAgentBuffer_Close(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("Close did not return after flush completed")
 		}
-		<-done
+		require.NoError(t, <-done)
 	})
 }
 
@@ -735,8 +735,8 @@ func TestAgentBuffer_FlushesInFlightHistogram(t *testing.T) {
 	assert.Equal(t, float64(3), sum, "second observation is in-flight=2, so sum is 1+2")
 
 	close(release)
-	<-done1
-	<-done2
+	require.NoError(t, <-done1)
+	require.NoError(t, <-done2)
 
 	count, sum = flushesInFlightSample(t, reg)
 	assert.EqualValues(t, 2, count, "completions are not observed")
