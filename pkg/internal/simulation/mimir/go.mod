@@ -1,6 +1,6 @@
 module github.com/grafana/warpstream-go/pkg/internal/simulation/mimir
 
-go 1.26.10
+go 1.27.3
 
 require (
 	github.com/go-kit/log v0.2.1
