@@ -84,8 +84,13 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 	}
 	req.SetTimeout(int32(s.cfg.ProduceRequestTimeout.Milliseconds()))
 
-	attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.ProduceRequestTimeout+s.cfg.ProduceRequestTimeoutOverhead)
-	defer cancel()
+	// The wire request must not inherit ctx's cancellation: franz-go kills the
+	// whole connection when a request is canceled while its response is being
+	// awaited, failing every other produce in flight to that agent (e.g. other
+	// primaries sharing the connection when a hedge wins). Only the per-attempt
+	// deadline may interrupt the wire; a canceled caller abandons the attempt
+	// instead and its response is discarded.
+	attemptCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ProduceRequestTimeout+s.cfg.ProduceRequestTimeoutOverhead)
 
 	agentState := agentStateLabel(target.State)
 	s.metrics.produceDirectRequestsTotal.WithLabelValues(agentState).Inc()
@@ -116,6 +121,27 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		}
 	}()
 
+	// Buffered so an abandoned attempt's goroutine never blocks on send.
+	done := make(chan ProduceResult, 1)
+	go func() {
+		defer cancel()
+		done <- s.request(attemptCtx, target, req)
+	}()
+
+	// The caller's deadline is honoured like a cancellation: the attempt is
+	// abandoned, not interrupted, so ctx.Err() keeps DeadlineExceeded vs
+	// Canceled for classification.
+	select {
+	case res := <-done:
+		return res
+	case <-ctx.Done():
+		return ProduceResult{err: ctx.Err()}
+	}
+}
+
+// request sends req to target and decodes the response. attemptCtx bounds
+// the wire round trip only.
+func (s *KafkaDirectProducer) request(attemptCtx context.Context, target Agent, req *kmsg.ProduceRequest) ProduceResult {
 	// Uses Broker.Request (not RetriableRequest) so franz-go's internal retry
 	// loop stays out of the way: retries are owned by the caller.
 	resp, err := s.client.Broker(int(target.NodeID)).Request(attemptCtx, req)
