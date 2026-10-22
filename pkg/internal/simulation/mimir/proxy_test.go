@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -181,4 +183,86 @@ func TestBrokerProxy_CloseDuringDelay(t *testing.T) {
 		p.Close()
 		require.Zero(t, time.Since(start))
 	})
+}
+
+func TestBrokerProxy_StorageTimeout(t *testing.T) {
+	for _, version := range []int16{8, 11} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				p := newBrokerProxy(func(_ context.Context, _, _ string) (net.Conn, error) {
+					client, server := net.Pipe()
+					go func() {
+						defer server.Close()
+						for {
+							frame, err := readKafkaFrame(server)
+							if err != nil {
+								return
+							}
+							response := kmsg.NewPtrProduceResponse()
+							response.SetVersion(version)
+							response.Topics = []kmsg.ProduceResponseTopic{{Topic: "topic", Partitions: []kmsg.ProduceResponseTopicPartition{{Partition: 3}}}}
+							header := append([]byte(nil), frame[4:8]...)
+							if response.IsFlexible() {
+								header = append(header, 0)
+							}
+							if writeKafkaFrame(server, response.AppendTo(header)) != nil {
+								return
+							}
+						}
+					}()
+					return client, nil
+				})
+				p.latency = func(string) time.Duration { return 3 * time.Second }
+				p.enforceProduceTimeout = true
+				var delivered atomic.Int64
+				p.observe = func(_ string, version int16, frame []byte) {
+					if observeProduceResponse(frame, version, nil) {
+						delivered.Add(1)
+					}
+				}
+				client, server := net.Pipe()
+				p.wg.Add(1)
+				go p.forward(server, "agent")
+				defer p.Close()
+				defer client.Close()
+				for _, budget := range []int32{2000, 4000} {
+					request := kmsg.NewPtrProduceRequest()
+					request.SetVersion(version)
+					request.TimeoutMillis = budget
+					header := binary.BigEndian.AppendUint16(nil, uint16(kmsg.Produce))
+					header = binary.BigEndian.AppendUint16(header, uint16(version))
+					header = binary.BigEndian.AppendUint32(header, uint32(budget))
+					header = append(header, 255, 255)
+					if request.IsFlexible() {
+						header = append(header, 0)
+					}
+					frame := request.AppendTo(header)
+					parsed, err := produceTimeout(frame, version)
+					require.NoError(t, err)
+					require.Equal(t, time.Duration(budget)*time.Millisecond, parsed)
+					start := time.Now()
+					require.NoError(t, writeKafkaFrame(client, frame))
+					frame, err = readKafkaFrame(client)
+					require.NoError(t, err)
+					require.Equal(t, min(3*time.Second, parsed), time.Since(start))
+					response := kmsg.NewPtrProduceResponse()
+					response.SetVersion(version)
+					offset, err := responseHeaderLength(frame, response.IsFlexible())
+					require.NoError(t, err)
+					require.NoError(t, response.ReadFrom(frame[offset:]))
+					require.Equal(t, uint32(budget), binary.BigEndian.Uint32(frame[:4]))
+					partition := response.Topics[0].Partitions[0]
+					require.EqualValues(t, 3, partition.Partition)
+					synctest.Wait()
+					if budget == 2000 {
+						require.Zero(t, delivered.Load())
+						require.Equal(t, kerr.KafkaStorageError.Code, partition.ErrorCode)
+					} else {
+						require.Zero(t, partition.ErrorCode)
+						require.EqualValues(t, 1, delivered.Load())
+					}
+				}
+			})
+		})
+	}
 }

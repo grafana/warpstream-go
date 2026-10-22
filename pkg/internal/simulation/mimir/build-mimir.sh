@@ -2,7 +2,7 @@
 set -euo pipefail
 
 module_dir="$(cd "$(dirname "$0")" && pwd)"
-repo_dir="$(git -C "$module_dir" rev-parse --show-toplevel)"
+repo_dir="${WARPSTREAM_CLIENT_DIR:-$(git -C "$module_dir" rev-parse --show-toplevel)}"
 build_dir="${1:-$module_dir/.build}"
 mkdir -p "$build_dir"
 build_dir="$(cd "$build_dir" && pwd)"

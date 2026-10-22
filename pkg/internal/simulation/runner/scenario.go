@@ -18,6 +18,7 @@ type scenarioExpectations struct {
 	// clear. Always enforced; the zero value is a no-op floor every run
 	// passes.
 	minWgoSuccessRate float64
+	maxSenderLag      *time.Duration
 	recoveryFrom      *time.Duration
 	maxHedgeSurge     *float64
 
@@ -56,6 +57,7 @@ type scenario struct {
 	windows                 []observationWindow
 	requiredWgoDelayBrokers []int32
 	requireStaleFallback    bool
+	collectClientEvidence   bool
 }
 
 func (sc scenario) duration() time.Duration {

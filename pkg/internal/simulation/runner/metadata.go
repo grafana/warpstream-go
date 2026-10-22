@@ -32,7 +32,7 @@ func installMetadataControl(cluster *kfake.Cluster, template *kmsg.MetadataRespo
 	return installMetadataPlacementControl(cluster, template, behaviours, false, false, -1)
 }
 
-func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider, singleAgent, dynamic bool, retainedFallback int32) *metadataView {
+func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider, singleAgent, dynamic bool, retainedFallback int32, advertised ...int) *metadataView {
 	view := &metadataView{template: template}
 	view.current.Store(template)
 	cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
@@ -46,7 +46,11 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 			if dynamic {
 				preferred = cluster.CurrentNode()
 			}
-			response = metadataPreferredPlacement(response, preferred, 3, retainedFallback)
+			count := 3
+			if len(advertised) > 0 && advertised[0] > 0 {
+				count = advertised[0]
+			}
+			response = metadataPreferredPlacement(response, preferred, count, retainedFallback)
 		}
 		metadataRequest := req.(*kmsg.MetadataRequest)
 		if len(behaviour.brokerOnlyMissing) > 0 {

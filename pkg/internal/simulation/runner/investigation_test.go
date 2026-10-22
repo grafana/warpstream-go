@@ -23,7 +23,7 @@ func TestInvestigation_ProfileSelection(t *testing.T) {
 	require.Len(t, investigation, 5)
 	all, err := profileScenarios("all", true)
 	require.NoError(t, err)
-	require.Len(t, all, len(standard)+len(investigation))
+	require.Len(t, all, len(standard)+len(investigation)+len(storagePressureScenarios()))
 	found := false
 	for _, candidate := range all {
 		if candidate.requireStaleFallback {

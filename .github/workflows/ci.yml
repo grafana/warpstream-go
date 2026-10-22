@@ -36,7 +36,9 @@ jobs:
       - name: Run unit tests
         run: make test
       - name: Test simulation report publisher
-        run: node --test .github/scripts/*.test.cjs
+        run: |
+          node --test .github/scripts/*.test.cjs
+          python3 -B .github/scripts/test_prepare_simulation.py
 
   simulation-workloads:
     name: Discover simulation workloads
@@ -45,10 +47,15 @@ jobs:
       workloads: ${{ steps.workloads.outputs.workloads }}
       integrations: ${{ steps.workloads.outputs.integrations }}
       batches: ${{ steps.workloads.outputs.batches }}
+      main-sha: ${{ steps.main.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - id: main
+        run: |
+          git fetch --depth=1 origin main
+          echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
       - id: workloads
         run: |
           workloads=$(node .github/scripts/simulation-workloads.cjs)
@@ -59,7 +66,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   simulation-build:
-    name: Build simulation (${{ matrix.workload.name }})
+    name: Build simulation (${{ matrix.workload.name }}, ${{ matrix.client }})
     needs: [simulation-workloads]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -67,9 +74,10 @@ jobs:
       fail-fast: false
       matrix:
         workload: ${{ fromJSON(needs.simulation-workloads.outputs.workloads) }}
+        client: [pr, main]
     defaults:
       run:
-        working-directory: ${{ matrix.workload.directory }}
+        working-directory: ${{ github.workspace }}/.simulation-harness/${{ matrix.workload.name != 'direct' && matrix.workload.name || '' }}
     env:
       GOMAXPROCS: "2"
     steps:
@@ -85,14 +93,43 @@ jobs:
             pkg/internal/simulation/**/go.sum
             pkg/internal/simulation/**/*-version.txt
             pkg/internal/simulation/**/build-*.sh
+            pkg/internal/simulation/**/download-*.sh
+            pkg/internal/simulation/**/*-sha256sums.txt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.client == 'main'
+        with:
+          ref: ${{ needs.simulation-workloads.outputs.main-sha }}
+          path: .simulation-main-client
+          persist-credentials: false
+      - name: Stage common harness
+        working-directory: ${{ github.workspace }}
+        env:
+          CLIENT_VARIANT: ${{ matrix.client }}
+          MAIN_SHA: ${{ needs.simulation-workloads.outputs.main-sha }}
+        run: |
+          client_directory="$GITHUB_WORKSPACE"
+          if [ "$CLIENT_VARIANT" = main ]; then
+            client_directory="$GITHUB_WORKSPACE/.simulation-main-client"
+          fi
+          python3 .github/scripts/prepare-simulation.py "$client_directory" "$GITHUB_WORKSPACE/.simulation-harness"
+          echo "WARPSTREAM_CLIENT_DIR=$client_directory" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/simulation-build/provenance"
+          git -C "$client_directory" rev-parse HEAD | tee "$RUNNER_TEMP/simulation-build/provenance/client-sha.txt"
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD | tee "$RUNNER_TEMP/simulation-build/provenance/harness-sha.txt"
+          printf '%s\n' "$MAIN_SHA" | tee "$RUNNER_TEMP/simulation-build/provenance/main-sha.txt"
       - name: Build integration workload
         if: matrix.workload.name != 'direct'
         run: |
-          for build in build-*.sh; do
-            if [ -f "$build" ]; then
-              bash "$build" "$RUNNER_TEMP/simulation-build/workload"
+          for script in build-*.sh download-*.sh; do
+            if [ -f "$script" ]; then
+              bash "$script" "$RUNNER_TEMP/simulation-build/workload"
             fi
           done
+      - name: Test real Prometheus sender retries
+        if: matrix.workload.name == 'mimir' && matrix.client == 'pr'
+        env:
+          PROMETHEUS_BINARY: ${{ runner.temp }}/simulation-build/workload/prometheus
+        run: go test -mod=mod -race -p 2 -count=1 -run '^TestPrometheus_RetryRemoteWrite$' .
       - name: Build simulation harness
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-build"
@@ -103,7 +140,7 @@ jobs:
       - name: Upload simulation executables
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: build-simulation-${{ matrix.workload.name }}
+          name: build-simulation-${{ matrix.workload.name }}-${{ matrix.client }}
           path: ${{ runner.temp }}/simulation-build.tar.gz
           compression-level: 0
           if-no-files-found: error
@@ -138,7 +175,7 @@ jobs:
         run: go test -mod=mod -race -p 2 ./...
 
   simulation:
-    name: Simulation (${{ matrix.workload.name }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
+    name: Simulation (${{ matrix.workload.name }}, ${{ matrix.client }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
     needs: [simulation-workloads, simulation-build]
     # A failed workload build must not suppress suites with usable artifacts.
     if: ${{ !cancelled() && needs.simulation-workloads.result == 'success' }}
@@ -149,6 +186,7 @@ jobs:
       matrix:
         workload: ${{ fromJSON(needs.simulation-workloads.outputs.batches) }}
         run: [1, 2, 3]
+        client: [pr, main]
     defaults:
       run:
         working-directory: ${{ matrix.workload.directory }}
@@ -161,7 +199,7 @@ jobs:
       - name: Download simulation executables
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: build-simulation-${{ matrix.workload.name }}
+          name: build-simulation-${{ matrix.workload.name }}-${{ matrix.client }}
           path: ${{ runner.temp }}
       - name: Extract simulation executables
         run: |
@@ -176,6 +214,7 @@ jobs:
           SIMULATION_BINARY: ${{ runner.temp }}/simulation-build/workload/${{ matrix.workload.name }}
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-report"
+          cp "$RUNNER_TEMP/simulation-build/provenance/"*.txt "$RUNNER_TEMP/simulation-report/"
           "$RUNNER_TEMP/simulation-build/harness" -timeout "$SIMULATION_TIMEOUT" -check=false \
             -batch "$SIMULATION_BATCH" -batches "$SIMULATION_BATCHES" \
             -report-filepath "$RUNNER_TEMP/simulation-report/report.md" \
@@ -184,7 +223,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: simulation-${{ matrix.workload.name }}-${{ matrix.run }}-batch-${{ matrix.workload.batch }}
+          name: simulation-${{ matrix.workload.name }}-${{ matrix.client }}-${{ matrix.run }}-batch-${{ matrix.workload.batch }}
           path: ${{ runner.temp }}/simulation-report/
           if-no-files-found: ignore
       - name: Publish simulation report

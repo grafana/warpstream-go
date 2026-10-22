@@ -1,11 +1,17 @@
 package runner
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // scenarioResult holds everything the report and the pass/fail check need for one
 // scenario.
 type scenarioResult struct {
 	sc                                         scenario
+	observationDescription                     string
+	wgoSender, kgoSender                       map[string]float64
+	clientEvidence                             *clientEvidence
 	staleFallback                              *staleFallbackEvidence
 	windows                                    []windowResult
 	wgoLatencySelections, kgoLatencySelections map[int32]int64
@@ -111,6 +117,20 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 
+	if exp.maxSenderLag != nil {
+		if len(res.wgoSender) == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "missing Prometheus sender evidence"})
+		} else {
+			for _, counter := range []string{"samples_failed_total", "samples_dropped_total"} {
+				if count := res.wgoSender[counter]; count > 0 {
+					out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("Prometheus %s: %.0f samples", counter, count)})
+				}
+			}
+			if lag := res.wgoSender["max_source_lag_seconds"]; lag > exp.maxSenderLag.Seconds() {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("Prometheus source-to-sent lag %s exceeds %s at collection", time.Duration(lag*float64(time.Second)), *exp.maxSenderLag)})
+			}
+		}
+	}
 	if res.sc.requireStaleFallback {
 		if res.staleFallback == nil || res.staleFallback.BrokerOnlyWithdrawals == 0 || res.staleFallback.StaleRoutingResponses == 0 || res.staleFallback.FallbackErrors == 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "stale fallback was not exercised by both discovery paths and real client errors"})
@@ -167,7 +187,10 @@ func checkResult(res scenarioResult) []scenarioFailure {
 	}
 	if exp.recoveryFrom != nil {
 		want := len(buildScenarioEvents("", 0, res.sc.duration()-*exp.recoveryFrom, res.sc.spacing()))
-		if res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
+		if res.observationDescription != "" {
+			want = res.wgoRecovery.total
+		}
+		if want == 0 || res.wgoRecovery.total != want || res.wgoRecovery.successes != want || exp.slowBudget != nil && res.wgoRecoverySlowFraction > 0 {
 			detail := fmt.Sprintf("recovery: %d/%d passes, want %d", res.wgoRecovery.successes, res.wgoRecovery.total, want)
 			if exp.slowBudget != nil {
 				detail += fmt.Sprintf("; %.1f%% slower than %s", 100*res.wgoRecoverySlowFraction, *exp.slowBudget)

@@ -38,7 +38,11 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 		Kgo         clientResults `json:"kgo"`
 	}
 	type scenarioSuccess struct {
+		ObservationKind   string                 `json:"observation_kind,omitempty"`
+		WgoSender         map[string]float64     `json:"wgo_sender,omitempty"`
+		KgoSender         map[string]float64     `json:"kgo_sender,omitempty"`
 		Scenario          string                 `json:"scenario"`
+		ClientEvidence    *clientEvidence        `json:"wgo_client_evidence,omitempty"`
 		StaleFallback     *staleFallbackEvidence `json:"stale_fallback,omitempty"`
 		Wgo               clientResults          `json:"wgo"`
 		Kgo               clientResults          `json:"kgo"`
@@ -50,11 +54,16 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 	results := make([]scenarioSuccess, 0, len(rr.results.entries))
 	for _, res := range rr.results.entries {
 		entry := scenarioSuccess{
-			Scenario:          res.sc.name,
+			Scenario:  res.sc.name,
+			WgoSender: res.wgoSender, KgoSender: res.kgoSender,
 			StaleFallback:     res.staleFallback,
+			ClientEvidence:    res.clientEvidence,
 			WgoInjectedDelays: res.wgoLatencySelections, KgoInjectedDelays: res.kgoLatencySelections,
 			Wgo: clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
 			Kgo: clientResults{Attempts: res.kgoSummary.total, Passes: res.kgoSummary.successes},
+		}
+		if res.observationDescription != "" {
+			entry.ObservationKind = "remote_write_http_attempt"
 		}
 		for _, window := range res.windows {
 			entry.Windows = append(entry.Windows, windowSuccess{Name: window.window.name, FromSeconds: window.window.from.Seconds(), ToSeconds: window.window.to.Seconds(), Wgo: clientResults{Attempts: window.wgo.total, Passes: window.wgo.successes}, Kgo: clientResults{Attempts: window.kgo.total, Passes: window.kgo.successes}})
@@ -92,9 +101,11 @@ func (rr *resultsReport) generateMarkdown() string {
 	} else {
 		fmt.Fprintf(&b, "- Cluster: %d brokers / %d partitions\n", brokers, partitions)
 	}
-	fmt.Fprintf(&b, "- Warmup %s, observed duration shown per scenario, event spacing %s, app-request timeout %s\n",
-		warmupDuration, spacing, appRequestTimeout)
-	if command == "simulation-mimir" {
+	fmt.Fprintf(&b, "- Warmup %s, observed duration shown per scenario, synthetic event spacing %s (external senders use their own scheduling)\n",
+		warmupDuration, spacing)
+	if len(rr.results.entries) > 0 && rr.results.entries[0].observationDescription != "" {
+		b.WriteString(rr.results.entries[0].observationDescription + "\n\n")
+	} else if command == "simulation-mimir" {
 		fmt.Fprintf(&b, "- **Event**: one remote-write application event, issued every %s, recorded as a single success/failure when all its HTTP requests finish or the %s app-request timeout expires.\n\n", spacing, appRequestTimeout)
 	} else {
 		fmt.Fprintf(&b, "- **Event**: one simulated application write, issued every %s. Each event fans "+
@@ -176,6 +187,48 @@ func (rr *resultsReport) writeScenarioSection(b *strings.Builder, res scenarioRe
 		if res.workloadDescription != "" {
 			fmt.Fprintf(b, "%s\n\n%s\n\n", res.workloadDescription, res.workloadConfiguration)
 		}
+	}
+	if res.observationDescription != "" {
+		b.WriteString(res.observationDescription + "\n\n")
+	}
+	for _, sender := range []struct {
+		name     string
+		evidence map[string]float64
+	}{{"wgo", res.wgoSender}, {"kgo", res.kgoSender}} {
+		if len(sender.evidence) == 0 {
+			continue
+		}
+		fmt.Fprintf(b, "Prometheus sender %s (counters since process start, except samples_accepted_observed_total for the observation window; gauges at collection):\n\n", sender.name)
+		for _, name := range slices.Sorted(maps.Keys(sender.evidence)) {
+			if strings.HasSuffix(name, "_seconds") {
+				fmt.Fprintf(b, "- %s: %.3f\n", name, sender.evidence[name])
+			} else {
+				fmt.Fprintf(b, "- %s: %.0f\n", name, sender.evidence[name])
+			}
+		}
+		b.WriteString("\n")
+	}
+	if evidence := res.clientEvidence; evidence != nil {
+		b.WriteString("Observed-phase wgo counters (warmup excluded):\n\n")
+		for _, group := range []struct {
+			name   string
+			counts map[string]int64
+		}{
+			{"Write failures", evidence.WriteFailures}, {"Direct attempt failures", evidence.DirectFailures},
+			{"Hedge suppression", evidence.HedgeSuppression}, {"Hedge triggers", evidence.HedgeTriggers},
+		} {
+			var values []string
+			for _, reason := range slices.Sorted(maps.Keys(group.counts)) {
+				if count := group.counts[reason]; count > 0 {
+					values = append(values, fmt.Sprintf("%s=%d", reason, count))
+				}
+			}
+			if len(values) == 0 {
+				values = []string{"none"}
+			}
+			fmt.Fprintf(b, "- %s: %s\n", group.name, strings.Join(values, ", "))
+		}
+		b.WriteString("\n")
 	}
 	if evidence := res.staleFallback; evidence != nil {
 		fmt.Fprintf(b, "Discovery-skew evidence: %d broker-only withdrawals; %d stale topic-discovery responses; %d fallback wire errors; %d successful cascades with at least three attempts; %d terminal errors.\n\n", evidence.BrokerOnlyWithdrawals, evidence.StaleRoutingResponses, evidence.FallbackErrors, evidence.ThirdAttemptSuccesses, evidence.TerminalErrors)

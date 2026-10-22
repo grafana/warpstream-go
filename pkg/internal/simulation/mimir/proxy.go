@@ -5,24 +5,28 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 type brokerProxy struct {
-	dial        func(context.Context, string, string) (net.Conn, error)
-	latency     func(string) time.Duration
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mu          sync.Mutex
-	closed      bool
-	listeners   map[string]net.Listener
-	connections map[net.Conn]struct{}
-	wg          sync.WaitGroup
+	dial                  func(context.Context, string, string) (net.Conn, error)
+	latency               func(string) time.Duration
+	enforceProduceTimeout bool
+	observe               func(string, int16, []byte)
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	mu                    sync.Mutex
+	closed                bool
+	listeners             map[string]net.Listener
+	connections           map[net.Conn]struct{}
+	wg                    sync.WaitGroup
 }
 
 func newBrokerProxy(dial func(context.Context, string, string) (net.Conn, error)) *brokerProxy {
@@ -86,7 +90,10 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 	ctx, cancel := context.WithCancel(p.ctx)
 	defer cancel()
 	var mu sync.Mutex
-	type requestKind struct{ api, version int16 }
+	type requestKind struct {
+		api, version int16
+		timeout      time.Duration
+	}
 	requests := map[int32]requestKind{}
 	done := make(chan struct{})
 	go func() {
@@ -102,8 +109,16 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 			if len(frame) >= 8 {
 				api := int16(binary.BigEndian.Uint16(frame[:2]))
 				if api == int16(kmsg.Metadata) || api == int16(kmsg.Produce) {
+					kind := requestKind{api: api, version: int16(binary.BigEndian.Uint16(frame[2:4]))}
+					if api == int16(kmsg.Produce) && p.enforceProduceTimeout {
+						kind.timeout, err = produceTimeout(frame, kind.version)
+						if err != nil {
+							log.Printf("broker proxy %s: parse Produce v%d timeout: %v", target, kind.version, err)
+							return
+						}
+					}
 					mu.Lock()
-					requests[int32(binary.BigEndian.Uint32(frame[4:8]))] = requestKind{api: api, version: int16(binary.BigEndian.Uint16(frame[2:4]))}
+					requests[int32(binary.BigEndian.Uint32(frame[4:8]))] = kind
 					mu.Unlock()
 				}
 			}
@@ -113,8 +128,10 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 		}
 	}()
 	type response struct {
-		frame []byte
-		due   time.Time
+		frame   []byte
+		due     time.Time
+		produce bool
+		version int16
 	}
 	responses := make(chan response, 64)
 	readDone := make(chan struct{})
@@ -127,6 +144,8 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 				return
 			}
 			due := time.Now()
+			var produce bool
+			var version int16
 			if len(frame) >= 4 {
 				correlation := int32(binary.BigEndian.Uint32(frame[:4]))
 				mu.Lock()
@@ -139,12 +158,23 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 						return
 					}
 				}
-				if known && kind.api == int16(kmsg.Produce) && p.latency != nil {
-					due = due.Add(p.latency(target))
+				if known && kind.api == int16(kmsg.Produce) {
+					produce, version = true, kind.version
+				}
+				if produce && p.latency != nil {
+					delay := p.latency(target)
+					if p.enforceProduceTimeout && delay > kind.timeout {
+						delay = kind.timeout
+						frame, err = timeoutProduceResponse(frame, kind.version)
+						if err != nil {
+							return
+						}
+					}
+					due = due.Add(delay)
 				}
 			}
 			select {
-			case responses <- response{frame: frame, due: due}:
+			case responses <- response{frame: frame, due: due, produce: produce, version: version}:
 			case <-ctx.Done():
 				return
 			}
@@ -164,6 +194,9 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 		}
 		if writeKafkaFrame(client, response.frame) != nil {
 			return
+		}
+		if response.produce && p.observe != nil {
+			p.observe(target, response.version, response.frame)
 		}
 	}
 }
@@ -274,4 +307,54 @@ func (p *brokerProxy) Close() {
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
+}
+
+func produceTimeout(frame []byte, version int16) (time.Duration, error) {
+	if len(frame) < 10 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	clientLength := int(int16(binary.BigEndian.Uint16(frame[8:10])))
+	if clientLength < -1 {
+		return 0, fmt.Errorf("invalid Kafka client ID length")
+	}
+	offset := 10 + max(0, clientLength)
+	if offset > len(frame) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	request := kmsg.NewPtrProduceRequest()
+	request.SetVersion(version)
+	if request.IsFlexible() {
+		// The helper skips four correlation-ID bytes before reading tags, so
+		// start four bytes early to read the tags after the nullable client ID.
+		header, err := responseHeaderLength(frame[offset-4:], true)
+		if err != nil {
+			return 0, err
+		}
+		offset += header - 4
+	}
+	if err := request.ReadFrom(frame[offset:]); err != nil {
+		return 0, err
+	}
+	return time.Duration(request.TimeoutMillis) * time.Millisecond, nil
+}
+
+func timeoutProduceResponse(frame []byte, version int16) ([]byte, error) {
+	response := kmsg.NewPtrProduceResponse()
+	response.SetVersion(version)
+	offset, err := responseHeaderLength(frame, response.IsFlexible())
+	if err != nil {
+		return nil, err
+	}
+	if err := response.ReadFrom(frame[offset:]); err != nil {
+		return nil, err
+	}
+	for i := range response.Topics {
+		for j := range response.Topics[i].Partitions {
+			partition := &response.Topics[i].Partitions[j]
+			if partition.ErrorCode == 0 {
+				partition.ErrorCode = kerr.KafkaStorageError.Code
+			}
+		}
+	}
+	return response.AppendTo(append([]byte(nil), frame[:offset]...)), nil
 }
