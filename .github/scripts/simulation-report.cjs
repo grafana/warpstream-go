@@ -54,7 +54,7 @@ function successRange(counts) {
 
 // Icons shown in front of the PR wgo result. The gate only applies to benchmark scenarios; the
 // trend compares the PR with main for every scenario.
-const icons = { pass: '✅', fail: '❌', up: '🟩', down: '🟥', same: '🟦', none: '' };
+const icons = { pass: '✅', fail: '❌', up: '🟩', down: '🟥', same: '🟦', none: '', warn: '⚠️' };
 
 // Two results within this many percentage points, or whose three-run ranges overlap, count as
 // the same: three runs of one build already differ by that much from timing alone.
@@ -78,10 +78,18 @@ function gateIcon(benchmark, prRuns) {
   if (!benchmark) return icons.none;
   const rows = prRuns.filter(Boolean);
   if (rows.length !== prRuns.length || rows.length === 0) return icons.none;
-  // Failures about the kgo reference run (for example a fault that never reached kgo's traffic)
-  // check that the scenario was set up the same for both clients and say nothing about wgo.
-  const aboutWgo = failure => !failure.startsWith('kgo');
   return rows.every(row => !(row.failures || []).some(aboutWgo)) ? icons.pass : icons.fail;
+}
+
+// Failures about the kgo reference run (for example a fault that never reached kgo's traffic)
+// check that the scenario was set up the same for both clients and say nothing about wgo.
+const aboutKgo = failure => failure.startsWith('kgo');
+const aboutWgo = failure => !aboutKgo(failure);
+
+// kgoWarning marks a kgo result that cannot be compared with wgo's, so the gate ignores it
+// but a reader does not take the kgo number at face value.
+function kgoWarning(prRuns) {
+  return prRuns.some(row => (row?.failures || []).some(aboutKgo)) ? icons.warn : icons.none;
 }
 
 function sampleRange(runs, client) {
@@ -100,14 +108,15 @@ function clearlyAbove(candidate, other) {
   return 100 * (candidate.mean - other.mean) > sameBandPoints;
 }
 
-function comparisonCells(columns, prefix = '') {
+function comparisonCells(columns, prefix = '', kgoMark = '') {
   const perfect = columns.findIndex(c => c.cell === '100%');
   const best = perfect !== -1 ? perfect : columns.findIndex((candidate, i) =>
     candidate.cell !== '—' && columns.every((other, j) =>
       i === j || other.cell === '—' || clearlyAbove(candidate, other)));
   return columns.map((column, i) => {
     const cell = column.cell !== '—' && i === best ? `**${column.cell}**` : column.cell;
-    return i === 0 && prefix ? `${prefix} ${cell}` : cell;
+    if (i === 0 && prefix) return `${prefix} ${cell}`;
+    return i === columns.length - 1 && kgoMark ? `${kgoMark} ${cell}` : cell;
   }).join(' | ');
 }
 
@@ -147,7 +156,7 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
     });
     const benchmark = rows.some(row => row.benchmark === true);
     const samples = [[pr, 'wgo'], [main, 'wgo'], [pr, 'kgo']].map(([runs, client]) => sampleRange(runs, client));
-    return { name, variableAttempts, columns, samples, benchmark, gate: gateIcon(benchmark, pr), trend: trendIcon(columns[0], columns[1]) };
+    return { name, variableAttempts, columns, samples, benchmark, gate: gateIcon(benchmark, pr), kgoMark: kgoWarning(pr), trend: trendIcon(columns[0], columns[1]) };
   });
   entries.sort((a, b) => a.columns[0].rate - b.columns[0].rate ||
     Math.min(...a.columns.slice(1).map(c => c.rate)) - Math.min(...b.columns.slice(1).map(c => c.rate)) ||
@@ -158,7 +167,7 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
     lines.push(`#### ${title}`, '', '| Scenario | wgo (PR) success | wgo (main) success | kgo success |', '| --- | ---: | ---: | ---: |');
     for (const entry of group) {
       const prefix = [entry.gate, entry.trend].filter(Boolean).join(' ');
-      lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${comparisonCells(entry.columns, prefix)} |`);
+      lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${comparisonCells(entry.columns, prefix, entry.kgoMark)} |`);
     }
   };
   render('Gated checks', entries.filter(entry => entry.benchmark));
@@ -223,7 +232,7 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   if (mainSHAs.size > 1 || harnessSHAs.size > 1) throw new Error('Client variants did not use one main revision and one PR harness');
   if (mainSHAs.size) sections.push(`Main client: \`${[...mainSHAs][0]}\` · Harness: \`${[...harnessSHAs][0]}\``, '');
   if (source) sections.push(source, '');
-  sections.push(`The icon in front of each PR wgo result compares it with main: ${icons.up} improved, ${icons.down} regressed, ${icons.same} the same, meaning within ${sameBandPoints} points or with overlapping ranges. A scenario that was 100% on main and is lower in any PR run is always ${icons.down}, and reaching 100% from below is always ${icons.up}. Gated checks also show ${icons.pass} when the scenario met its expectations in all three PR runs and ${icons.fail} when it missed them in at least one; only these checks are meant to block a PR later, and CI does not enforce them yet.`, '');
+  sections.push(`The icon in front of each PR wgo result compares it with main: ${icons.up} improved, ${icons.down} regressed, ${icons.same} the same, meaning within ${sameBandPoints} points or with overlapping ranges. A scenario that was 100% on main and is lower in any PR run is always ${icons.down}, and reaching 100% from below is always ${icons.up}. Gated checks also show ${icons.pass} when the scenario met its expectations in all three PR runs and ${icons.fail} when it missed them in at least one. Failures about the kgo reference run alone, such as a fault that never reached kgo's traffic, are ignored, because they say nothing about wgo; they are marked ${icons.warn} in front of the kgo result, which means the kgo comparison is inconclusive: rerun before relying on it. Only these checks are meant to block a PR later, and CI does not enforce them yet.`, '');
   sections.push('**Bold** marks a range entirely above every other available range, or perfect 100% success. Overlapping or touching partial ranges have no highlighted winner. Perfect ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
   return sections.join('\n');
 }
