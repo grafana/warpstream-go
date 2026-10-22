@@ -58,6 +58,8 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 		WgoSuccessLatency *successLatency        `json:"wgo_success_latency,omitempty"`
 		KgoSuccessLatency *successLatency        `json:"kgo_success_latency,omitempty"`
 		StaleFallback     *staleFallbackEvidence `json:"stale_fallback,omitempty"`
+		WgoWrites         *clientResults         `json:"wgo_writes,omitempty"`
+		KgoWrites         *clientResults         `json:"kgo_writes,omitempty"`
 		Wgo               clientResults          `json:"wgo"`
 		Kgo               clientResults          `json:"kgo"`
 		Failures          []string               `json:"failures,omitempty"`
@@ -76,6 +78,10 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 			WgoInjectedDelays: res.wgoLatencySelections, KgoInjectedDelays: res.kgoLatencySelections,
 			Wgo: clientResults{Attempts: res.wgoSummary.total, Passes: res.wgoSummary.successes},
 			Kgo: clientResults{Attempts: res.kgoSummary.total, Passes: res.kgoSummary.successes},
+		}
+		if res.wgoSummary.writes > res.wgoSummary.total {
+			entry.WgoWrites = &clientResults{Attempts: res.wgoSummary.writes, Passes: res.wgoSummary.writesOK}
+			entry.KgoWrites = &clientResults{Attempts: res.kgoSummary.writes, Passes: res.kgoSummary.writesOK}
 		}
 		if stop := res.hedgeStop(); stop.worthReporting() {
 			entry.HedgeStop = stop
@@ -154,6 +160,7 @@ func (rr *resultsReport) generateMarkdown() string {
 	b.WriteString("\n")
 
 	rr.writeSuccessLatencyTable(&b)
+	rr.writeWritesTable(&b)
 
 	var stops []hedgeStopRow
 	for _, res := range rr.results.entries {
@@ -185,6 +192,34 @@ func (rr *resultsReport) writeSuccessLatencyTable(b *strings.Builder) {
 		fmt.Fprintf(b, "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", res.sc.name, rr.appSuccessCell(w), rr.appSuccessCell(k),
 			cell(w, w.successP50Latency), cell(k, k.successP50Latency), cell(w, w.successP99Latency), cell(k, k.successP99Latency),
 			cell(w, w.successMeanLatency), cell(k, k.successMeanLatency))
+	}
+	b.WriteString("\n")
+}
+
+// writeWritesTable shows the success ratio of individual writes (one produce
+// record each) for the scenarios whose events fan out into several. An event needs
+// every write, so this keeps the gradation the event success hides.
+func (rr *resultsReport) writeWritesTable(b *strings.Builder) {
+	var rows []scenarioResult
+	for _, res := range rr.results.entries {
+		if res.wgoSummary.writes > res.wgoSummary.total {
+			rows = append(rows, res)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	b.WriteString("### Individual write success\n\nEach event fans out into several writes. The event succeeds only when all of them are acknowledged before the deadline; this table counts the writes themselves, so a partly failed event still shows how much got through.\n\n")
+	b.WriteString("| Scenario | wgo writes | kgo writes | wgo events | kgo events |\n| --- | --- | --- | --- | --- |\n")
+	pct := func(ok, total int) string {
+		if total == 0 {
+			return "n/a"
+		}
+		return fmt.Sprintf("%.1f%% (%d/%d)", 100*float64(ok)/float64(total), ok, total)
+	}
+	for _, res := range rows {
+		w, k := res.wgoSummary, res.kgoSummary
+		fmt.Fprintf(b, "| %s | %s | %s | %s | %s |\n", res.sc.name, pct(w.writesOK, w.writes), pct(k.writesOK, k.writes), pct(w.successes, w.total), pct(k.successes, k.total))
 	}
 	b.WriteString("\n")
 }

@@ -53,7 +53,11 @@ func fixedSettingsDescription() string {
 // injects the same fault just below the limit, where wgo still acts on it, and
 // just above, where it stops. The below scenario is the control for the above one.
 type fractionGate struct {
+	// splitWrites makes a Mimir event one write per series, so the report counts
+	// successful writes as well as events.
+	splitWrites          bool
 	fault                string  // names the scenario
+	subject              string  // replaces "<fault> agents" in the name when set
 	limitName            string  // the limit's parameter name in wgo's health-check config
 	limit                float64 // the share of agents at which the gate trips
 	does                 string  // what each affected agent does
@@ -123,38 +127,6 @@ var (
 		suppression:          suppressedSlowFraction,
 		forbiddenSuppression: []string{suppressedFaultyFraction},
 	}
-	stalledSlowFractionGate = fractionGate{
-		fault: "stalled slow", limitName: "MaxSlowFraction", limit: wgo.DefaultHealthCheckMaxSlowFraction,
-		does:        "answer every Produce after " + stalledSlowLatency.String() + " while the rest answer in " + moderateHealthyLatency.String(),
-		belowEffect: "wgo hedges each stalled write to a healthy agent, so writes finish well inside the deadline",
-		aboveEffect: "hedging is expected to stop, and wgo to lose writes that kgo loses too",
-		tail: func(share float64) string {
-			return fmt.Sprintf("%s is past the %s application deadline, so kgo misses it on every event that reaches a stalled agent (an event writes to all %d agents), and under the %s produce wire timeout, so nothing times out on the wire. "+
-				"This is the survival comparison: below the limit wgo should beat kgo clearly, above it no worse. No particular gate is required. "+
-				"The stalled agents are fixed, so a partition whose primary and both fallbacks all stall fails every event on either client.",
-				stalledSlowLatency, appRequestTimeout, clusterSize, clientProduceRequestTimeout)
-		},
-		behaviours: func(count int32) brokersBehaviour {
-			return slowBehaviours(count, moderateHealthyLatency, stalledSlowLatency)
-		},
-		expect: func(above bool) scenarioExpectations {
-			if above {
-				return scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.1)}
-			}
-			return scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.5)}
-		},
-		valid: func(share float64) error {
-			switch {
-			case stalledSlowLatency <= appRequestTimeout:
-				return fmt.Errorf("%s does not exceed the %s application deadline, so kgo would not fail", stalledSlowLatency, appRequestTimeout)
-			case stalledSlowLatency >= clientProduceRequestTimeout:
-				return fmt.Errorf("%s reaches the %s produce wire timeout, so requests would time out", stalledSlowLatency, clientProduceRequestTimeout)
-			case float64(stalledSlowLatency) <= requiredSlowRatio(share)*float64(moderateHealthyLatency):
-				return fmt.Errorf("stalled agents at %.0f%% would not count as slow", 100*share)
-			}
-			return nil
-		},
-	}
 	faultyFractionGate = fractionGate{
 		fault: "failing", limitName: "MaxFaultyFraction", limit: wgo.DefaultHealthCheckMaxFaultyFraction,
 		does:        "return NotLeaderForPartition immediately",
@@ -189,6 +161,85 @@ func requiredSlowRatio(share float64) float64 {
 	return wgo.DefaultHealthCheckSlowMultiplier * (1 - share) / headroom
 }
 
+func stalledFastFirstFallbackGate(runID int) fractionGate {
+	return stalledAgentsGate("stalled agents with a fast first fallback", fastFirstFallback, runID)
+}
+
+func stalledFastSecondFallbackGate(runID int) fractionGate {
+	return stalledAgentsGate("stalled agents with a fast second fallback", fastSecondFallback, runID)
+}
+
+// stalledAgentsGate builds a gate for agents that answer after the application
+// deadline, with the stalled agents placed by rule so that every partition has a
+// way out. The agents are fixed for a run id, so every build in a run meets the
+// same chains; other run ids place them differently.
+func stalledAgentsGate(subject string, rule stalledRule, runID int) fractionGate {
+	hedgeWaves := 1
+	belowEffect := "wgo races each stalled write against its fast first fallback, which every build does, so writes finish about one hedge delay after they start"
+	tail := func(ids []int32, share float64) string {
+		return fmt.Sprintf("%s is past the %s application deadline, so kgo misses it on every event that reaches a stalled agent, and under the %s produce wire timeout, so nothing times out. "+
+			"Run id %d places the stalled agents at %v so that every stalled partition has a fast first fallback. Below the limit wgo should finish near 100%% while kgo fails every event; above it hedging stops and both fail.",
+			stalledSlowLatency, appRequestTimeout, clientProduceRequestTimeout, runID, ids)
+	}
+	if rule == fastSecondFallback {
+		hedgeWaves = 2
+		belowEffect = "a client that races another candidate when a fallback stalls reaches the fast second fallback in time, and the others are expected to miss the deadline on the partitions whose first fallback is stalled"
+		tail = func(ids []int32, share float64) string {
+			return fmt.Sprintf("%s is past the %s application deadline, so kgo misses it on every event that reaches a stalled agent, and under the %s produce wire timeout, so nothing times out. "+
+				"Run id %d places the stalled agents at %v so that no partition has its whole chain stalled and at least %d stalled partitions have a stalled first fallback and a fast second one. "+
+				"Only a client that races another candidate on a timer when a fallback stalls (#128) reaches the second fallback in time, about two hedge delays after the start. Builds without it are expected to fail every event.",
+				stalledSlowLatency, appRequestTimeout, clientProduceRequestTimeout, runID, ids, minNeedingSecondFallback)
+		}
+	}
+	return fractionGate{
+		splitWrites: true,
+		subject:     subject, fault: "stalled", limitName: "MaxSlowFraction", limit: wgo.DefaultHealthCheckMaxSlowFraction,
+		does:        "answer every Produce after " + stalledSlowLatency.String() + " while the rest answer in " + moderateHealthyLatency.String(),
+		belowEffect: belowEffect,
+		aboveEffect: "hedging is switched off (observed: slow_fraction_exceeded), so every stalled write waits out its stall and every event misses the deadline, as for kgo",
+		tail: func(share float64) string {
+			ids, _ := findStalledAgents(int32(math.Round(share*float64(clusterSize))), rule, runID)
+			return tail(ids, share)
+		},
+		behaviours: func(count int32) brokersBehaviour {
+			ids := pickStalledAgents(count, rule, runID)
+			bh := slowBehavioursAt(ids, moderateHealthyLatency, constantLatency(stalledSlowLatency))
+			// Counting the delayed responses per agent puts the placement in the report.
+			for _, id := range ids {
+				behaviour := bh.byBroker[id]
+				behaviour.injectedLatency = true
+				bh.byBroker[id] = behaviour
+			}
+			return bh
+		},
+		expect: func(above bool) scenarioExpectations {
+			if above {
+				return scenarioExpectations{}
+			}
+			return scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.5)}
+		},
+		valid: func(share float64) error {
+			baseline := time.Duration(share*float64(stalledSlowLatency) + (1-share)*float64(moderateHealthyLatency))
+			hedgeDelay := max(baseline, longestHedgeDelay)
+			finishes := time.Duration(hedgeWaves)*hedgeDelay + moderateHealthyLatency
+			switch {
+			case stalledSlowLatency <= appRequestTimeout:
+				return fmt.Errorf("%s does not exceed the %s application deadline, so kgo would not fail", stalledSlowLatency, appRequestTimeout)
+			case stalledSlowLatency >= clientProduceRequestTimeout:
+				return fmt.Errorf("%s reaches the %s produce wire timeout, so requests would time out", stalledSlowLatency, clientProduceRequestTimeout)
+			case float64(stalledSlowLatency) <= requiredSlowRatio(share)*float64(moderateHealthyLatency):
+				return fmt.Errorf("stalled agents at %.0f%% would not count as slow", 100*share)
+			case finishes > appRequestTimeout-appRequestTimeout/20:
+				return fmt.Errorf("a rescue after %d hedge delays of %s finishes at %s, too close to the %s deadline", hedgeWaves, hedgeDelay, finishes, appRequestTimeout)
+			}
+			_, err := findStalledAgents(int32(math.Round(share*float64(clusterSize))), rule, runID)
+			return err
+		},
+		suppression:          suppressedSlowFraction,
+		forbiddenSuppression: []string{suppressedFaultyFraction},
+	}
+}
+
 // name carries no numbers, so it stays stable when a limit or a share changes
 // and historical results stay comparable. The description holds the values.
 func (g fractionGate) name(above bool) string {
@@ -196,7 +247,11 @@ func (g fractionGate) name(above bool) string {
 	if above {
 		side = "above"
 	}
-	return fmt.Sprintf("%s agents just %s %s", g.fault, side, g.limitName)
+	subject := g.subject
+	if subject == "" {
+		subject = g.fault + " agents"
+	}
+	return fmt.Sprintf("%s just %s %s", subject, side, g.limitName)
 }
 
 // agents returns how many agents carry the fault: the share fractionMargin
@@ -238,7 +293,7 @@ func (g fractionGate) description(above bool) string {
 // fractionScenario builds one half of a pair: the gate's fault on the share of
 // agents just below its limit, or just above it when above is set.
 func fractionScenario(g fractionGate, above bool) scenario {
-	sc := scenario{name: g.name(above), collectClientEvidence: true, expect: g.expect(above), description: g.description(above), behaviours: g.behaviours(g.agents(above))}
+	sc := scenario{name: g.name(above), collectClientEvidence: true, splitWrites: g.splitWrites, expect: g.expect(above), description: g.description(above), behaviours: g.behaviours(g.agents(above))}
 	if g.suppression == "" {
 		// A survival scenario: the report lists the gates that acted, none is required.
 		return sc
@@ -260,12 +315,21 @@ func slowBehaviours(count int32, healthy, latency time.Duration) brokersBehaviou
 }
 
 func slowBehavioursFn(count int32, healthy time.Duration, latency func(*rand.Rand) time.Duration) brokersBehaviour {
+	ids := make([]int32, count)
+	for i := range ids {
+		ids[i] = int32(i)
+	}
+	return slowBehavioursAt(ids, healthy, latency)
+}
+
+// slowBehavioursAt makes the agents in ids answer with latency and the rest in healthy.
+func slowBehavioursAt(ids []int32, healthy time.Duration, latency func(*rand.Rand) time.Duration) brokersBehaviour {
 	bh := healthyBehaviours()
 	for i := range int32(clusterSize) {
 		bh.byBroker[i] = brokerBehaviour{latencyFn: constantLatency(healthy)}
 	}
-	for i := range count {
-		bh.byBroker[i] = brokerBehaviour{latencyFn: latency}
+	for _, id := range ids {
+		bh.byBroker[id] = brokerBehaviour{latencyFn: latency}
 	}
 	return bh
 }

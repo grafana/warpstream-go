@@ -29,8 +29,13 @@ func Main(factory WorkloadFactory) {
 	batch := flag.Int("batch", 1, "one-based scenario batch to run")
 	batches := flag.Int("batches", 1, "number of batches to split the selected scenarios across")
 	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
+	runID := flag.Int("run-id", defaultRunID, "run number, at least 1; scenarios that vary their setup (where the stalled agents sit) use a different, reproducible setup for each id and the others ignore it")
 	flag.Parse()
-	available, err := profileScenarios(*profile, factory != nil)
+	if *runID < 1 {
+		fmt.Fprintf(os.Stderr, "-run-id must be at least 1, got %d\n", *runID)
+		os.Exit(1)
+	}
+	available, err := profileScenarios(*profile, factory != nil, *runID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -90,7 +95,7 @@ func Main(factory WorkloadFactory) {
 }
 
 func selectScenarios(pattern string) ([]scenario, error) {
-	return filterScenarios(pattern, scenarios())
+	return filterScenarios(pattern, scenarios(defaultRunID))
 }
 
 func filterScenarios(pattern string, available []scenario) ([]scenario, error) {

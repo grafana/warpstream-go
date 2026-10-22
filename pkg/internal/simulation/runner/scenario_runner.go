@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -314,10 +315,15 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 		innerWG  sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
+		okWrites atomic.Int64
 	)
 	for _, rec := range event.records {
 		innerWG.Add(1)
 		client.Produce(eventCtx, rec, func(_ *kgo.Record, err error) {
+			// An acknowledgement after the deadline is too late for the application.
+			if err == nil && eventCtx.Err() == nil {
+				okWrites.Add(1)
+			}
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -335,9 +341,9 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 		if eventCtx.Err() != nil {
 			firstErr = eventCtx.Err()
 		}
-		obs.record(scheduled, issued, time.Since(issued), firstErr)
+		obs.recordWrites(scheduled, issued, time.Since(issued), firstErr, len(event.records), int(okWrites.Load()))
 	case <-eventCtx.Done():
-		obs.record(scheduled, issued, time.Since(issued), eventCtx.Err())
+		obs.recordWrites(scheduled, issued, time.Since(issued), eventCtx.Err(), len(event.records), int(okWrites.Load()))
 	}
 	// Drain callbacks before cleanup so they cannot access a closed environment.
 	<-done

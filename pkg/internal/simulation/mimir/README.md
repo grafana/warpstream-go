@@ -23,14 +23,14 @@ responses are observed on the wire; counters are scraped from Mimir's `/metrics`
 Recovery evidence counts wire responses read, including probes and responses after
 an HTTP request completes. HTTP success counts are measured separately.
 
-The same 25 scenarios as the direct-client runner cover healthy traffic, missing
+The same 27 scenarios as the direct-client runner cover healthy traffic, missing
 leaders, failing agents, slow agents, random failures and latency bursts, storage
 degradation, pod kills, network blackholes, and rolling and concurrent replacements. Produce
 responses receive the shared per-broker latency distributions on the TCP wire.
 Response order is preserved, while delays for concurrent requests overlap.
 
 Four scenarios run at a time by default, launching up to sixteen Mimir processes;
-use `-parallel` to change that limit. The default `all` profile includes all 25
+use `-parallel` to change that limit. The default `all` profile includes all 27
 standard, nine investigation, and two real Prometheus scenarios
 and takes roughly 10–15 minutes plus binary build time. Use `-profile standard`
 for only the standard suite. During rolling restarts,
@@ -69,9 +69,9 @@ Threshold pairs probe wgo's health-check fractions. Each pair injects the same f
 share of agents just below the limit (wgo still acts on it) and just above it (wgo stops
 acting). Names carry no numbers, so history stays comparable when a limit changes: "failing
 agents just below/above MaxFaultyFraction" and, for the slow fraction, "moderately slow",
-"barely hedged slow" and "stalled slow" agents just below/above MaxSlowFraction (the
-parameter names of wgo's health-check config). The number of affected agents derives from
-the library default limit, 5 points below or above it rounded down to whole agents, and
+"barely hedged slow" and "stalled" agents (with a fast first or second fallback) just
+below/above MaxSlowFraction (the parameter names of wgo's health-check config). The number of
+affected agents derives from the library default limit, 5 points below or above it rounded down to whole agents, and
 every latency derives from the default hedge delays and deadlines. The harness refuses to
 start when a derived value stops making sense, and a test fails if the shares no longer
 straddle the limit. Settings stay at the library defaults (Mimir's flags default to them)
@@ -84,10 +84,31 @@ and each description lists them.
 - The barely hedged pair answers just after the hedge delay but before a hedge to a healthy
   agent could, so hedges fire but the slow primary wins and nothing slow is cancelled. The
   faulty-fraction gate stays out: below the limit wgo hedges, above it hedging should stop.
-- The stalled pair answers between the application deadline and the produce wire timeout, so
-  kgo misses the deadline on every event that reaches one. It is the survival comparison with
-  kgo; with fixed stalled agents, a partition whose primary and both fallbacks all stall
-  fails every event on either client.
+- The stalled pairs answer between the application deadline and the produce wire timeout, so
+  kgo misses the deadline on every event that reaches a stalled agent. An event needs every
+  partition, so each pair places its stalled agents with a fixed search over wgo's real
+  candidate walk (a leader followed by consecutive agents from a hash of the topic and
+  partition) so that every partition has a way out. "Fast first fallback" leaves every
+  stalled partition a fast first fallback, which every build races. "Fast second fallback"
+  leaves no partition with its whole chain stalled and at least three whose first fallback
+  is stalled but second is fast, which only a client that races another candidate on a
+  timer (#128) reaches in time, so older builds are expected to fail it. Below the limit
+  wgo should finish near 100 while kgo fails every event; above it hedging stops and both
+  fail. The walk is pinned by a test in `pkg/wgo` and a copy in the runner.
+
+`-run-id N` (default 1, at least 1) numbers the run. CI passes the run number of its three repetitions, and a
+local run can pass its round number. Only the four stalled-agent scenarios use it: run N places the stalled agents
+at the N-th set, in order of seed, that meets the scenario's rule, so each id is a different but reproducible
+placement with the same guarantees, and every build in a run sees the same one. Every other scenario ignores it,
+and id 1 gives the placement used before the flag existed. Repeat the same id to measure plain noise. The
+descriptions in a report name the id and the agents.
+
+An event succeeds only when every one of its writes is acknowledged before the application deadline, which hides how
+much of a failed event got through. The reports therefore also count individual writes ("Individual write success"
+table, `wgo_writes` and `kgo_writes` in the JSON) for scenarios whose events fan out into several. The direct harness
+does so for every scenario (one write per partition). On this harness the four stalled-agent scenarios send each series
+as its own write (50 per event, `splitWrites`); the others keep one request per event and show no write table, so their
+event results stay comparable with earlier runs.
 
 Slow agents are hedged, never demoted: wgo's demoter acts only on agents that return errors,
 so above MaxSlowFraction nothing else helps a slow agent.
@@ -125,7 +146,7 @@ completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
 jobs and posts each client's observed success-percentage range in one updated PR comment.
 The Mimir binary and simulation harness are built once and shared across the
-three runs per client variant. Each CI run splits the 36 scenarios into five batches of seven or eight on
+three runs per client variant. Each CI run splits the 38 scenarios into five batches of seven or eight on
 separate runners. Both clients run together within each scenario, preserving
 all comparison gates. Integration harness unit tests run once in a separate job, in
 parallel with the build. The real Prometheus sender retry test runs after the

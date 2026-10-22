@@ -57,20 +57,20 @@ func constantLatency(delay time.Duration) func(*rand.Rand) time.Duration {
 	return func(*rand.Rand) time.Duration { return delay }
 }
 
-func profileScenarios(profile string, external bool) ([]scenario, error) {
+func profileScenarios(profile string, external bool, runID int) ([]scenario, error) {
 	switch profile {
 	case "all":
 		if !external {
 			return nil, fmt.Errorf("all requires an external workload")
 		}
-		return append(append(scenarios(), investigationScenarios()...), storagePressureScenarios()...), nil
+		return append(append(scenarios(runID), investigationScenarios()...), storagePressureScenarios()...), nil
 	case "mimir-prometheus":
 		if !external {
 			return nil, fmt.Errorf("mimir-prometheus requires an external workload")
 		}
 		return storagePressureScenarios(), nil
 	case "standard":
-		return scenarios(), nil
+		return scenarios(runID), nil
 	case "mimir-investigation":
 		if !external {
 			return nil, fmt.Errorf("mimir-investigation requires an external workload")

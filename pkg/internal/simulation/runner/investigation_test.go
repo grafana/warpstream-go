@@ -14,17 +14,17 @@ import (
 )
 
 func TestInvestigation_ProfileSelection(t *testing.T) {
-	_, err := profileScenarios("mimir-investigation", false)
+	_, err := profileScenarios("mimir-investigation", false, defaultRunID)
 	require.ErrorContains(t, err, "external workload")
-	_, err = profileScenarios("unknown", true)
+	_, err = profileScenarios("unknown", true, defaultRunID)
 	require.Error(t, err)
-	standard, err := profileScenarios("standard", false)
+	standard, err := profileScenarios("standard", false, defaultRunID)
 	require.NoError(t, err)
-	require.Len(t, standard, len(scenarios()))
-	investigation, err := profileScenarios("mimir-investigation", true)
+	require.Len(t, standard, len(scenarios(defaultRunID)))
+	investigation, err := profileScenarios("mimir-investigation", true, defaultRunID)
 	require.NoError(t, err)
 	require.Len(t, investigation, 7+len(researchScenarios()))
-	all, err := profileScenarios("all", true)
+	all, err := profileScenarios("all", true, defaultRunID)
 	require.NoError(t, err)
 	require.Len(t, all, len(standard)+len(investigation)+len(storagePressureScenarios()))
 	found := false

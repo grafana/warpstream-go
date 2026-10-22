@@ -14,7 +14,7 @@ import (
 
 func scenarioNamed(t *testing.T, name string) scenario {
 	t.Helper()
-	for _, sc := range scenarios() {
+	for _, sc := range scenarios(defaultRunID) {
 		if sc.name == name {
 			return sc
 		}
@@ -35,7 +35,10 @@ func TestFractionScenarios_PairsShareSettings(t *testing.T) {
 		{barelyHedgedSlowFractionGate, func(b brokerBehaviour) bool {
 			return b.latencyFn != nil && b.latencyFn(rand.New(rand.NewPCG(1, 1))) == barelyHedgedSlowLatency
 		}},
-		{stalledSlowFractionGate, func(b brokerBehaviour) bool {
+		{stalledFastFirstFallbackGate(defaultRunID), func(b brokerBehaviour) bool {
+			return b.latencyFn != nil && b.latencyFn(rand.New(rand.NewPCG(1, 1))) == stalledSlowLatency
+		}},
+		{stalledFastSecondFallbackGate(defaultRunID), func(b brokerBehaviour) bool {
 			return b.latencyFn != nil && b.latencyFn(rand.New(rand.NewPCG(1, 1))) == stalledSlowLatency
 		}},
 		{faultyFractionGate, func(b brokerBehaviour) bool { return b.failRate == 1 }},
@@ -124,19 +127,4 @@ func TestFractionGate_LatenciesStayDerivedFromHedgeDelays(t *testing.T) {
 	// The moderately slow agents never reach any hedge delay.
 	require.Less(t, moderateSlowLatency, shortestHedgeDelay)
 	require.Less(t, moderateHealthyLatency, moderateSlowLatency)
-}
-
-func TestFractionScenarios_StalledSlowAgentsDefeatOnlyAClientThatDoesNotHedge(t *testing.T) {
-	t.Parallel()
-	// kgo misses the application deadline, nothing times out on the wire.
-	require.Greater(t, stalledSlowLatency, appRequestTimeout)
-	require.Less(t, stalledSlowLatency, clientProduceRequestTimeout)
-	below := scenarioNamed(t, stalledSlowFractionGate.name(false))
-	above := scenarioNamed(t, stalledSlowFractionGate.name(true))
-	// No gate is required: this pair compares survival, the report lists the gates.
-	require.Empty(t, below.requireSuppression)
-	require.Empty(t, above.requireSuppression)
-	require.NotNil(t, below.expect.minSuccessDeltaVsKgo)
-	require.NotNil(t, above.expect.minSuccessDeltaVsKgo)
-	require.Greater(t, *below.expect.minSuccessDeltaVsKgo, *above.expect.minSuccessDeltaVsKgo)
 }

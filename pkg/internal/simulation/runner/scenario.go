@@ -59,6 +59,10 @@ type scenario struct {
 	requiredWgoDelayBrokers []int32
 	requireStaleFallback    bool
 	collectClientEvidence   bool
+	// splitWrites makes a Mimir event one write per series instead of one request
+	// carrying all of them, so the report can count successful writes, not only
+	// events that got every one through.
+	splitWrites bool
 
 	// requireCascadeContinuation asserts that no retry cascade stopped at a
 	// terminal error while a candidate was left, and that some writes got
@@ -95,7 +99,7 @@ func ptr[T any](v T) *T { return &v }
 // scenario tests verbatim; expectations are tightened from the original
 // single-floor design per the PR #3 review (a floor alone can't tell a
 // rerouting client from one that just waits — see scenarioExpectations).
-func scenarios() []scenario {
+func scenarios(runID int) []scenario {
 	// agentCount returns numerator/denominator of the cluster as an agent count,
 	// panicking if the split is degenerate (no affected agents, or none left healthy).
 	agentCount := func(label string, numerator, denominator int32) int32 {
@@ -271,8 +275,10 @@ func scenarios() []scenario {
 		fractionScenario(slowFractionGate, true),
 		fractionScenario(barelyHedgedSlowFractionGate, false),
 		fractionScenario(barelyHedgedSlowFractionGate, true),
-		fractionScenario(stalledSlowFractionGate, false),
-		fractionScenario(stalledSlowFractionGate, true),
+		fractionScenario(stalledFastFirstFallbackGate(runID), false),
+		fractionScenario(stalledFastFirstFallbackGate(runID), true),
+		fractionScenario(stalledFastSecondFallbackGate(runID), false),
+		fractionScenario(stalledFastSecondFallbackGate(runID), true),
 		fractionScenario(faultyFractionGate, false),
 		fractionScenario(faultyFractionGate, true),
 		func() scenario {

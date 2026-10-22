@@ -13,6 +13,11 @@ type observation struct {
 	issued    time.Time
 	latency   time.Duration
 	err       error
+
+	// records is how many produce records the event fanned out and recordsOK how
+	// many of those were acknowledged before the application deadline. Zero records
+	// means the observation is a single write whose outcome is err.
+	records, recordsOK int
 }
 
 // observations is a thread-safe collector.
@@ -24,6 +29,23 @@ type observations struct {
 // record appends one observation from its fields.
 func (o *observations) record(scheduled, issued time.Time, latency time.Duration, err error) {
 	o.add(observation{scheduled: scheduled, issued: issued, latency: latency, err: err})
+}
+
+// recordWrites appends one observation together with its per-record outcome.
+func (o *observations) recordWrites(scheduled, issued time.Time, latency time.Duration, err error, records, recordsOK int) {
+	o.add(observation{scheduled: scheduled, issued: issued, latency: latency, err: err, records: records, recordsOK: recordsOK})
+}
+
+// writes returns the observation's record counts, treating a plain observation as
+// one write.
+func (o observation) writes() (total, ok int) {
+	if o.records > 0 {
+		return o.records, o.recordsOK
+	}
+	if o.err == nil {
+		return 1, 1
+	}
+	return 1, 0
 }
 
 // add appends an already-formed observation.
@@ -107,6 +129,9 @@ func (s observationsSnapshot) summary() observationsSummary {
 	var sum, successSum time.Duration
 	var succeeded []observation
 	for _, ob := range s.list {
+		total, ok := ob.writes()
+		out.writes += total
+		out.writesOK += ok
 		if ob.err == nil {
 			out.successes++
 			successSum += ob.latency
@@ -162,9 +187,16 @@ func (s observationsSnapshot) bucketedSummary(windowSize time.Duration) []observ
 
 // observationsSummary aggregates a set of observations.
 type observationsSummary struct {
-	total       int
-	successes   int
-	failures    int
+	total     int
+	successes int
+	failures  int
+
+	// writes counts the produce records of every event and writesOK those
+	// acknowledged before the deadline. With one record per event they equal
+	// total and successes; with a fan-out they show how much of a partly failed
+	// event still got through.
+	writes, writesOK int
+
 	meanLatency time.Duration
 	p50Latency  time.Duration
 	p99Latency  time.Duration

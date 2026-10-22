@@ -22,7 +22,7 @@ func TestResearchScenarios_AreInvestigationScenarios(t *testing.T) {
 	for _, sc := range researchScenarios() {
 		assert.True(t, strings.HasPrefix(sc.name, "investigation: "), sc.name)
 		assert.Contains(t, investigation, sc.name)
-		for _, standard := range scenarios() {
+		for _, standard := range scenarios(defaultRunID) {
 			assert.NotEqual(t, sc.name, standard.name)
 		}
 	}
