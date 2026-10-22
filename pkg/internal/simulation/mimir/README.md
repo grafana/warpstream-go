@@ -49,12 +49,13 @@ rolling-restart gate still requires every write to finish within 2s.
 Fake brokers acknowledge without persisting writes. Results measure HTTP
 completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
-jobs and posts each client's worst success count in one updated PR comment.
+jobs and posts each client's observed success-percentage range in one updated PR comment.
 The Mimir binary and simulation harness are built once and shared across the
-three runs. Each CI run splits the 20 scenarios into five batches of four on
+three runs per client variant. Each CI run splits the 22 scenarios into five batches on
 separate runners. Both clients run together within each scenario, preserving
 all comparison gates. Integration harness unit tests run once in a separate job, in
-parallel with the build.
+parallel with the build. The real Prometheus sender retry test runs after the
+Prometheus binary is built for the PR client variant.
 Each run's full latency, fault and error report is retained as a CI artifact.
 CI freezes one `main` client revision, then runs both clients against the PR's
 harness three times per variant. The comment compares PR wgo, main wgo and the
@@ -190,7 +191,7 @@ partition before observation starts.
 
 From 10s to 130s, one agent takes 6s to acknowledge and four take 3s; five remain
 at 50ms. The proxy reads `Produce.TimeoutMillis` from each real Kafka request.
-Agent work exceeding it returns `REQUEST_TIMED_OUT` at that deadline. With this
+Agent work exceeding it returns `KAFKA_STORAGE_ERROR` at that deadline. With this
 budget Mimir sends 2s through wgo and 4s through franz-go: the same 3s operation
 can produce different broker outcomes. Concurrent service times overlap while
 TCP response order is preserved. These are acknowledgement-stall inputs, not a
@@ -206,8 +207,8 @@ entirely above its peers; overlapping or touching ranges have no highlighted
 winner. Perfect 100% results are highlighted, with ties preferring PR wgo.
 Synthetic scenarios retain exact attempt-count validation. No assertion requires a client
 to win. HTTP availability targets remain strict and informational in CI. The
-fault case also rejects permanently failed or dropped sender samples and requires
-the source-to-sent lag to be at most 5s at collection, so successful recent HTTP
+fault case also rejects permanently failed or dropped wgo sender samples and requires
+the wgo source-to-sent lag to be at most 5s at collection, so successful recent HTTP
 requests cannot hide an old WAL backlog.
 
 Reports retain Mimir timeout/hedge-suppression evidence and sender counters since

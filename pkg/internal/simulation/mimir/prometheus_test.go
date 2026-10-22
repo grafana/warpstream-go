@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,4 +106,42 @@ func TestPrometheus_RecordsDoNotInjectHTTP(t *testing.T) {
 	called := false
 	p.Produce(context.Background(), &kgo.Record{}, func(_ *kgo.Record, err error) { require.NoError(t, err); called = true })
 	require.True(t, called)
+}
+
+func TestPrometheus_SenderEvidenceHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	workload := &prometheusWorkload{senders: []*prometheusSender{{
+		address: server.URL, client: &distributorClient{http: server.Client()},
+	}}}
+	_, err := workload.SenderEvidence()
+	require.ErrorContains(t, err, "HTTP 503 Service Unavailable")
+}
+
+func TestPrometheus_CloseIdleConnections(t *testing.T) {
+	closed := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			close(closed)
+		}
+	}
+	server.Start()
+	defer server.Close()
+	sender := &prometheusSender{transport: &http.Transport{}}
+	defer sender.Close()
+	client := &http.Client{Transport: sender.transport, Timeout: 5 * time.Second}
+	response, err := client.Get(server.URL)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	sender.Close()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle proxy connection was not closed")
+	}
 }

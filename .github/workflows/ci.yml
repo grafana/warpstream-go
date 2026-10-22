@@ -123,6 +123,11 @@ jobs:
               bash "$build" "$RUNNER_TEMP/simulation-build/workload"
             fi
           done
+      - name: Test real Prometheus sender retries
+        if: matrix.workload.name == 'mimir' && matrix.client == 'pr'
+        env:
+          PROMETHEUS_BINARY: ${{ runner.temp }}/simulation-build/workload/prometheus
+        run: go test -mod=mod -race -p 2 -count=1 -run '^TestPrometheus_RetryRemoteWrite$' .
       - name: Build simulation harness
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-build"

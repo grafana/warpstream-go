@@ -32,6 +32,7 @@ type prometheusSender struct {
 	keepFiles          bool
 	lastScrape         atomic.Int64
 	client             *distributorClient
+	transport          *http.Transport
 	command            *exec.Cmd
 	done               chan struct{}
 	source, receiver   *httptest.Server
@@ -97,7 +98,8 @@ func newPrometheusSender(binary string, client *distributorClient, logs string) 
 		return nil, err
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = &http.Transport{ResponseHeaderTimeout: 30 * time.Second}
+	s.transport = &http.Transport{ResponseHeaderTimeout: 30 * time.Second}
+	proxy.Transport = s.transport
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "distributor unavailable", http.StatusBadGateway)
 	}
@@ -231,6 +233,9 @@ func (s *prometheusSender) Close() {
 		if s.receiver != nil {
 			s.receiver.Close()
 		}
+		if s.transport != nil {
+			s.transport.CloseIdleConnections()
+		}
 		if s.source != nil {
 			s.source.Close()
 		}
@@ -321,6 +326,10 @@ func (p *prometheusWorkload) SenderEvidence() (map[string]float64, error) {
 		response, err := sender.client.http.Get(sender.address + "/metrics")
 		if err != nil {
 			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			return nil, fmt.Errorf("prometheus metrics %s: HTTP %s", sender.address, response.Status)
 		}
 		parser := expfmt.NewTextParser(model.UTF8Validation)
 		families, parseErr := parser.TextToMetricFamilies(response.Body)

@@ -256,7 +256,7 @@ func TestBrokerProxy_StorageTimeout(t *testing.T) {
 					synctest.Wait()
 					if budget == 2000 {
 						require.Zero(t, delivered.Load())
-						require.Equal(t, kerr.RequestTimedOut.Code, partition.ErrorCode)
+						require.Equal(t, kerr.KafkaStorageError.Code, partition.ErrorCode)
 					} else {
 						require.Zero(t, partition.ErrorCode)
 						require.EqualValues(t, 1, delivered.Load())

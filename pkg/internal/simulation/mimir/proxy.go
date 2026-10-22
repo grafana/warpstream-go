@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -112,6 +113,7 @@ func (p *brokerProxy) forward(client net.Conn, target string) {
 					if api == int16(kmsg.Produce) && p.enforceProduceTimeout {
 						kind.timeout, err = produceTimeout(frame, kind.version)
 						if err != nil {
+							log.Printf("broker proxy %s: parse Produce v%d timeout: %v", target, kind.version, err)
 							return
 						}
 					}
@@ -322,7 +324,8 @@ func produceTimeout(frame []byte, version int16) (time.Duration, error) {
 	request := kmsg.NewPtrProduceRequest()
 	request.SetVersion(version)
 	if request.IsFlexible() {
-		// Request headers place tagged fields after the nullable client ID.
+		// The helper skips four correlation-ID bytes before reading tags, so
+		// start four bytes early to read the tags after the nullable client ID.
 		header, err := responseHeaderLength(frame[offset-4:], true)
 		if err != nil {
 			return 0, err
@@ -349,7 +352,7 @@ func timeoutProduceResponse(frame []byte, version int16) ([]byte, error) {
 		for j := range response.Topics[i].Partitions {
 			partition := &response.Topics[i].Partitions[j]
 			if partition.ErrorCode == 0 {
-				partition.ErrorCode = kerr.RequestTimedOut.Code
+				partition.ErrorCode = kerr.KafkaStorageError.Code
 			}
 		}
 	}

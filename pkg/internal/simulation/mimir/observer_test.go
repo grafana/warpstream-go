@@ -12,7 +12,7 @@ import (
 
 func TestObserver_ProduceOutcome(t *testing.T) {
 	for _, version := range []int16{8, 11} {
-		for _, errorCode := range []int16{0, kerr.RequestTimedOut.Code} {
+		for _, errorCode := range []int16{0, kerr.RequestTimedOut.Code, kerr.KafkaStorageError.Code} {
 			t.Run(fmt.Sprintf("version %d error %d", version, errorCode), func(t *testing.T) {
 				response := kmsg.NewPtrProduceResponse()
 				response.SetVersion(version)
