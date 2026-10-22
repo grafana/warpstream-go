@@ -93,6 +93,8 @@ jobs:
             pkg/internal/simulation/**/go.sum
             pkg/internal/simulation/**/*-version.txt
             pkg/internal/simulation/**/build-*.sh
+            pkg/internal/simulation/**/download-*.sh
+            pkg/internal/simulation/**/*-sha256sums.txt
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: matrix.client == 'main'
         with:
@@ -118,9 +120,9 @@ jobs:
       - name: Build integration workload
         if: matrix.workload.name != 'direct'
         run: |
-          for build in build-*.sh; do
-            if [ -f "$build" ]; then
-              bash "$build" "$RUNNER_TEMP/simulation-build/workload"
+          for script in build-*.sh download-*.sh; do
+            if [ -f "$script" ]; then
+              bash "$script" "$RUNNER_TEMP/simulation-build/workload"
             fi
           done
       - name: Test real Prometheus sender retries

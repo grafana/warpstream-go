@@ -55,7 +55,7 @@ three runs per client variant. Each CI run splits the 22 scenarios into five bat
 separate runners. Both clients run together within each scenario, preserving
 all comparison gates. Integration harness unit tests run once in a separate job, in
 parallel with the build. The real Prometheus sender retry test runs after the
-Prometheus binary is built for the PR client variant.
+Prometheus release binary is downloaded for the PR client variant.
 Each run's full latency, fault and error report is retained as a CI artifact.
 CI freezes one `main` client revision, then runs both clients against the PR's
 harness three times per variant. The comment compares PR wgo, main wgo and the
@@ -172,9 +172,11 @@ investigation profile and one for the standard suite.
 
 `-profile mimir-prometheus` runs a healthy control and a sustained partial outage.
 Both are included in the default `all` profile and its three-run CI report.
-The build creates both the actual pinned Mimir binary and a pinned Prometheus
-binary. Supply `-prometheus-binary` to use an existing build; otherwise the harness
-looks beside the Mimir binary. `PROMETHEUS_BINARY` also supplies this path.
+The build compiles the actual pinned Mimir binary and downloads the official
+Prometheus release pinned in `prometheus-version.txt`, verifying the archive against
+`prometheus-sha256sums.txt`. Linux and macOS on amd64 and arm64 are supported.
+Supply `-prometheus-binary` to use an existing binary; otherwise the harness looks
+beside the Mimir binary. `PROMETHEUS_BINARY` also supplies this path.
 
 Each lane launches two actual Prometheus processes in agent mode. Each scrapes
 32,000 fixed series every second, writes its WAL, and remote-writes to an

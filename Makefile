@@ -18,7 +18,7 @@ simulation:
 .PHONY: simulation-mimir-build
 simulation-mimir-build:
 	bash pkg/internal/simulation/mimir/build-mimir.sh
-	bash pkg/internal/simulation/mimir/build-prometheus.sh
+	bash pkg/internal/simulation/mimir/download-prometheus.sh
 
 .PHONY: simulation-mimir
 simulation-mimir: simulation-mimir-build
