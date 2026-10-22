@@ -128,3 +128,10 @@ func TestFractionGate_LatenciesStayDerivedFromHedgeDelays(t *testing.T) {
 	require.Less(t, moderateSlowLatency, shortestHedgeDelay)
 	require.Less(t, moderateHealthyLatency, moderateSlowLatency)
 }
+
+func TestFaultyFractionGate_NoFloorAboveTheLimit(t *testing.T) {
+	t.Parallel()
+	// Above the limit wgo is expected to collapse, so its description and its floor must agree.
+	require.Zero(t, faultyFractionGate.expect(true).minWgoSuccessRate)
+	require.Positive(t, faultyFractionGate.expect(false).minWgoSuccessRate)
+}

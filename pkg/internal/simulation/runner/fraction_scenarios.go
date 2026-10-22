@@ -100,7 +100,7 @@ var (
 		belowEffect: "wgo still hedges these writes after the " + shortestHedgeDelay.String() + " hedge delay",
 		aboveEffect: "hedging is switched off (observed: slow_fraction_exceeded)",
 		tail: func(share float64) string {
-			return fmt.Sprintf("%s is just past the %s hedge delay, so wgo hedges, but a hedge answers after %s, later than the slow primary. The primary wins and nothing slow is cancelled, which keeps the fault out of the faulty-fraction gate. "+
+			return fmt.Sprintf("%s is just past the %s hedge delay, so wgo hedges, but a hedge answers after %s, later than the slow primary. The primary wins, so no slow request is cancelled and the slow agents are not charged as faulty. The hedge that loses is cancelled on a healthy agent, which before #127 can close that agent's shared connection; the report shows it if that raises the faulty-fraction gate. "+
 				"The slow agents count as slow at this share (%s against %s is %.1fx, and %.1fx is needed). Success should be the same on both sides; the difference is hedge surge, some below the limit and little above it. "+
 				"The direct harness hedges only after %s, so it never hedges this latency.",
 				barelyHedgedSlowLatency, shortestHedgeDelay, shortestHedgeDelay+barelyHedgedHealthyLatency, barelyHedgedSlowLatency, barelyHedgedHealthyLatency,
@@ -141,7 +141,8 @@ var (
 		},
 		expect: func(above bool) scenarioExpectations {
 			if above {
-				return scenarioExpectations{minWgoSuccessRate: 1.0}
+				// A probe of the limit: wgo is expected to collapse here, so there is no floor.
+				return scenarioExpectations{}
 			}
 			return scenarioExpectations{minWgoSuccessRate: 1.0, minSuccessDeltaVsKgo: ptr(0.5)}
 		},
@@ -178,7 +179,7 @@ func stalledAgentsGate(subject string, rule stalledRule, runID int) fractionGate
 	belowEffect := "wgo races each stalled write against its fast first fallback, which every build does, so writes finish about one hedge delay after they start"
 	tail := func(ids []int32, share float64) string {
 		return fmt.Sprintf("%s is past the %s application deadline, so kgo misses it on every event that reaches a stalled agent, and under the %s produce wire timeout, so nothing times out. "+
-			"Run id %d places the stalled agents at %v so that every stalled partition has a fast first fallback. Below the limit wgo should finish near 100%% while kgo fails every event; above it hedging stops and both fail.",
+			"Run id %d places the stalled agents at %v so that every stalled partition has a fast first fallback. Below the limit wgo should finish near 100%% while kgo fails the events that reach a stalled agent, nearly all of them; above it hedging stops and both fail.",
 			stalledSlowLatency, appRequestTimeout, clientProduceRequestTimeout, runID, ids)
 	}
 	if rule == fastSecondFallback {
@@ -187,7 +188,7 @@ func stalledAgentsGate(subject string, rule stalledRule, runID int) fractionGate
 		tail = func(ids []int32, share float64) string {
 			return fmt.Sprintf("%s is past the %s application deadline, so kgo misses it on every event that reaches a stalled agent, and under the %s produce wire timeout, so nothing times out. "+
 				"Run id %d places the stalled agents at %v so that no partition has its whole chain stalled and at least %d stalled partitions have a stalled first fallback and a fast second one. "+
-				"Only a client that races another candidate on a timer when a fallback stalls (#128) reaches the second fallback in time, about two hedge delays after the start. Builds without it are expected to fail every event.",
+				"Only a client that races another candidate on a timer when a fallback stalls (#128) reaches the second fallback in time, about two hedge delays after the start. Builds without it are expected to fail the events that reach those partitions, nearly all of them: a split event sends 50 writes hashed over the ring, so a rare event can miss them.",
 				stalledSlowLatency, appRequestTimeout, clientProduceRequestTimeout, runID, ids, minNeedingSecondFallback)
 		}
 	}
@@ -196,7 +197,7 @@ func stalledAgentsGate(subject string, rule stalledRule, runID int) fractionGate
 		subject:     subject, fault: "stalled", limitName: "MaxSlowFraction", limit: wgo.DefaultHealthCheckMaxSlowFraction,
 		does:        "answer every Produce after " + stalledSlowLatency.String() + " while the rest answer in " + moderateHealthyLatency.String(),
 		belowEffect: belowEffect,
-		aboveEffect: "hedging is switched off (observed: slow_fraction_exceeded), so every stalled write waits out its stall and every event misses the deadline, as for kgo",
+		aboveEffect: "hedging is switched off (observed: slow_fraction_exceeded), so every stalled write waits out its stall and the events that reach a stalled agent miss the deadline, as for kgo",
 		tail: func(share float64) string {
 			ids, _ := findStalledAgents(int32(math.Round(share*float64(clusterSize))), rule, runID)
 			return tail(ids, share)

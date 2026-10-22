@@ -144,6 +144,13 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 	}
 	if res.sc.requireCascadeContinuation {
+		if res.staleFallback == nil || res.staleFallback.BrokerOnlyWithdrawals == 0 || res.staleFallback.StaleRoutingResponses == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "stale discovery was not exercised: no broker-only withdrawal reached the client's routing"})
+		}
+		// Builds before the unknown_broker label report the same failure as "unknown".
+		if res.staleFallback == nil || res.staleFallback.FallbackErrorReasons["unknown_broker"]+res.staleFallback.FallbackErrorReasons["unknown"] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no fallback attempt failed on an agent the client does not know, so the unknown-agent cascade was not exercised"})
+		}
 		if res.staleFallback == nil || res.staleFallback.FallbackErrors == 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no fallback attempt failed, so the cascade was not exercised"})
 		}

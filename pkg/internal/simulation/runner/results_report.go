@@ -179,9 +179,9 @@ func (rr *resultsReport) generateMarkdown() string {
 }
 
 // writeSuccessLatencyTable shows each client's success ratio, then the latency of
-// the writes that succeeded. A failure is a 5xx for the application, so it leads.
+// the events that succeeded. A failure is a 5xx for the application, so it leads.
 func (rr *resultsReport) writeSuccessLatencyTable(b *strings.Builder) {
-	b.WriteString("### Latency of successful requests\n\nOnly requests that succeeded are timed, so a failure's deadline does not hide how fast the others were; `n/a` means none succeeded. Read it with the success columns, since a client that fails its slowest writes looks faster here. The summary above counts failures at their deadline.\n\n")
+	b.WriteString("### Latency of successful requests\n\nOnly requests (whole events) that succeeded are timed, so a failure's deadline does not hide how fast the others were; an event with one failed write is not timed at all; `n/a` means none succeeded. Read it with the success columns, since a client that fails its slowest writes looks faster here. The summary above counts failures at their deadline.\n\n")
 	b.WriteString("| Scenario | wgo success | kgo success | wgo p50 | kgo p50 | wgo p99 | kgo p99 | wgo mean | kgo mean |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
 	cell := func(s observationsSummary, d time.Duration) string {
 		if s.successes == 0 {

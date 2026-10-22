@@ -82,19 +82,22 @@ and each description lists them.
 - The moderately slow pair never reaches the hedge delay, so no hedge fires on either side:
   the slow-fraction gate acts and nothing else changes.
 - The barely hedged pair answers just after the hedge delay but before a hedge to a healthy
-  agent could, so hedges fire but the slow primary wins and nothing slow is cancelled. The
-  faulty-fraction gate stays out: below the limit wgo hedges, above it hedging should stop.
+  agent could, so hedges fire but the slow primary wins, so no slow request is cancelled. The hedge that
+  loses is cancelled on a healthy agent, which before #127 can close that agent's shared
+  connection; the report shows if that raises the faulty-fraction gate. Below the limit wgo
+  hedges, above it hedging should stop.
 - The stalled pairs answer between the application deadline and the produce wire timeout, so
   kgo misses the deadline on every event that reaches a stalled agent. An event needs every
-  partition, so each pair places its stalled agents with a fixed search over wgo's real
+  write it issues, so each pair places its stalled agents with a fixed search over wgo's real
   candidate walk (a leader followed by consecutive agents from a hash of the topic and
   partition) so that every partition has a way out. "Fast first fallback" leaves every
   stalled partition a fast first fallback, which every build races. "Fast second fallback"
   leaves no partition with its whole chain stalled and at least three whose first fallback
   is stalled but second is fast, which only a client that races another candidate on a
   timer (#128) reaches in time, so older builds are expected to fail it. Below the limit
-  wgo should finish near 100 while kgo fails every event; above it hedging stops and both
-  fail. The walk is pinned by a test in `pkg/wgo` and a copy in the runner.
+  wgo should finish near 100 while kgo fails the events that reach a stalled agent, nearly all
+  of them; above it hedging stops and both fail. Each event sends 50 writes hashed over the
+  ring, so a rare event can miss the partitions a pair is built around. The walk is pinned by a test in `pkg/wgo` and a copy in the runner.
 
 `-run-id N` (default 1, at least 1) numbers the run. CI passes the run number of its three repetitions, and a
 local run can pass its round number. Only the four stalled-agent scenarios use it: run N places the stalled agents
@@ -103,7 +106,7 @@ placement with the same guarantees, and every build in a run sees the same one. 
 and id 1 gives the placement used before the flag existed. Repeat the same id to measure plain noise. The
 descriptions in a report name the id and the agents.
 
-The CI comment compares the PR's wgo results with the current head of the PR's base branch (`main`) and splits each table in two. **Gated checks** are the benchmark scenarios listed in `runner/benchmarks.go`, whose expectations are meant to block a PR later (CI does not enforce them yet); their PR result starts with ✅ when every PR run met the expectations and ❌ when one missed. **Other checks** are informational. Every PR result also starts with 🟩 improved, 🟥 regressed or 🟦 unchanged against main: results within 2 points of each other, or whose three-run ranges overlap, count as unchanged, but a drop from a perfect 100% is always a regression and reaching 100% from below is always an improvement. Bold marks a clear winner only: a result that is better by less than that same margin stays plain, so a bold value is never shown next to 🟦.
+The CI comment compares the PR's wgo results with the current head of the PR's base branch (`main`) and splits each table in two. **Gated checks** are the benchmark scenarios listed in `runner/benchmarks.go`, whose expectations are meant to block a PR later (CI does not enforce them yet); their PR result starts with ✅ when every PR run met the expectations and ❌ when one missed. **Other checks** are informational. Every PR result also starts with 🟩 improved, 🟥 regressed or 🟦 unchanged against main: results within 2 points of each other, or whose three-run ranges overlap, count as unchanged, but a drop from a perfect 100% is always a regression and reaching 100% from below is always an improvement. Bold marks a clear winner only: a result that is better by less than that same margin stays plain, so a bold value is not shown next to 🟦, except a perfect 100% that ties.
 
 An event succeeds only when every one of its writes is acknowledged before the application deadline, which hides how
 much of a failed event got through. The reports therefore also count individual writes ("Individual write success"
@@ -116,8 +119,8 @@ Slow agents are hedged, never demoted: wgo's demoter acts only on agents that re
 so above MaxSlowFraction nothing else helps a slow agent.
 
 Success against kgo is the main result of every scenario. Each report has a "Latency of
-successful requests" table: both clients' failure ratio first (a failure is a 5xx for the
-application), then mean, p50 and p99 of the writes that succeeded, so a failure's deadline
+successful requests" table: both clients' success ratio first (a failure is a 5xx for the
+application), then p50, p99 and mean of the events that succeeded (an event with one failed write is not timed), so a failure's deadline
 does not hide how fast the others were. A client that fails its slowest writes looks faster
 there, so read it with the success columns. A "Why hedging stopped (secondary signal)" table
 then shows the gate a scenario is built to trip next to the hedges each gate suppressed, with

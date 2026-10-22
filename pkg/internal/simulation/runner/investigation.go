@@ -156,7 +156,7 @@ const (
 
 // rotatingLeaderScenario models a write-agent rollout seen through WarpStream's
 // discovery. Metadata names one leader for every partition, picked from a cached
-// listing that keeps a dead agent for a minute or more. Every wave takes two
+// listing that still names a dead agent as the leader for 10s after it dies. Every wave takes two
 // agents away: one still known to the client's broker map, and one the broker map
 // has already dropped while the pool still lists it. For the first 10s after an
 // agent dies the cached listing still names it as the leader, so all partitions
