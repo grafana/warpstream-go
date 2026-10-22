@@ -53,6 +53,7 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 		WgoSender         map[string]float64     `json:"wgo_sender,omitempty"`
 		KgoSender         map[string]float64     `json:"kgo_sender,omitempty"`
 		Scenario          string                 `json:"scenario"`
+		Benchmark         bool                   `json:"benchmark,omitempty"`
 		ClientEvidence    *clientEvidence        `json:"wgo_client_evidence,omitempty"`
 		HedgeStop         *hedgeStop             `json:"hedge_stop,omitempty"`
 		WgoSuccessLatency *successLatency        `json:"wgo_success_latency,omitempty"`
@@ -71,6 +72,7 @@ func (rr *resultsReport) generateJSON() ([]byte, error) {
 	for _, res := range rr.results.entries {
 		entry := scenarioSuccess{
 			Scenario:  res.sc.name,
+			Benchmark: benchmarkScenarios[res.sc.name],
 			WgoSender: res.wgoSender, KgoSender: res.kgoSender,
 			StaleFallback:     res.staleFallback,
 			ClientEvidence:    res.clientEvidence,

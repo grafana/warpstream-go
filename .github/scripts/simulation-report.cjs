@@ -27,6 +27,7 @@ function validateReport(rows) {
         throw new Error(`Invalid ${client} accepted sample count`);
       }
     }
+    if (row.benchmark !== undefined && typeof row.benchmark !== 'boolean') throw new Error('Invalid benchmark flag');
     if (row.failures !== undefined && (!Array.isArray(row.failures) || row.failures.some(f => typeof f !== 'string'))) {
       throw new Error('Invalid expectation failures');
     }
@@ -47,7 +48,37 @@ function percentage(value) {
 function successRange(counts) {
   const rates = counts.map(c => c.passes / c.attempts);
   const low = Math.min(...rates), high = Math.max(...rates);
-  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))} ± ${percentage(50 * (high - low))} %`, rate: low, high };
+  const mean = rates.reduce((sum, rate) => sum + rate, 0) / rates.length;
+  return { cell: low === 1 ? '100%' : `${percentage(50 * (low + high))} ± ${percentage(50 * (high - low))} %`, rate: low, high, mean };
+}
+
+// Icons shown in front of the PR wgo result. The gate only applies to benchmark scenarios; the
+// trend compares the PR with main for every scenario.
+const icons = { pass: '✅', fail: '❌', up: '🟩', down: '🟥', same: '🟦', none: '' };
+
+// Two results within this many percentage points, or whose three-run ranges overlap, count as
+// the same: three runs of one build already differ by that much from timing alone.
+const sameBandPoints = 2;
+
+// trendIcon compares the PR's wgo range with main's. Perfection is held to a stricter rule:
+// a drop from 100% is a regression however small, and reaching 100% from below is an
+// improvement however small.
+function trendIcon(pr, main) {
+  if (pr.cell === '—' || main.cell === '—') return icons.none;
+  if (main.rate === 1) return pr.rate === 1 ? icons.same : icons.down;
+  if (pr.rate === 1) return icons.up;
+  const overlap = pr.rate <= main.high && main.rate <= pr.high;
+  const delta = 100 * (pr.mean - main.mean);
+  if (overlap || Math.abs(delta) <= sameBandPoints) return icons.same;
+  return delta > 0 ? icons.up : icons.down;
+}
+
+// gateIcon is only shown for benchmark scenarios, whose expectations are meant to gate a PR.
+function gateIcon(benchmark, prRuns) {
+  if (!benchmark) return icons.none;
+  const rows = prRuns.filter(Boolean);
+  if (rows.length !== prRuns.length || rows.length === 0) return icons.none;
+  return rows.every(row => !(row.failures || []).length) ? icons.pass : icons.fail;
 }
 
 function sampleRange(runs, client) {
@@ -57,12 +88,24 @@ function sampleRange(runs, client) {
   return { cell: `${((low + high) / 2).toLocaleString('en-US')} ± ${((high - low) / 2).toLocaleString('en-US')}`, rate: low, high };
 }
 
-function comparisonCells(columns) {
+// above reports whether one range is clearly better than another: entirely above it and, for
+// success percentages, by more than the band that the trend icon treats as "the same". Without
+// this a bold value could sit next to a "=" icon.
+function clearlyAbove(candidate, other) {
+  if (!(candidate.rate > other.high)) return false;
+  if (candidate.mean === undefined || other.mean === undefined) return true;
+  return 100 * (candidate.mean - other.mean) > sameBandPoints;
+}
+
+function comparisonCells(columns, prefix = '') {
   const perfect = columns.findIndex(c => c.cell === '100%');
   const best = perfect !== -1 ? perfect : columns.findIndex((candidate, i) =>
     candidate.cell !== '—' && columns.every((other, j) =>
-      i === j || other.cell === '—' || candidate.rate > other.high));
-  return columns.map((column, i) => column.cell !== '—' && i === best ? `✅ **${column.cell}**` : column.cell).join(' | ');
+      i === j || other.cell === '—' || clearlyAbove(candidate, other)));
+  return columns.map((column, i) => {
+    const cell = column.cell !== '—' && i === best ? `**${column.cell}**` : column.cell;
+    return i === 0 && prefix ? `${prefix} ${cell}` : cell;
+  }).join(' | ');
 }
 
 function renderWorkload(title, reports, mainReports = [null, null, null], incomplete = false) {
@@ -99,17 +142,24 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
       if (counts.length !== 3) return { cell: '—', rate: -1 };
       return successRange(counts);
     });
+    const benchmark = rows.some(row => row.benchmark === true);
     const samples = [[pr, 'wgo'], [main, 'wgo'], [pr, 'kgo']].map(([runs, client]) => sampleRange(runs, client));
-    return { name, variableAttempts, columns, samples };
+    return { name, variableAttempts, columns, samples, benchmark, gate: gateIcon(benchmark, pr), trend: trendIcon(columns[0], columns[1]) };
   });
   entries.sort((a, b) => a.columns[0].rate - b.columns[0].rate ||
     Math.min(...a.columns.slice(1).map(c => c.rate)) - Math.min(...b.columns.slice(1).map(c => c.rate)) ||
     a.name.localeCompare(b.name));
-  lines.push('| Scenario | wgo (PR) success | wgo (main) success | kgo success |');
-  lines.push('| --- | ---: | ---: | ---: |');
-  for (const entry of entries) {
-    lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${comparisonCells(entry.columns)} |`);
-  }
+  const render = (title, group) => {
+    if (!group.length) return;
+    if (lines[lines.length - 1] !== '') lines.push('');
+    lines.push(`#### ${title}`, '', '| Scenario | wgo (PR) success | wgo (main) success | kgo success |', '| --- | ---: | ---: | ---: |');
+    for (const entry of group) {
+      const prefix = [entry.gate, entry.trend].filter(Boolean).join(' ');
+      lines.push(`| ${escapeCell(entry.name)}${entry.variableAttempts ? ' (HTTP attempts)' : ''} | ${comparisonCells(entry.columns, prefix)} |`);
+    }
+  };
+  render('Gated checks', entries.filter(entry => entry.benchmark));
+  render('Other checks', entries.filter(entry => !entry.benchmark));
   const remoteEntries = entries.filter(entry => entry.variableAttempts);
   if (remoteEntries.length) {
     lines.push('', '#### Samples acknowledged by Mimir', '',
@@ -170,7 +220,8 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   if (mainSHAs.size > 1 || harnessSHAs.size > 1) throw new Error('Client variants did not use one main revision and one PR harness');
   if (mainSHAs.size) sections.push(`Main client: \`${[...mainSHAs][0]}\` · Harness: \`${[...harnessSHAs][0]}\``, '');
   if (source) sections.push(source, '');
-  sections.push('✅ **Bold** marks a range entirely above every other available range, or perfect 100% success. Overlapping or touching partial ranges have no highlighted winner. Perfect ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
+  sections.push(`The icon in front of each PR wgo result compares it with main: ${icons.up} improved, ${icons.down} regressed, ${icons.same} the same, meaning within ${sameBandPoints} points or with overlapping ranges. A scenario that was 100% on main and is lower in any PR run is always ${icons.down}, and reaching 100% from below is always ${icons.up}. Gated checks also show ${icons.pass} when the scenario met its expectations in all three PR runs and ${icons.fail} when it missed them in at least one; only these checks are meant to block a PR later, and CI does not enforce them yet.`, '');
+  sections.push('**Bold** marks a range entirely above every other available range, or perfect 100% success. Overlapping or touching partial ranges have no highlighted winner. Perfect ties prefer PR wgo. These three-run ranges do not establish statistical significance.', '');
   return sections.join('\n');
 }
 
@@ -197,7 +248,7 @@ function publish(directory) {
   console.log(JSON.parse(result).html_url);
 }
 
-module.exports = { buildReport, renderWorkload, validateReport };
+module.exports = { buildReport, renderWorkload, validateReport, trendIcon, icons };
 if (require.main === module) {
   const directory = process.argv[2];
   if (!directory) throw new Error('Usage: simulation-report.cjs DIRECTORY [--publish]');

@@ -103,6 +103,8 @@ placement with the same guarantees, and every build in a run sees the same one. 
 and id 1 gives the placement used before the flag existed. Repeat the same id to measure plain noise. The
 descriptions in a report name the id and the agents.
 
+The CI comment compares the PR's wgo results with the current head of the PR's base branch (`main`) and splits each table in two. **Gated checks** are the benchmark scenarios listed in `runner/benchmarks.go`, whose expectations are meant to block a PR later (CI does not enforce them yet); their PR result starts with ✅ when every PR run met the expectations and ❌ when one missed. **Other checks** are informational. Every PR result also starts with 🟩 improved, 🟥 regressed or 🟦 unchanged against main: results within 2 points of each other, or whose three-run ranges overlap, count as unchanged, but a drop from a perfect 100% is always a regression and reaching 100% from below is always an improvement. Bold marks a clear winner only: a result that is better by less than that same margin stays plain, so a bold value is never shown next to 🟦.
+
 An event succeeds only when every one of its writes is acknowledged before the application deadline, which hides how
 much of a failed event got through. The reports therefore also count individual writes ("Individual write success"
 table, `wgo_writes` and `kgo_writes` in the JSON) for scenarios whose events fan out into several. The direct harness
