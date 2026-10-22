@@ -120,6 +120,14 @@ function comparisonCells(columns, prefix = '', kgoMark = '') {
   }).join(' | ');
 }
 
+// The rows keep one fixed order, so a scenario sits in the same place in every comment and the
+// two sides of a threshold pair are adjacent. A scenario missing from the list goes last.
+const scenarioOrder = require('./simulation-order.json');
+const orderOf = name => {
+  const index = scenarioOrder.indexOf(name);
+  return index === -1 ? scenarioOrder.length : index;
+};
+
 function renderWorkload(title, reports, mainReports = [null, null, null], incomplete = false) {
   const lines = [`### ${title}`, ''];
   for (const [label, runs] of [['PR', reports], ['main', mainReports]]) {
@@ -158,9 +166,7 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
     const samples = [[pr, 'wgo'], [main, 'wgo'], [pr, 'kgo']].map(([runs, client]) => sampleRange(runs, client));
     return { name, variableAttempts, columns, samples, benchmark, gate: gateIcon(benchmark, pr), kgoMark: kgoWarning(pr), trend: trendIcon(columns[0], columns[1]) };
   });
-  entries.sort((a, b) => a.columns[0].rate - b.columns[0].rate ||
-    Math.min(...a.columns.slice(1).map(c => c.rate)) - Math.min(...b.columns.slice(1).map(c => c.rate)) ||
-    a.name.localeCompare(b.name));
+  entries.sort((a, b) => orderOf(a.name) - orderOf(b.name) || a.name.localeCompare(b.name));
   const render = (title, group) => {
     if (!group.length) return;
     if (lines[lines.length - 1] !== '') lines.push('');
@@ -184,7 +190,7 @@ function renderWorkload(title, reports, mainReports = [null, null, null], incomp
 
 function buildReport(directory, heading = 'Simulation results', source = '') {
   const sections = [marker, `## ${heading}`, '',
-    'Three independent runs per client variant and scenario, using the same PR harness. Success is normalized to percentages. Partial results show the midpoint ± half the observed min/max range, with one percent sign for both numbers (for example, 25.0 ± 5.0 % spans 20–30%); 100% means all three runs were perfect. This is an observed range, not a confidence interval. Rows are sorted by the lowest PR wgo success rate, worst first. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
+    'Three independent runs per client variant and scenario, using the same PR harness. Success is normalized to percentages. Partial results show the midpoint ± half the observed min/max range, with one percent sign for both numbers (for example, 25.0 ± 5.0 % spans 20–30%); 100% means all three runs were perfect. This is an observed range, not a confidence interval. Rows keep a fixed order, so each scenario sits in the same place in every comment and the two sides of a threshold pair are adjacent. HTTP attempts include real remote-write retries; failed attempts do not imply lost samples. Scenario gates are informational; build and harness errors still fail CI.', '',
     '> **Run-to-run variance:** Results below 100% success can vary because of randomness and wall-clock timing during testing.', '',
     'kgo comes from the PR runs. Main-run kgo measurements are retained in the artifacts. All runs, gates, latency, sender, fault and error details are available in the artifacts.', ''];
   sections.push('Sample counts show midpoint ± half-range across three runs; more is better. They count samples in remote-write requests issued during the observation window that receive HTTP 2xx, including their bounded drain. Warmup and failed attempts are excluded. Acknowledgements do not establish unique or durably stored samples.', '');

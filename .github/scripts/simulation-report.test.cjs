@@ -72,11 +72,19 @@ test('compares PR and main through the same scenarios', () => {
   assert.throws(() => renderWorkload('Mimir', pr, [[{ ...row(100), scenario: 'other' }], ...main.slice(1)]), /scenario names differ/);
 });
 
-test('sorts the weakest PR result first, independently of the main result', () => {
-  const rows = [ { ...row(120), scenario: 'a healthy' }, { ...row(5), scenario: 'z weak' } ];
-  const main = [ { ...row(0), scenario: 'a healthy' }, { ...row(120), scenario: 'z weak' } ];
-  const output = renderWorkload('Mimir', [rows, rows, rows], [main, main, main]);
-  assert.ok(output.indexOf('| z weak |') < output.indexOf('| a healthy |'));
+test('keeps a fixed scenario order whatever the results, with threshold pairs adjacent', () => {
+  const below = 'stalled agents with a fast first fallback just below MaxSlowFraction';
+  const above = 'stalled agents with a fast first fallback just above MaxSlowFraction';
+  const unlisted = 'a scenario that is not in the order list';
+  const render = passes => {
+    const rows = [above, unlisted, 'all healthy', below].map(scenario => ({ ...row(passes[scenario] ?? 120), scenario }));
+    return renderWorkload('Mimir', [rows, rows, rows], [rows, rows, rows]);
+  };
+  for (const output of [render({}), render({ [below]: 120, [above]: 5, 'all healthy': 5 })]) {
+    const at = name => output.indexOf(`| ${name} |`);
+    assert.ok(at('all healthy') < at(below) && at(below) < at(above) && at(above) < at(unlisted));
+    assert.equal(output.slice(at(below)).split('\n')[1].startsWith(`| ${above} |`), true);
+  }
 });
 
 test('ties highlight PR wgo only across three columns', () => {

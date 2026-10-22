@@ -159,7 +159,7 @@ Prometheus release binary is downloaded for the PR client variant.
 Each run's full latency, fault and error report is retained as a CI artifact.
 CI freezes one `main` client revision, then runs both clients against the PR's
 harness three times per variant. The comment compares PR wgo, main wgo and the
-PR-run kgo reference, sorted by PR wgo success rate with the weakest first.
+PR-run kgo reference, listed in a fixed order (`.github/scripts/simulation-order.json`), so a scenario sits in the same place in every comment and the two sides of a threshold pair are adjacent.
 Artifacts record client and harness revisions; mixed revisions or scenario
 coverage are rejected. Main-run kgo results remain available in the artifacts.
 
