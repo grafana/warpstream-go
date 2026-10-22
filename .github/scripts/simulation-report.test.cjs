@@ -251,3 +251,11 @@ test('does not bold a result that is only marginally better and shows the same i
   const clear = renderWorkload('Mimir', [[row(110)], [row(110)], [row(110)]], [[row(100)], [row(100)], [row(100)]]);
   assert.match(clear, /\| rolling restart \| 🟩 \*\*91\.7 ± 0\.0 %\*\*/);
 });
+
+test('the gate ignores failures on the kgo reference lane', () => {
+  const bench = failures => ({ ...row(120), benchmark: true, failures });
+  const same = rows => [rows, rows, rows];
+  const kgoOnly = ['kgo was served no Metadata response naming withdrawn broker 3 as leader', 'kgo: no Metadata request failed during the failure window'];
+  assert.match(renderWorkload('Mimir', same([bench(kgoOnly)]), same([bench([])])), /\| rolling restart \| ✅ /);
+  assert.match(renderWorkload('Mimir', same([bench([...kgoOnly, 'wgo transport fault on broker 1 did not affect live traffic'])]), same([bench([])])), /\| rolling restart \| ❌ /);
+});

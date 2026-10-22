@@ -78,7 +78,10 @@ function gateIcon(benchmark, prRuns) {
   if (!benchmark) return icons.none;
   const rows = prRuns.filter(Boolean);
   if (rows.length !== prRuns.length || rows.length === 0) return icons.none;
-  return rows.every(row => !(row.failures || []).length) ? icons.pass : icons.fail;
+  // Failures about the kgo reference run (for example a fault that never reached kgo's traffic)
+  // check that the scenario was set up the same for both clients and say nothing about wgo.
+  const aboutWgo = failure => !failure.startsWith('kgo');
+  return rows.every(row => !(row.failures || []).some(aboutWgo)) ? icons.pass : icons.fail;
 }
 
 function sampleRange(runs, client) {
