@@ -135,3 +135,17 @@ func TestFaultyFractionGate_NoFloorAboveTheLimit(t *testing.T) {
 	require.Zero(t, faultyFractionGate.expect(true).minWgoSuccessRate)
 	require.Positive(t, faultyFractionGate.expect(false).minWgoSuccessRate)
 }
+
+func TestStalledAgentsGate_RequiresDelaysToReachTraffic(t *testing.T) {
+	t.Parallel()
+	for _, gate := range []fractionGate{stalledFastFirstFallbackGate(defaultRunID), stalledFastSecondFallbackGate(defaultRunID)} {
+		for _, above := range []bool{false, true} {
+			sc := scenarioNamed(t, gate.name(above))
+			require.True(t, sc.hasInjectedDelays(), sc.name)
+			failures := checkResult(scenarioResult{sc: sc})
+			require.True(t, slices.ContainsFunc(failures, func(f scenarioFailure) bool {
+				return strings.Contains(f.detail, "wgo: no Produce response selected for injected delay")
+			}), sc.name)
+		}
+	}
+}

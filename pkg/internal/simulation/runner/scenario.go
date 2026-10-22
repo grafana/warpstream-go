@@ -320,12 +320,13 @@ func (sc scenario) failsMetadata() bool {
 }
 
 func (sc scenario) hasInjectedDelays() bool {
-	for _, phase := range sc.behaviourPhases {
-		for _, behaviour := range phase.behaviours.byBroker {
+	delays := func(behaviours brokersBehaviour) bool {
+		for _, behaviour := range behaviours.byBroker {
 			if behaviour.injectedLatency {
 				return true
 			}
 		}
+		return false
 	}
-	return false
+	return delays(sc.behaviours) || slices.ContainsFunc(sc.behaviourPhases, func(phase behaviourPhase) bool { return delays(phase.behaviours) })
 }
