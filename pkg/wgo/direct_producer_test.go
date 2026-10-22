@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -405,6 +406,75 @@ func TestKafkaDirectProducer_Produce(t *testing.T) {
 				# TYPE warpstream_produce_direct_requests_failed_total counter
 				warpstream_produce_direct_requests_failed_total{agent_state="healthy",reason="unknown_broker"} 1
 			`), "warpstream_produce_direct_requests_failed_total"))
+		})
+	})
+
+	// A hedge race cancels its losing leg. franz-go kills the connection when a
+	// request is canceled while awaiting its response, so the cancellation must
+	// not reach the wire: another produce in flight on the same connection has
+	// to complete.
+	t.Run("canceled caller does not fail other produces in flight to the same agent", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var vnet kfake.VirtualNetwork
+			cluster, clusterAddr := testkafka.CreateCluster(t, numPartitions, topicName, testkafka.WithVirtualNetwork(&vnet))
+
+			var (
+				produces atomic.Int32
+				release  = make(chan struct{})
+				unblock  = sync.OnceFunc(func() { close(release) })
+			)
+			t.Cleanup(unblock)
+			cluster.ControlKey(int16(kmsg.Produce), func(kmsg.Request) (kmsg.Response, error, bool) {
+				// Hold the first response; the second is answered after it, as
+				// responses on one connection are ordered.
+				if produces.Add(1) == 1 {
+					cluster.SleepControl(func() { <-release })
+				}
+				return nil, nil, false
+			})
+
+			client, err := kgo.NewClient(kgo.SeedBrokers(clusterAddr), kgo.Dialer(vnet.DialContext))
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			metaResp, err := client.Request(t.Context(), &kmsg.MetadataRequest{
+				Topics: []kmsg.MetadataRequestTopic{{Topic: kmsg.StringPtr(topicName)}},
+			})
+			require.NoError(t, err)
+			topicID := metaResp.(*kmsg.MetadataResponse).Topics[0].TopicID
+
+			reg := prometheus.NewPedanticRegistry()
+			topicIDFn := func(name string) ([16]byte, bool) {
+				if name == topicName {
+					return topicID, true
+				}
+				return [16]byte{}, false
+			}
+			producer := NewKafkaDirectProducer(client, topicIDFn, 9, KafkaDirectProducerConfig{
+				ProduceRequestTimeout:         5 * time.Second,
+				ProduceRequestTimeoutOverhead: time.Second,
+			}, newMetrics(reg))
+			records := func() []encodedTopicPartitionRecords {
+				return partitionsForTest([]*kgo.Record{{
+					Topic: topicName, Partition: partition, Value: []byte("v"), Timestamp: time.Now(),
+				}})
+			}
+
+			loserCtx, cancelLoser := context.WithCancel(t.Context())
+			loserDone := make(chan ProduceResult, 1)
+			go func() { loserDone <- producer.ProduceSync(loserCtx, Agent{NodeID: brokerNodeID}, records()) }()
+			synctest.Wait()
+
+			otherDone := make(chan ProduceResult, 1)
+			go func() { otherDone <- producer.ProduceSync(t.Context(), Agent{NodeID: brokerNodeID}, records()) }()
+			synctest.Wait()
+
+			cancelLoser()
+			require.ErrorIs(t, (<-loserDone).error(), context.Canceled, "a canceled caller returns without waiting for the agent")
+
+			time.Sleep(time.Second)
+			unblock()
+			require.NoError(t, (<-otherDone).error())
 		})
 	})
 }
