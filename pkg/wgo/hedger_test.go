@@ -1306,7 +1306,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		assertAttemptPayload(t, m, reqStats, produceRequestStats{})
 	})
 
-	t.Run("canceled before fallback dispatch counts the cascade and emits no failure", func(t *testing.T) {
+	t.Run("canceled before primary dispatch skips primary accounting and emits no failure", func(t *testing.T) {
 		producer := newMockDirectProducer()
 		producer.blockCh[primaryID] = make(chan struct{})
 		m := newMetrics(prometheus.NewPedanticRegistry())
@@ -1319,7 +1319,9 @@ func TestHedger_ProduceSync(t *testing.T) {
 			nodeID:                       primaryID,
 		}}).error()
 		require.ErrorIs(t, err, context.Canceled)
-		assert.Equal(t, float64(1), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+		assert.Empty(t, producer.recordedCalls())
+		assert.Equal(t, float64(0), testutil.ToFloat64(m.produceRequestsPrimaryTotal))
+		assertAttemptPayload(t, m, produceRequestStats{}, produceRequestStats{})
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeAttemptsTotal))
 		assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
 		assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))

@@ -78,13 +78,22 @@ func NewKafkaDirectProducer(client *kgo.Client, topicID func(string) ([16]byte, 
 
 // ProduceSync implements DirectProducer.
 func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, partitions []encodedTopicPartitionRecords) (retResult ProduceResult) {
+	if err := ctx.Err(); err != nil {
+		return ProduceResult{err: err}
+	}
 	req, reqStats, err := buildMultiTopicProduceRequestFromEncoded(s.version, s.topicID, partitions)
 	if err != nil {
 		return ProduceResult{err: err}
 	}
 	req.SetTimeout(int32(s.cfg.ProduceRequestTimeout.Milliseconds()))
 
-	attemptCtx, cancel := context.WithTimeout(ctx, s.cfg.ProduceRequestTimeout+s.cfg.ProduceRequestTimeoutOverhead)
+	// Canceling a broker request closes its shared connection and fails sibling
+	// writes. Let started attempts drain, bounded by their original deadline.
+	deadline := time.Now().Add(s.cfg.ProduceRequestTimeout + s.cfg.ProduceRequestTimeoutOverhead)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	attemptCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 	defer cancel()
 
 	agentState := agentStateLabel(target.State)
