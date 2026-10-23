@@ -16,6 +16,18 @@ type staleFallbackEvidence struct {
 	TerminalErrors        int64            `json:"terminal_errors"`
 }
 
+// subtract removes the counts already present in initial so the evidence covers
+// only the observed phase. Discovery counters come from the metadata view and
+// are not part of the client's registry.
+func (e *staleFallbackEvidence) subtract(initial *staleFallbackEvidence) {
+	e.FallbackErrors -= initial.FallbackErrors
+	for reason, count := range initial.FallbackErrorReasons {
+		e.FallbackErrorReasons[reason] -= count
+	}
+	e.ThirdAttemptSuccesses -= initial.ThirdAttemptSuccesses
+	e.TerminalErrors -= initial.TerminalErrors
+}
+
 func readStaleFallbackEvidence(metrics prometheus.Gatherer, prefix string, view *metadataView) (*staleFallbackEvidence, error) {
 	families, err := metrics.Gather()
 	if err != nil {

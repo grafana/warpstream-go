@@ -58,6 +58,39 @@ func TestScenarioResults_Check_DeltaVsKgo(t *testing.T) {
 	assert.Equal(t, "no better than kgo", failures[0].scenario)
 }
 
+func TestScenarioResults_Check_CascadeContinuation(t *testing.T) {
+	t.Parallel()
+	evidence := func() *staleFallbackEvidence {
+		return &staleFallbackEvidence{
+			BrokerOnlyWithdrawals: 1, StaleRoutingResponses: 1, FallbackErrors: 1, ThirdAttemptSuccesses: 1,
+			FallbackErrorReasons: map[string]int64{"unknown_broker": 1},
+		}
+	}
+	result := scenarioResult{sc: scenario{requireCascadeContinuation: true}, staleFallback: evidence()}
+	require.Empty(t, checkResult(result))
+
+	for name, mutate := range map[string]func(*staleFallbackEvidence){
+		"no fallback error":       func(e *staleFallbackEvidence) { e.FallbackErrors = 0 },
+		"no third attempt":        func(e *staleFallbackEvidence) { e.ThirdAttemptSuccesses = 0 },
+		"no broker-only withdraw": func(e *staleFallbackEvidence) { e.BrokerOnlyWithdrawals = 0 },
+		"no stale routing":        func(e *staleFallbackEvidence) { e.StaleRoutingResponses = 0 },
+		"only known-agent errors": func(e *staleFallbackEvidence) { e.FallbackErrorReasons = map[string]int64{"transport": 1} },
+		"terminal error":          func(e *staleFallbackEvidence) { e.TerminalErrors = 1 },
+	} {
+		result.staleFallback = evidence()
+		mutate(result.staleFallback)
+		require.NotEmpty(t, checkResult(result), name)
+	}
+
+	// Builds before the unknown_broker label report the same failure as "unknown".
+	result.staleFallback = evidence()
+	result.staleFallback.FallbackErrorReasons = map[string]int64{"unknown": 1}
+	require.Empty(t, checkResult(result))
+
+	result.staleFallback = nil
+	require.Len(t, checkResult(result), 4)
+}
+
 func TestScenarioResults_RecoveryAndSurge(t *testing.T) {
 	t.Parallel()
 	result := scenarioResult{

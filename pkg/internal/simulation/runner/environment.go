@@ -153,6 +153,7 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	workload := func(backend, address string, registry *prometheus.Registry, network *transportNetwork, behaviours *brokersBehaviourProvider) WorkloadConfig {
 		cfg := workloadConfig(backend, address, registry, network, behaviours)
 		cfg.Partitions = partitions
+		cfg.SplitWrites = sc.splitWrites
 		if sc.profile != nil {
 			cfg.SecondaryTopic = secondaryTopicName
 			cfg.SecondaryPartitions = secondaryPartitions

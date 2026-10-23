@@ -61,10 +61,24 @@ type distributorClient struct {
 	overlayIdentity, binaryDescription string
 }
 
+// pooledTransport keeps idle connections for reuse. The default keeps two per host, so
+// the many concurrent writes of a split event would open and close hundreds of
+// connections per second and exhaust the local ports (connect: can't assign requested
+// address) over a long run.
+func pooledTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 2000
+	transport.MaxIdleConnsPerHost = 2000
+	return transport
+}
+
 func newDistributorWithOptions(binary string, cfg runner.WorkloadConfig, options distributorOptions) (_ *distributorClient, err error) {
-	c := &distributorClient{config: cfg, http: &http.Client{Timeout: remoteTimeout(cfg) + 500*time.Millisecond}, series: 32 * int(cfg.Partitions), partitions: make(map[int32]bool), expectedPartitions: int(cfg.Partitions), backend: cfg.Backend}
+	c := &distributorClient{config: cfg, http: &http.Client{Timeout: remoteTimeout(cfg) + 500*time.Millisecond, Transport: pooledTransport()}, series: 32 * int(cfg.Partitions), partitions: make(map[int32]bool), expectedPartitions: int(cfg.Partitions), backend: cfg.Backend}
 	if cfg.SeriesPerRequest > 0 {
 		c.series = cfg.SeriesPerRequest
+	}
+	if cfg.SplitWrites {
+		c.series = int(cfg.Partitions)
 	}
 	defer func() {
 		if err != nil {
@@ -298,6 +312,22 @@ func (c *distributorClient) EventRecords(topic string, _ int32, at time.Duration
 	request := prompb.WriteRequest{}
 	timestamp := time.Now().Add(at).UnixMilli()
 	offset := 0
+	if c.config.SplitWrites {
+		// One write per series. Names change with every event so the series hash
+		// across the whole partition ring over time.
+		offset = int(at/(500*time.Millisecond)) * c.series
+		records := make([]*kgo.Record, 0, c.series)
+		for series := range c.series {
+			name := fmt.Sprintf("simulation_%x", sha256.Sum256([]byte(fmt.Sprint(series+offset))))
+			single := prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{Labels: []prompb.Label{{Name: "__name__", Value: name}}, Samples: []prompb.Sample{{Timestamp: timestamp, Value: 1}}}}}
+			data, err := single.Marshal()
+			if err != nil {
+				panic(err)
+			}
+			records = append(records, &kgo.Record{Topic: topic, Value: snappy.Encode(nil, data)})
+		}
+		return records
+	}
 	if c.config.SeriesPerRequest > 0 {
 		offset = int(at/(500*time.Millisecond)) * c.series
 	}
