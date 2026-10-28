@@ -316,18 +316,22 @@ func TestNewMetrics_ProduceRequestsFailed(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)
 
-	m.produceRequestsFailed[produceFailureReasonCandidatesExhausted].Inc()
+	m.produceRequestsFailed[produceFailureReasonNoAlternate].Inc()
+	m.produceRequestsFailed[produceFailureReasonListDrained].Add(5)
+	m.produceRequestsFailed[produceFailureReasonBudgetCap].Add(6)
 	m.produceRequestsFailed[produceFailureReasonTerminalError].Add(2)
 	m.produceRequestsFailed[produceFailureReasonWriteTimeout].Add(3)
 	m.produceRequestsFailed[produceFailureReasonInternalError].Add(4)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_produce_requests_failed_total Why a Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.
+		# HELP warpstream_produce_requests_failed_total Why a Hedger produce failed: candidates_exhausted (a partition had no candidate left; the cause label says why: no_alternate, the list offered nothing besides the primary; list_drained, every agent in a shorter list was tried; or budget_cap, MaxHedgeAgents agents were tried), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts. The cause label is set only for candidates_exhausted.
 		# TYPE warpstream_produce_requests_failed_total counter
-		warpstream_produce_requests_failed_total{reason="candidates_exhausted"} 1
-		warpstream_produce_requests_failed_total{reason="internal_error"} 4
-		warpstream_produce_requests_failed_total{reason="terminal_error"} 2
-		warpstream_produce_requests_failed_total{reason="write_timeout"} 3
+		warpstream_produce_requests_failed_total{cause="budget_cap",reason="candidates_exhausted"} 6
+		warpstream_produce_requests_failed_total{cause="list_drained",reason="candidates_exhausted"} 5
+		warpstream_produce_requests_failed_total{cause="no_alternate",reason="candidates_exhausted"} 1
+		warpstream_produce_requests_failed_total{cause="",reason="internal_error"} 4
+		warpstream_produce_requests_failed_total{cause="",reason="terminal_error"} 2
+		warpstream_produce_requests_failed_total{cause="",reason="write_timeout"} 3
 	`), "warpstream_produce_requests_failed_total"))
 }
 
