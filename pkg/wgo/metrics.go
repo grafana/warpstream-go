@@ -219,13 +219,12 @@ const (
 )
 
 const (
-	produceFailureReasonLabelCandidatesExhausted = "candidates_exhausted"
-	produceFailureCauseLabelNoAlternate          = "no_alternate"
-	produceFailureCauseLabelListDrained          = "list_drained"
-	produceFailureCauseLabelBudgetCap            = "budget_cap"
-	produceFailureReasonLabelTerminalError       = "terminal_error"
-	produceFailureReasonLabelWriteTimeout        = "write_timeout"
-	produceFailureReasonLabelInternalError       = "internal_error"
+	produceFailureReasonLabelNoAlternate   = "candidates_exhausted_no_alternate"
+	produceFailureReasonLabelListDrained   = "candidates_exhausted_list_drained"
+	produceFailureReasonLabelBudgetCap     = "candidates_exhausted_budget_cap"
+	produceFailureReasonLabelTerminalError = "terminal_error"
+	produceFailureReasonLabelWriteTimeout  = "write_timeout"
+	produceFailureReasonLabelInternalError = "internal_error"
 )
 
 type agentpoolChurnDirection int8
@@ -354,8 +353,8 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	produceRequestsFailed := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_requests_failed_total",
-		Help: "Why a Hedger produce failed: candidates_exhausted (a partition had no candidate left; the cause label says why: no_alternate, the list offered nothing besides the primary; list_drained, every agent in a shorter list was tried; or budget_cap, MaxHedgeAgents agents were tried), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts. The cause label is set only for candidates_exhausted.",
-	}, []string{"reason", "cause"})
+		Help: "Why a Hedger produce failed: candidates_exhausted_no_alternate (a partition had no candidate left and the list offered nothing besides the primary), candidates_exhausted_list_drained (every agent in a list shorter than the budget was tried), candidates_exhausted_budget_cap (MaxHedgeAgents agents were tried), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.",
+	}, []string{"reason"})
 
 	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_agentpool_agents_changed_total",
@@ -413,12 +412,12 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			hedgeTriggerDemotedProbe:   hedgeTriggerWins.WithLabelValues(hedgeTriggerLabelDemotedProbe),
 		},
 		produceRequestsFailed: [produceFailureReasonCount]prometheus.Counter{
-			produceFailureReasonNoAlternate:   produceRequestsFailed.WithLabelValues(produceFailureReasonLabelCandidatesExhausted, produceFailureCauseLabelNoAlternate),
-			produceFailureReasonListDrained:   produceRequestsFailed.WithLabelValues(produceFailureReasonLabelCandidatesExhausted, produceFailureCauseLabelListDrained),
-			produceFailureReasonBudgetCap:     produceRequestsFailed.WithLabelValues(produceFailureReasonLabelCandidatesExhausted, produceFailureCauseLabelBudgetCap),
-			produceFailureReasonTerminalError: produceRequestsFailed.WithLabelValues(produceFailureReasonLabelTerminalError, ""),
-			produceFailureReasonWriteTimeout:  produceRequestsFailed.WithLabelValues(produceFailureReasonLabelWriteTimeout, ""),
-			produceFailureReasonInternalError: produceRequestsFailed.WithLabelValues(produceFailureReasonLabelInternalError, ""),
+			produceFailureReasonNoAlternate:   produceRequestsFailed.WithLabelValues(produceFailureReasonLabelNoAlternate),
+			produceFailureReasonListDrained:   produceRequestsFailed.WithLabelValues(produceFailureReasonLabelListDrained),
+			produceFailureReasonBudgetCap:     produceRequestsFailed.WithLabelValues(produceFailureReasonLabelBudgetCap),
+			produceFailureReasonTerminalError: produceRequestsFailed.WithLabelValues(produceFailureReasonLabelTerminalError),
+			produceFailureReasonWriteTimeout:  produceRequestsFailed.WithLabelValues(produceFailureReasonLabelWriteTimeout),
+			produceFailureReasonInternalError: produceRequestsFailed.WithLabelValues(produceFailureReasonLabelInternalError),
 		},
 		agentpoolAgentsChanged: [agentpoolChurnCount]prometheus.Counter{
 			agentpoolChurnAdded:   agentpoolAgentsChanged.WithLabelValues(agentpoolChurnLabelAdded),
