@@ -338,7 +338,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	hedgeCandidateSets := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_hedge_candidates_total",
-		Help: "Fallback cascades by the primary's routing-time state and candidates: the smallest fallback candidate count across the batch's partitions (distinct agents offered besides the primary), capped at MaxHedgeAgents-1 because the primary takes one slot of the budget. It is the minimum available fallback count, capped at the retry budget: only partitions still pending can stop a cascade, so a short partition that succeeds early does not limit the rest. Actual waves may be fewer, because a cascade often stops sooner when the request resolves; warpstream_produce_requests_attempts shows the depth reached. at_capacity is true when candidates equals MaxHedgeAgents-1, so false means at least one partition could not fill the budget. One increment per cascade before any wave, including cascades that never dispatch a fallback or are rescued by the primary.",
+		Help: "Fallback cascades by primary state at routing (healthy or demoted), candidates (the fewest distinct fallback agents offered to any partition, capped at MaxHedgeAgents-1), and at_capacity (whether that count fills the retry budget). Counts once before any fallback wave, even if no wave is sent or the primary later succeeds. Measures available candidates, not attempts made.",
 	}, []string{"primary", "candidates", "at_capacity"})
 
 	produceAttemptRecords := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
@@ -353,7 +353,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 
 	produceRequestsFailed := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "warpstream_produce_requests_failed_total",
-		Help: "Why a Hedger produce failed: candidates_exhausted_no_alternate (a partition had no candidate left and the list offered nothing besides the primary), candidates_exhausted_list_drained (every agent in a list shorter than the budget was tried), candidates_exhausted_budget_cap (MaxHedgeAgents agents were tried), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.",
+		Help: "Failed Hedger invocations by reason: candidates_exhausted_no_alternate (no fallback offered), candidates_exhausted_list_drained (all offered agents tried before reaching the budget), candidates_exhausted_budget_cap (MaxHedgeAgents agents tried), terminal_error (non-retriable error), write_timeout (work deadline expired), or internal_error (routing mismatch, duplicate partition, or unclassified failure). Terminal errors take precedence over deadlines, then exhaustion. Counts once per failed invocation, including routing errors; excludes success and caller cancellation.",
 	}, []string{"reason"})
 
 	agentpoolAgentsChanged := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{

@@ -71,12 +71,8 @@ type produceStop int8
 
 const (
 	produceStopNone produceStop = iota
-	// produceStopNoAlternate: the list offered nothing besides the primary.
 	produceStopNoAlternate
-	// produceStopListDrained: every agent in a list shorter than the budget was tried.
 	produceStopListDrained
-	// produceStopBudgetCap: MaxHedgeAgents agents were tried, whether or not the
-	// list had more.
 	produceStopBudgetCap
 	produceStopTerminalError
 	produceStopWriteTimeout
@@ -84,7 +80,6 @@ const (
 	produceStopInternal
 )
 
-// exhausted reports whether the cascade stopped for lack of a candidate.
 func (s produceStop) exhausted() bool {
 	return s == produceStopNoAlternate || s == produceStopListDrained || s == produceStopBudgetCap
 }
@@ -152,8 +147,7 @@ func NewHedger(inner DirectProducer, tracker AgentStatsReader, strategy Partitio
 	if logger == nil {
 		logger = nopLogger{}
 	}
-	// Expose zeroes before the first observation so a rare first increment
-	// can be measured against a previously scraped zero.
+	// Start counters at zero so scrapes can capture the first increment.
 	for state := primaryStateHealthy; state < primaryStateCount; state++ {
 		for n := 0; n < cfg.MaxHedgeAgents; n++ {
 			m.hedgeCandidateSet(state, n, cfg.MaxHedgeAgents)
@@ -412,12 +406,8 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 	return res
 }
 
-// runHedgingAttemptsAndRaceWithPrimary races the hedge fallback against
-// the in-flight primary; the first to produce a usable outcome wins.
-// workCtx scopes both legs and is cancelled by the caller's deferred
-// cancel as soon as this function returns, which unwinds the losing leg.
-// The reported attempts is the depth of the winning leg: 1 when the
-// primary wins, the fallback's own depth when the fallback wins or both fail.
+// runHedgingAttemptsAndRaceWithPrimary returns the first successful leg.
+// Attempts is 1 if the primary wins; otherwise it includes the fallback waves.
 func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
 	fallbackCh := make(chan hedgerProduceResult, 1)
 	go func() {
@@ -453,10 +443,8 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 			h.observeHedgeWin(trigger)
 			return fb
 		}
-		// Fallback failed (e.g. exhausted candidates) — the primary may
-		// still produce a usable outcome, so let it finish. If the primary
-		// then succeeds it won on its single attempt (depth 1); otherwise the
-		// request failed after the fallback's full depth.
+		// The primary may still succeed. If both legs fail, keep the
+		// fallback's attempt count.
 		primaryResult := <-primaryCh
 		attempts := fb.attempts
 		if primaryResult.succeeded() {
@@ -467,15 +455,9 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 	}
 }
 
-// observeCandidates records the minimum available fallback count across the
-// partitions, capped at the retry budget. The primary takes one of the
-// MaxHedgeAgents slots, so a list offering more agents than the rest is not
-// counted: a demoted primary can be absent from the list, because routing
-// already used its probe slot unless the probe interval has elapsed by fetch
-// time, and the list then offers one agent more than the cascade can reach.
-// Actual waves may be fewer, since only pending partitions stop the cascade and
-// it ends early when the request resolves. A demoted primary is the one that
-// started a demoted_probe cascade. The fetch is memoized, so the waves reuse it.
+// observeCandidates counts each cascade by its shortest fallback list,
+// capped at MaxHedgeAgents-1 because the primary uses one attempt.
+// Cached lists keep the metric and retries consistent.
 func (h *Hedger) observeCandidates(trigger hedgeTrigger, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates) {
 	if len(partitions) == 0 {
 		return
@@ -556,14 +538,8 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 	return out
 }
 
-// runHedgingAttempt runs one wave of the per-partition retry loop, fanning
-// out per agent. dispatched reports whether this wave actually issued any
-// produce requests (false when it bailed before dispatching: nothing
-// pending or a partition exhausted its candidates). canRetry reports
-// whether the caller should iterate again — false when no further work
-// would change the outcome (every partition resolved, accumulator aborted,
-// a partition exhausted candidates, or ctx canceled mid-wave). exhaustion is
-// set only for the candidate-budget stop.
+// runHedgingAttempt runs one retry wave. It reports whether work was sent,
+// whether another wave can help, and why candidates ran out, if applicable.
 func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAccumulator, tried map[topicPartition][]int32, candidates *hedgerCandidates) (dispatched, canRetry bool, exhaustion produceStop) {
 	pending := acc.remaining()
 	if len(pending) == 0 {
@@ -600,8 +576,6 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 			}
 		}
 
-		// We exhausted all candidates for this partition. We give up. Only the
-		// primary tried means the list never offered an alternate.
 		if !found {
 			if len(tried[tp]) == 1 {
 				return false, false, produceStopNoAlternate

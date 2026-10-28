@@ -292,7 +292,6 @@ func TestHedger_ProduceSync(t *testing.T) {
 		})
 	}
 
-	// The cascade is observed before any wave, and counted when it runs out.
 	for _, tc := range []struct {
 		name           string
 		primaryState   AgentState
@@ -305,8 +304,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		{"only the primary offered", AgentStateDemoted, []Agent{{NodeID: primaryID, State: AgentStateDemoted}}, nil, primaryStateDemoted, 0, produceFailureReasonNoAlternate},
 		{"short list drained", AgentStateHealthy, healthyAgents(primaryID, secondaryID), []int32{secondaryID}, primaryStateHealthy, 1, produceFailureReasonListDrained},
 		{"healthy primary hits the cap", AgentStateHealthy, healthyAgents(primaryID, secondaryID, 3), []int32{secondaryID, 3}, primaryStateHealthy, 2, produceFailureReasonBudgetCap},
-		// A demoted primary is elided from the fetched list, so the list offers one
-		// more agent than the cascade can reach; the metric counts the 2 it can.
+		// The primary uses a budget slot even when absent from this list.
 		{"demoted primary hits the cap with an agent left over", AgentStateDemoted, healthyAgents(secondaryID, 3, 4), []int32{secondaryID, 3}, primaryStateDemoted, 2, produceFailureReasonBudgetCap},
 	} {
 		t.Run("failure cause: "+tc.name, func(t *testing.T) {
@@ -2140,12 +2138,9 @@ func TestHedger_ObserveCandidatesThroughDemoter(t *testing.T) {
 		wantCount    string
 		wantCapacity string
 	}{
-		// Routing already took the probe slot, so the demoted leader is out of the
-		// list and the Demoter fills all three entries with other agents; only two
-		// can be reached because the primary takes a slot.
+		// The spent probe slot removes the primary, but it still uses one attempt.
 		{"demoted primary: probe already spent", healthyAgents(demotedID, 1, 3, 4, 5), demotedID, hedgeTriggerDemotedProbe, true, []int32{1, 3, 4}, "demoted", "2", "true"},
-		// The probe slot is due at fetch time, so the Demoter puts the demoted agent
-		// first and truncates again: it takes one of the three entries.
+		// A due probe takes one of the list's three slots.
 		{"healthy primary: a due probe takes an entry, then truncation", healthyAgents(demotedID, 1, 3, 4, 5), 1, hedgeTriggerLatency, false, []int32{demotedID, 1, 3}, "healthy", "2", "true"},
 		{"healthy primary: no demoted agent in the list", healthyAgents(1, 3, 4, 5), 1, hedgeTriggerLatency, false, []int32{1, 3, 4}, "healthy", "2", "true"},
 	} {
@@ -2167,8 +2162,7 @@ func TestHedger_ObserveCandidatesThroughDemoter(t *testing.T) {
 			for _, c := range candidates.fetch(topicPartition{topic: topic, partition: 0}) {
 				gotList = append(gotList, c.NodeID)
 			}
-			// The measured list is the Demoter's final output: never longer than the
-			// budget, even when a due probe is added to a list that was already full.
+			// Adding a probe must not grow the list beyond the budget.
 			assert.Equal(t, tc.wantList, gotList)
 			assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeCandidateSets.WithLabelValues(tc.wantPrimary, tc.wantCount, tc.wantCapacity)))
 		})
