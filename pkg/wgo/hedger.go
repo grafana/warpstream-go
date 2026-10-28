@@ -406,8 +406,13 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 	return res
 }
 
-// runHedgingAttemptsAndRaceWithPrimary returns the first successful leg.
-// Attempts is 1 if the primary wins; otherwise it includes the fallback waves.
+// runHedgingAttemptsAndRaceWithPrimary races the hedge fallback against
+// the in-flight primary; the first to produce a usable outcome wins.
+// workCtx scopes both legs and is cancelled by the caller's deferred
+// cancel as soon as this function returns, which unwinds the losing leg.
+// The reported attempts is the depth of the winning leg: 1 when the
+// primary wins, the fallback's own depth when the fallback wins.
+// If both legs fail, the fallback's attempt depth is reported.
 func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
 	fallbackCh := make(chan hedgerProduceResult, 1)
 	go func() {
@@ -443,8 +448,10 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 			h.observeHedgeWin(trigger)
 			return fb
 		}
-		// The primary may still succeed. If both legs fail, keep the
-		// fallback's attempt count.
+		// Fallback failed (e.g. exhausted candidates) — the primary may
+		// still produce a usable outcome, so let it finish. If the primary
+		// then succeeds it won on its single attempt (depth 1). If both legs
+		// fail, report the fallback's full attempt depth.
 		primaryResult := <-primaryCh
 		attempts := fb.attempts
 		if primaryResult.succeeded() {
@@ -538,8 +545,14 @@ func (h *Hedger) runHedgingAttempts(workCtx context.Context, primaryID int32, pa
 	return out
 }
 
-// runHedgingAttempt runs one retry wave. It reports whether work was sent,
-// whether another wave can help, and why candidates ran out, if applicable.
+// runHedgingAttempt runs one wave of the per-partition retry loop, fanning
+// out per agent. dispatched reports whether this wave actually issued any
+// produce requests (false when it bailed before dispatching: nothing
+// pending or a partition exhausted its candidates). canRetry reports
+// whether the caller should iterate again — false when no further work
+// would change the outcome (every partition resolved, accumulator aborted,
+// a partition exhausted candidates, or ctx canceled mid-wave). exhaustion is
+// set only for the candidate-budget stop.
 func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAccumulator, tried map[topicPartition][]int32, candidates *hedgerCandidates) (dispatched, canRetry bool, exhaustion produceStop) {
 	pending := acc.remaining()
 	if len(pending) == 0 {
@@ -576,6 +589,7 @@ func (h *Hedger) runHedgingAttempt(workCtx context.Context, acc *produceResultAc
 			}
 		}
 
+		// We exhausted all candidates for this partition. We give up.
 		if !found {
 			if len(tried[tp]) == 1 {
 				return false, false, produceStopNoAlternate
