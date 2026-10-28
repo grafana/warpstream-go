@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -246,6 +247,54 @@ func TestHedger_ProduceSync(t *testing.T) {
 
 	// reqStats is the payload makeReq sends; makeReq encodes deterministically.
 	reqStats := sumEncodedStats(unpromise(makeReq(newResultCapture())))
+
+	for _, tc := range []struct {
+		name          string
+		primaryDelay  time.Duration
+		fallbackDelay time.Duration
+		primaryErr    error
+		wantAttempts  float64
+	}{
+		{"fallback exhausts before primary fails", time.Second, 0, kerr.RequestTimedOut, 3},
+		{"primary fails before fallback exhausts", 20 * time.Millisecond, 200 * time.Millisecond, kerr.RequestTimedOut, 3},
+		{"primary succeeds after fallback exhausts", time.Second, 0, nil, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				producer := newMockDirectProducer()
+				producer.delays[primaryID] = tc.primaryDelay
+				producer.errs[primaryID] = tc.primaryErr
+				producer.respFn = successResp
+				for _, id := range []int32{secondaryID, 3} {
+					producer.delays[id] = tc.fallbackDelay
+					producer.errs[id] = kerr.NotLeaderForPartition
+				}
+				strategy := &mockPartitionAssignmentStrategy{
+					candidates: map[partitionKey][]Agent{{topic, partition}: healthyAgents(primaryID, secondaryID, 3)},
+				}
+				raceCfg := cfg
+				raceCfg.MinHedgeDelay = time.Millisecond
+				m := newMetrics(prometheus.NewPedanticRegistry())
+				h := NewHedger(producer, slowPrimaryTracker(), strategy, health, raceCfg, 0, 1<<20, m, nil)
+				capture := newResultCapture()
+				runHedger(h, context.Background(), makeReq(capture))
+
+				assert.ElementsMatch(t, []int32{primaryID, secondaryID, 3}, producer.recordedCallNodeIDs())
+				metric := m.produceRequestsAttemptsSuccess
+				if tc.primaryErr != nil {
+					require.Error(t, capture.get(topic, partition).err)
+					metric = m.produceRequestsAttemptsFailure
+					assertProduceFailures(t, m, map[produceFailureReason]float64{produceFailureReasonCandidatesExhausted: 1})
+				} else {
+					require.NoError(t, capture.get(topic, partition).err)
+					assertProduceFailures(t, m, nil)
+				}
+				count, sum := histogramCountSum(t, metric.(prometheus.Histogram))
+				assert.Equal(t, uint64(1), count)
+				assert.Equal(t, tc.wantAttempts, sum)
+			})
+		})
+	}
 
 	t.Run("no hedge decision: only primary is called", func(t *testing.T) {
 		producer := newMockDirectProducer()

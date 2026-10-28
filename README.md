@@ -71,6 +71,8 @@ When a per-agent buffer flushes, the resulting batch goes to the `Hedger`, which
 
 Before accepting a primary response, the Hedger checks that it includes every requested topic-partition. An incomplete response triggers the existing retry path and logs a warning with the agent ID and first missing topic-partition, even if a retry succeeds. Partitions still unacknowledged after retries are exhausted are reported as failed.
 
+The attempts histogram reports the winning leg's depth on success (1 for the primary). When both legs fail, it reports 1 plus the number of dispatched fallback waves, regardless of which leg finished first.
+
 The hedge decision is **data-driven**, not unconditional. The Hedger consults rolling per-agent latency and error stats (the same window the `Demoter` uses, so both components agree on "is agent X bad?"). When the primary looks unhealthy the hedge delay is the cluster's baseline latency, so the fallback fires quickly. When the primary looks healthy the delay is multiplied so we don't stampede the cluster during normal operation — but we still hedge, because tail-latency amplification (every application request fans out to all partitions; one slow primary stalls the whole request) is the dominant cost we're trying to avoid. Either way the computed delay is floored at the configured `MinHedgeDelay` (probes are the exception — they fire the fallback immediately with no delay).
 
 Two cluster-wide guard rails suppress hedging entirely:

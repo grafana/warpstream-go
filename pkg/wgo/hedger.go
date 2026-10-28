@@ -393,7 +393,7 @@ func (h *Hedger) withCoverageCheck(res ProduceResult, nodeID int32, requested []
 // workCtx scopes both legs and is cancelled by the caller's deferred
 // cancel as soon as this function returns, which unwinds the losing leg.
 // The reported attempts is the depth of the winning leg: 1 when the
-// primary wins, the fallback's own depth when the fallback wins.
+// primary wins, the fallback's own depth when it wins or both legs fail.
 func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, primaryID int32, partitions []encodedTopicPartitionRecords, candidates *hedgerCandidates, primaryCh <-chan ProduceResult, trigger hedgeTrigger) hedgerProduceResult {
 	fallbackCh := make(chan hedgerProduceResult, 1)
 	go func() {
@@ -429,14 +429,14 @@ func (h *Hedger) runHedgingAttemptsAndRaceWithPrimary(workCtx context.Context, p
 			h.observeHedgeWin(trigger)
 			return fb
 		}
-		// Fallback failed (e.g. exhausted candidates) — the primary may
-		// still produce a usable outcome, so let it finish. If the primary
-		// then succeeds it won on its single attempt (depth 1). When the
-		// fallback failed too the depth-1 label is best-effort: the
-		// fallback's wave count isn't surfaced on this branch.
+		// The primary may still succeed after the fallback exhausts.
 		primaryResult := <-primaryCh
+		attempts := fb.attempts
+		if primaryResult.succeeded() {
+			attempts = 1
+		}
 		result := selectProduceResult(primaryResult, fb.result)
-		return hedgerProduceResult{result: result, attempts: 1, stop: finalStop(workCtx, primaryResult, result, fb.stop)}
+		return hedgerProduceResult{result: result, attempts: attempts, stop: finalStop(workCtx, primaryResult, result, fb.stop)}
 	}
 }
 
