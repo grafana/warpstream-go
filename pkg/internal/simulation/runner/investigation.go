@@ -1,9 +1,11 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"time"
 )
 
@@ -55,20 +57,20 @@ func constantLatency(delay time.Duration) func(*rand.Rand) time.Duration {
 	return func(*rand.Rand) time.Duration { return delay }
 }
 
-func profileScenarios(profile string, external bool) ([]scenario, error) {
+func profileScenarios(profile string, external bool, runID int) ([]scenario, error) {
 	switch profile {
 	case "all":
 		if !external {
 			return nil, fmt.Errorf("all requires an external workload")
 		}
-		return append(append(scenarios(), investigationScenarios()...), storagePressureScenarios()...), nil
+		return append(append(scenarios(runID), investigationScenarios()...), storagePressureScenarios()...), nil
 	case "mimir-prometheus":
 		if !external {
 			return nil, fmt.Errorf("mimir-prometheus requires an external workload")
 		}
 		return storagePressureScenarios(), nil
 	case "standard":
-		return scenarios(), nil
+		return scenarios(runID), nil
 	case "mimir-investigation":
 		if !external {
 			return nil, fmt.Errorf("mimir-investigation requires an external workload")
@@ -141,18 +143,107 @@ func investigationScenarios() []scenario {
 	restart.windows = []observationWindow{{"before fault", 0, 8 * time.Second}, {"degraded", 10 * time.Second, 50 * time.Second}, {"recovery", 70 * time.Second, 90 * time.Second}}
 	restart.expect = scenarioExpectations{minWgoSuccessRate: 1, slowBudget: ptr(2 * time.Second), maxWgoSlowFraction: ptr(0.05), recoveryFrom: ptr(70 * time.Second)}
 	restart.requireStaleFallback = true
-	return []scenario{control, faultCase, changing, intermittent, restart}
+	return append([]scenario{control, faultCase, changing, intermittent, restart, rotatingLeaderScenario(profile), rollingStallScenario(profile)}, researchScenarios()...)
+}
+
+const (
+	rotatingAgents      = 20
+	rotatingFirstWave   = 5 * time.Second
+	rotatingWaveSpacing = 10 * time.Second
+	rotatingWaveLength  = 20 * time.Second
+	rotatingWaves       = 6
+)
+
+// rotatingLeaderScenario models a write-agent rollout seen through WarpStream's
+// discovery. Metadata names one leader for every partition, picked from a cached
+// listing that still names a dead agent as the leader for 10s after it dies. Every wave takes two
+// agents away: one still known to the client's broker map, and one the broker map
+// has already dropped while the pool still lists it. For the first 10s after an
+// agent dies the cached listing still names it as the leader, so all partitions
+// fail on it together and the cascade has to get past the unknown agent.
+func rotatingLeaderScenario(base *workloadProfile) scenario {
+	profile := *base
+	profile.brokers = rotatingAgents
+	profile.advertisedAgents = rotatingAgents
+	sc := scenario{profile: &profile}
+	healthy := sc.healthyBehaviours()
+
+	type wave struct {
+		start, end     time.Duration
+		known, unknown int32
+	}
+	waves := make([]wave, rotatingWaves)
+	var phases []transportPhase
+	var boundaries []time.Duration
+	for i := range waves {
+		start := rotatingFirstWave + time.Duration(i)*rotatingWaveSpacing
+		waves[i] = wave{start: start, end: start + rotatingWaveLength, known: int32(2 * i), unknown: int32(2*i + 1)}
+		for _, id := range []int32{waves[i].known, waves[i].unknown} {
+			phases = append(phases, transportPhase{start, id, killPod}, transportPhase{waves[i].end, id, restorePod})
+		}
+		boundaries = append(boundaries, start, start+rotatingWaveSpacing, waves[i].end)
+	}
+	slices.SortStableFunc(phases, func(a, b transportPhase) int { return cmp.Compare(a.at, b.at) })
+	slices.Sort(boundaries)
+	boundaries = slices.Compact(boundaries)
+
+	var behaviourPhases []behaviourPhase
+	for _, at := range boundaries {
+		behaviours := sc.healthyBehaviours()
+		dead := map[int32]bool{}
+		var newest *wave
+		for i := range waves {
+			if at >= waves[i].start && at < waves[i].end {
+				dead[waves[i].known], dead[waves[i].unknown] = true, true
+				behaviours.brokerOnlyMissing = append(behaviours.brokerOnlyMissing, waves[i].unknown)
+				if at < waves[i].start+rotatingWaveSpacing {
+					newest = &waves[i]
+				}
+			}
+		}
+		if newest != nil {
+			behaviours.leaderPool = []int32{newest.known}
+		} else {
+			for id := range int32(rotatingAgents) {
+				if !dead[id] {
+					behaviours.leaderPool = append(behaviours.leaderPool, id)
+				}
+			}
+		}
+		behaviourPhases = append(behaviourPhases, behaviourPhase{at, behaviours})
+	}
+
+	awayAtOnce := int(rotatingWaveLength/rotatingWaveSpacing) * 2
+	return scenario{
+		name:        "investigation: rotating leader over stale discovery",
+		profile:     &profile,
+		observedFor: 90 * time.Second,
+		description: fmt.Sprintf("%d agents are all advertised and every partition shares one leader per Metadata response. %d waves take two agents away each, %s long and %s apart, so %d of %d (%.0f%%) are away at once. "+
+			"One agent of each wave refuses connections while still known to the client; the other refuses connections and is dropped from broker-only discovery while topic discovery still lists it. "+
+			"For %s after an agent dies, Metadata still names it as the leader of every partition, so the first flushes fail on it together and cascade to a hash-walk fallback that may be the unknown agent. A cascade that stops there fails that flush.",
+			rotatingAgents, rotatingWaves, rotatingWaveLength, rotatingWaveSpacing, awayAtOnce, rotatingAgents, 100*float64(awayAtOnce)/rotatingAgents, rotatingWaveSpacing),
+		behaviours:      healthy,
+		transportPhases: phases,
+		behaviourPhases: behaviourPhases,
+		expect:          scenarioExpectations{minWgoSuccessRate: 1},
+
+		requireCascadeContinuation: true,
+		collectClientEvidence:      true,
+	}
 }
 
 func runPhases(ctx context.Context, env *environment, start time.Time, sc scenario) error {
-	if len(sc.behaviourPhases) == 0 {
-		return runTransportPhases(ctx, env, start, sc.transportPhases)
+	transportDone := make(chan error, 1)
+	go func() { transportDone <- runTransportPhases(ctx, env, start, sc.transportPhases) }()
+	behaviourErr := runBehaviourPhases(ctx, env, start, sc.behaviourPhases)
+	if transportErr := <-transportDone; transportErr != nil {
+		return transportErr
 	}
-	if len(sc.transportPhases) != 0 {
-		return fmt.Errorf("mixed transport and behaviour phases are unsupported")
-	}
-	var phaseErr error
-	for _, phase := range sc.behaviourPhases {
+	return behaviourErr
+}
+
+func runBehaviourPhases(ctx context.Context, env *environment, start time.Time, phases []behaviourPhase) error {
+	for _, phase := range phases {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -162,13 +253,10 @@ func runPhases(ctx context.Context, env *environment, start time.Time, sc scenar
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
-				phaseErr = ctx.Err()
+				return ctx.Err()
 			}
-		}
-		if phaseErr != nil {
-			break
 		}
 		env.behaviours.set(phase.behaviours)
 	}
-	return phaseErr
+	return nil
 }

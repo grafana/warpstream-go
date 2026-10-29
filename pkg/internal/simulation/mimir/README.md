@@ -23,15 +23,15 @@ responses are observed on the wire; counters are scraped from Mimir's `/metrics`
 Recovery evidence counts wire responses read, including probes and responses after
 an HTTP request completes. HTTP success counts are measured separately.
 
-The same 15 scenarios as the direct-client runner cover healthy traffic, missing
+The same 27 scenarios as the direct-client runner cover healthy traffic, missing
 leaders, failing agents, slow agents, random failures and latency bursts, storage
-degradation, pod kills, network blackholes, and rolling replacements. Produce
+degradation, pod kills, network blackholes, and rolling and concurrent replacements. Produce
 responses receive the shared per-broker latency distributions on the TCP wire.
 Response order is preserved, while delays for concurrent requests overlap.
 
 Four scenarios run at a time by default, launching up to sixteen Mimir processes;
-use `-parallel` to change that limit. The default `all` profile includes all 15
-standard, five investigation, and two real Prometheus scenarios
+use `-parallel` to change that limit. The default `all` profile includes all 27
+standard, nine investigation, and two real Prometheus scenarios
 and takes roughly 10–15 minutes plus binary build time. Use `-profile standard`
 for only the standard suite. During rolling restarts,
 each of three pods disappears for 20s while partition assignments still name it.
@@ -39,6 +39,106 @@ Both backends must be served Metadata responses naming each missing leader.
 This scenario observes traffic for 90s, with recovery measured from 80s. Every Warpstream-backed
 HTTP request must complete within 2s, with at most 5% extra hedge requests, and the
 final recovery window must reach all three replacements.
+
+The concurrent restart scenario rolls five waves of agents through the cluster, each away
+for 20s and 10s apart, so 8 of 50 agents (16%) are away at once. A wave takes two partition
+leaders and the agent that is each one's first fallback in wgo's hash walk, so a cascade has
+to continue to a third agent. Its report counts failed flushes by stop reason, fallback wire
+errors by reason and cascades that reached a third attempt; the scenario fails when a
+cascade stops at a terminal error.
+
+The rotating leader investigation scenario uses WarpStream's single-leader Metadata
+placement: one agent is named leader of every partition. 20 agents are all advertised and
+six waves each take two agents away for 20s; for the first 10s after an agent dies, Metadata
+still names it as the leader. Its report lists write failures by stop reason, so cascades
+that run out of candidates show up separately from those that stop at an error.
+
+The rolling stalls investigation scenario stalls every Produce response of two agents per
+wave by 9s (four of 20 at once) without errors, while Metadata keeps listing them and for 10s
+names a newly stalled agent as leader. Each wave stalls agents the client has not seen fail,
+so it keeps hedging and learning.
+
+The metadata unavailable scenario fails Metadata requests from 25s to 65s while four of 50
+agents leave discovery at 10s and return on new addresses at 35s. Produce keeps working, so
+the new addresses cannot be discovered until Metadata recovers and the partitions must be
+written through other agents. WarpStream documents that a discovery failure surfaces as a
+Kafka error but not its payload, so the harness fails the request and leaves each client
+with its cached view.
+
+Threshold pairs probe wgo's health-check fractions. Each pair injects the same fault into a
+share of agents just below the limit (wgo still acts on it) and just above it (wgo stops
+acting). Names carry no numbers, so history stays comparable when a limit changes: "failing
+agents just below/above MaxFaultyFraction" and, for the slow fraction, "moderately slow",
+"barely hedged slow" and "stalled" agents (with a fast first or second fallback) just
+below/above MaxSlowFraction (the parameter names of wgo's health-check config). The number of
+affected agents derives from the library default limit, 5 points below or above it rounded down to whole agents, and
+every latency derives from the default hedge delays and deadlines. The harness refuses to
+start when a derived value stops making sense, and a test fails if the shares no longer
+straddle the limit. Settings stay at the library defaults (Mimir's flags default to them)
+and each description lists them.
+
+- The failing pair (immediate NotLeaderForPartition) isolates the faulty fraction. wgo is
+  expected to collapse above the limit, because demotion switches off.
+- The moderately slow pair never reaches the hedge delay, so no hedge fires on either side:
+  the slow-fraction gate acts and nothing else changes.
+- The barely hedged pair answers just after the hedge delay but before a hedge to a healthy
+  agent could, so hedges fire but the slow primary wins, so no slow request is cancelled. The hedge that
+  loses is cancelled on a healthy agent, which before #127 can close that agent's shared
+  connection; the report shows if that raises the faulty-fraction gate. Below the limit wgo
+  hedges, above it hedging should stop.
+- The stalled pairs answer between the application deadline and the produce wire timeout, so
+  kgo misses the deadline on every event that reaches a stalled agent. An event needs every
+  write it issues, so each pair places its stalled agents with a fixed search over wgo's real
+  candidate walk (a leader followed by consecutive agents from a hash of the topic and
+  partition) so that every partition has a way out. "Fast first fallback" leaves every
+  stalled partition a fast first fallback, which every build races. "Fast second fallback"
+  leaves no partition with its whole chain stalled and at least three whose first fallback
+  is stalled but second is fast, which only a client that races another candidate on a
+  timer (#128) reaches in time, so older builds are expected to fail it. Below the limit
+  wgo should finish near 100 while kgo fails the events that reach a stalled agent, nearly all
+  of them; above it hedging stops and both fail. Each event sends 50 writes hashed over the
+  ring, so a rare event can miss the partitions a pair is built around. The walk is pinned by a test in `pkg/wgo` and a copy in the runner.
+
+`-run-id N` (default 1, at least 1) numbers the run. CI passes the run number of its three repetitions, and a
+local run can pass its round number. Only the four stalled-agent scenarios use it: run N places the stalled agents
+at the N-th set, in order of seed, that meets the scenario's rule, so each id is a different but reproducible
+placement with the same guarantees, and every build in a run sees the same one. Every other scenario ignores it,
+and id 1 gives the placement used before the flag existed. Repeat the same id to measure plain noise. The
+descriptions in a report name the id and the agents.
+
+The CI comment compares the PR's wgo results with the current head of the PR's base branch (`main`) and splits each table in two. **Gated checks** are the benchmark scenarios listed in `runner/benchmarks.go`, whose expectations are meant to block a PR later (CI does not enforce them yet); their PR result starts with ✅ when every PR run met the expectations and ❌ when one missed. Checks about the kgo reference run (for example, a fault that never reached kgo's traffic) do not count, because they say nothing about wgo. The kgo result is then marked ⚠️: the comparison is inconclusive, so rerun before relying on it. **Other checks** are informational. Every PR result also starts with 🟩 improved, 🟥 regressed or 🟦 unchanged against main: results within 2 points of each other, or whose three-run ranges overlap, count as unchanged, but a drop from a perfect 100% is always a regression and reaching 100% from below is always an improvement. Bold marks a clear winner only: a result that is better by less than that same margin stays plain, so a bold value is not shown next to 🟦, except a perfect 100% that ties.
+
+An event succeeds only when every one of its writes is acknowledged before the application deadline, which hides how
+much of a failed event got through. The reports therefore also count individual writes ("Individual write success"
+table, `wgo_writes` and `kgo_writes` in the JSON) for scenarios whose events fan out into several. The direct harness
+does so for every scenario (one write per partition). On this harness the four stalled-agent scenarios send each series
+as its own write (50 per event, `splitWrites`); the others keep one request per event and show no write table, so their
+event results stay comparable with earlier runs.
+
+Slow agents are hedged, never demoted: wgo's demoter acts only on agents that return errors,
+so above MaxSlowFraction nothing else helps a slow agent.
+
+Success against kgo is the main result of every scenario. Each report has a "Latency of
+successful requests" table: both clients' success ratio first (a failure is a 5xx for the
+application), then p50, p99 and mean of the events that succeeded (an event with one failed write is not timed), so a failure's deadline
+does not hide how fast the others were. A client that fails its slowest writes looks faster
+there, so read it with the success columns. A "Why hedging stopped (secondary signal)" table
+then shows the gate a scenario is built to trip next to the hedges each gate suppressed, with
+the verdict `as expected`, `mixed` (the expected gate acted and so did another), `differs`,
+or `informational` for scenarios that do not isolate a gate. The JSON report carries the same
+data as `wgo_success_latency`, `kgo_success_latency` and `hedge_stop`.
+
+Research scenarios are investigation scenarios whose result depends on work in progress
+(#127 and #128). They are named by their setup, with the numbers fixed on purpose rather than
+derived, so a name never describes a mechanism that a fix would change. "investigation: 17 of
+50 agents (34%) answer in 500ms to 3s, mean 1.5s" is main's `25% slow agents` at a larger
+share, and "investigation: 17 of 50 agents (34%) answer uniformly in 250ms to 3s" has answers
+from under to over the hedge delay, above MaxSlowFraction. Correct handling means no agent is
+charged as faulty, wgo does as well as kgo, and only the slow-fraction gate stops hedging. On
+current clients, cancelling a hedged slow request closes the shared connection and fails the
+requests queued behind it; those failures are charged to the slow agent and the
+faulty-fraction gate acts too. Tests fail when a default moves so far that a setup no longer
+sits on its side of a limit.
 
 The standard scenarios use a 5s distributor remote timeout and a 10s Kafka write
 timeout, with 2s
@@ -51,7 +151,7 @@ completion, not durability or queryability. Local reports are written under
 `.reports/` and ignored by Git. CI runs every scenario three times in separate
 jobs and posts each client's observed success-percentage range in one updated PR comment.
 The Mimir binary and simulation harness are built once and shared across the
-three runs per client variant. Each CI run splits the 22 scenarios into five batches on
+three runs per client variant. Each CI run splits the 38 scenarios into five batches of seven or eight on
 separate runners. Both clients run together within each scenario, preserving
 all comparison gates. Integration harness unit tests run once in a separate job, in
 parallel with the build. The real Prometheus sender retry test runs after the
@@ -59,7 +159,7 @@ Prometheus release binary is downloaded for the PR client variant.
 Each run's full latency, fault and error report is retained as a CI artifact.
 CI freezes one `main` client revision, then runs both clients against the PR's
 harness three times per variant. The comment compares PR wgo, main wgo and the
-PR-run kgo reference, sorted by PR wgo success rate with the weakest first.
+PR-run kgo reference, listed in a fixed order (`.github/scripts/simulation-order.json`), so a scenario sits in the same place in every comment and the two sides of a threshold pair are adjacent.
 Artifacts record client and harness revisions; mixed revisions or scenario
 coverage are rejected. Main-run kgo results remain available in the artifacts.
 

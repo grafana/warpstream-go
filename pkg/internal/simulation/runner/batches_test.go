@@ -8,7 +8,7 @@ import (
 )
 
 func TestScenarioBatches_CoverEveryScenarioOnce(t *testing.T) {
-	available, err := profileScenarios("all", true)
+	available, err := profileScenarios("all", true, defaultRunID)
 	require.NoError(t, err)
 	seen := make(map[string]bool)
 	for batch := 1; batch <= 5; batch++ {

@@ -28,11 +28,12 @@ type scenarioResult struct {
 	// wgoSlowFraction is the fraction of wgo observations whose latency
 	// exceeded sc.expect.slowBudget. Set only when that expectation is
 	// configured; nil otherwise.
-	wgoSlowFraction                      *float64
-	wgoRecovery                          observationsSummary
-	wgoRecoverySlowFraction              float64
-	wgoTransport, kgoTransport           transportStats
-	wgoMissingLeaders, kgoMissingLeaders map[int32]int64
+	wgoSlowFraction                          *float64
+	wgoRecovery                              observationsSummary
+	wgoRecoverySlowFraction                  float64
+	wgoTransport, kgoTransport               transportStats
+	wgoMissingLeaders, kgoMissingLeaders     map[int32]int64
+	wgoMetadataFailures, kgoMetadataFailures int64
 }
 
 // successRate returns the wgo app-level success fraction, or 0 when nothing was
@@ -140,6 +141,44 @@ func checkResult(res scenarioResult) []scenarioFailure {
 		}
 		if res.staleFallback != nil && res.staleFallback.TerminalErrors > 0 {
 			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%d retry cascades stopped at a terminal error", res.staleFallback.TerminalErrors)})
+		}
+	}
+	if res.sc.requireCascadeContinuation {
+		if res.staleFallback == nil || res.staleFallback.BrokerOnlyWithdrawals == 0 || res.staleFallback.StaleRoutingResponses == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "stale discovery was not exercised: no broker-only withdrawal reached the client's routing"})
+		}
+		// Builds before the unknown_broker label report the same failure as "unknown".
+		if res.staleFallback == nil || res.staleFallback.FallbackErrorReasons["unknown_broker"]+res.staleFallback.FallbackErrorReasons["unknown"] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no fallback attempt failed on an agent the client does not know, so the unknown-agent cascade was not exercised"})
+		}
+		if res.staleFallback == nil || res.staleFallback.FallbackErrors == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no fallback attempt failed, so the cascade was not exercised"})
+		}
+		if res.staleFallback == nil || res.staleFallback.ThirdAttemptSuccesses == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "no write completed after continuing to a third agent"})
+		}
+		if res.staleFallback != nil && res.staleFallback.TerminalErrors > 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%d retry cascades stopped at a terminal error", res.staleFallback.TerminalErrors)})
+		}
+	}
+	for _, reason := range res.sc.requireSuppression {
+		if res.clientEvidence == nil || res.clientEvidence.HedgeSuppression[reason] == 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("hedging was never suppressed with reason %q", reason)})
+		}
+	}
+	for _, reason := range res.sc.forbidSuppression {
+		if res.clientEvidence != nil && res.clientEvidence.HedgeSuppression[reason] > 0 {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("hedging was suppressed %d times with reason %q, so this is not the gate the scenario isolates", res.clientEvidence.HedgeSuppression[reason], reason)})
+		}
+	}
+	if res.sc.failsMetadata() {
+		for _, lane := range []struct {
+			name     string
+			failures int64
+		}{{"wgo", res.wgoMetadataFailures}, {"kgo", res.kgoMetadataFailures}} {
+			if lane.failures == 0 {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("%s: no Metadata request failed during the failure window", lane.name)})
+			}
 		}
 	}
 	for _, phase := range res.sc.transportPhases {

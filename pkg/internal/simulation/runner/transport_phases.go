@@ -1,9 +1,11 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
@@ -85,6 +87,88 @@ func (env *environment) applyTransportPhase(phase transportPhase) error {
 	return nil
 }
 
+// restartPair is a leaving partition leader and the agent that is that
+// partition's first fallback in wgo's fixed hash walk over the pool. The fallback
+// is still advertised by topic discovery but unknown to the client's broker map,
+// so a cascade that reaches it fails with an unknown-broker error.
+type restartPair struct {
+	leader, fallback int32
+	leaderReplaced   bool
+}
+
+// restartWaves lists the pairs that leave together. A random choice of leaving
+// agents rarely pairs a leader with its first fallback, and the client's health
+// tracking steers around agents it has already seen fail, so new pairs have to keep
+// arriving for the cascade to keep meeting an agent it has not learned about.
+var restartWaves = [][]restartPair{
+	{{15, 37, false}, {7, 18, true}},
+	{{39, 34, false}, {1, 33, true}},
+	{{8, 20, false}, {48, 6, true}},
+	{{16, 38, false}, {47, 49, true}},
+	{{9, 17, false}, {45, 27, true}},
+}
+
+const (
+	restartFirstWave   = 5 * time.Second
+	restartWaveSpacing = 10 * time.Second
+	restartWaveLength  = 20 * time.Second
+)
+
+// concurrentRestartScenario rolls restartWaves through the cluster so that two
+// waves, 8 of 50 agents (16%), are away at once, in the ways a terminating pod
+// looks to a client: refusing connections while still advertised, refusing them
+// while only some discovery responses list it, and leaving discovery before
+// returning on a new address.
+func concurrentRestartScenario() scenario {
+	var phases []transportPhase
+	var boundaries []time.Duration
+	for wave, pairs := range restartWaves {
+		leave := restartFirstWave + time.Duration(wave)*restartWaveSpacing
+		rejoin := leave + restartWaveLength
+		boundaries = append(boundaries, leave, rejoin)
+		for _, pair := range pairs {
+			if pair.leaderReplaced {
+				phases = append(phases, transportPhase{leave, pair.leader, withdrawPod}, transportPhase{rejoin, pair.leader, replacePod})
+			} else {
+				phases = append(phases, transportPhase{leave, pair.leader, killPod}, transportPhase{rejoin, pair.leader, restorePod})
+			}
+			phases = append(phases, transportPhase{leave, pair.fallback, killPod}, transportPhase{rejoin, pair.fallback, restorePod})
+		}
+	}
+	slices.SortStableFunc(phases, func(a, b transportPhase) int { return cmp.Compare(a.at, b.at) })
+	slices.Sort(boundaries)
+	boundaries = slices.Compact(boundaries)
+	var behaviourPhases []behaviourPhase
+	for _, at := range boundaries {
+		skewed := healthyBehaviours()
+		for wave, pairs := range restartWaves {
+			leave := restartFirstWave + time.Duration(wave)*restartWaveSpacing
+			if at >= leave && at < leave+restartWaveLength {
+				for _, pair := range pairs {
+					skewed.brokerOnlyMissing = append(skewed.brokerOnlyMissing, pair.fallback)
+				}
+			}
+		}
+		behaviourPhases = append(behaviourPhases, behaviourPhase{at, skewed})
+	}
+	awayAtOnce := int(restartWaveLength/restartWaveSpacing) * 2 * len(restartWaves[0])
+	return scenario{
+		name:        "concurrent restart",
+		observedFor: 90 * time.Second,
+		description: fmt.Sprintf("%d waves of agents leave, each for %s and starting %s after the last, so %d of %d agents (%.0f%%) are away at once. Each wave takes two partition leaders and, for each, the agent that is the partition's first fallback. "+
+			"One leader refuses connections while still advertised and the other leaves discovery and returns on a new address; both fallbacks refuse connections while broker-only discovery omits them but topic discovery still lists them. "+
+			"A write whose leader and first fallback are both gone must continue to a third agent. The evidence section counts failed flushes by stop reason; a cascade that stops at a terminal error with candidates left fails the scenario.",
+			len(restartWaves), restartWaveLength, restartWaveSpacing, awayAtOnce, clusterSize, 100*float64(awayAtOnce)/float64(clusterSize)),
+		behaviours:      healthyBehaviours(),
+		transportPhases: phases,
+		behaviourPhases: behaviourPhases,
+		expect:          scenarioExpectations{minWgoSuccessRate: 0.5, recoveryFrom: ptr(80 * time.Second), minSuccessDeltaVsKgo: ptr(0.2)},
+
+		requireCascadeContinuation: true,
+		collectClientEvidence:      true,
+	}
+}
+
 func transportScenarios() []scenario {
 	expectation := scenarioExpectations{
 		minWgoSuccessRate: 1,
@@ -92,6 +176,8 @@ func transportScenarios() []scenario {
 		recoveryFrom: ptr(50 * time.Second), maxHedgeSurge: ptr(0.25),
 	}
 	return []scenario{
+		concurrentRestartScenario(),
+		metadataUnavailableScenario(),
 		{
 			name:        "pod killed during writes",
 			description: "At 10s broker 1 closes every established connection and refuses new dials. Metadata continues advertising it. At 30s the broker accepts connections again. Writes must reroute within budget and recover by 50s.",

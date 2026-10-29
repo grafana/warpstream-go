@@ -49,6 +49,13 @@ func TestStaleFallback_ClientMetrics(t *testing.T) {
 	require.Contains(t, report.generateMarkdown(), "successful cascades with at least three attempts")
 }
 
+func TestStaleFallback_Subtract(t *testing.T) {
+	t.Parallel()
+	evidence := &staleFallbackEvidence{BrokerOnlyWithdrawals: 4, FallbackErrors: 10, FallbackErrorReasons: map[string]int64{"unknown_broker": 10}, ThirdAttemptSuccesses: 7, TerminalErrors: 3}
+	evidence.subtract(&staleFallbackEvidence{BrokerOnlyWithdrawals: 1, FallbackErrors: 4, FallbackErrorReasons: map[string]int64{"unknown_broker": 4}, ThirdAttemptSuccesses: 2, TerminalErrors: 1})
+	require.Equal(t, &staleFallbackEvidence{BrokerOnlyWithdrawals: 4, FallbackErrors: 6, FallbackErrorReasons: map[string]int64{"unknown_broker": 6}, ThirdAttemptSuccesses: 5, TerminalErrors: 2}, evidence)
+}
+
 func TestStaleFallback_ThirdAttempts(t *testing.T) {
 	for _, tc := range []struct {
 		name         string

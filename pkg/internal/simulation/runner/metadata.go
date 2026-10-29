@@ -2,6 +2,7 @@ package runner
 
 import (
 	"cmp"
+	"errors"
 	"maps"
 	"slices"
 	"sync"
@@ -19,6 +20,11 @@ func missingBrokerBehaviours(nodeIDs ...int32) brokersBehaviour {
 	return b
 }
 
+// errMetadataUnavailable makes kfake close the connection that sent a Metadata
+// request. The agent's discovery failure is documented only as a Kafka error, so
+// the harness fails the request without inventing a payload.
+var errMetadataUnavailable = errors.New("simulated discovery failure")
+
 type metadataView struct {
 	current                atomic.Pointer[kmsg.MetadataResponse]
 	template               *kmsg.MetadataResponse
@@ -26,6 +32,8 @@ type metadataView struct {
 	missingLeaderResponses map[int32]int64
 	brokerOnlyWithdrawals  int64
 	staleRoutingResponses  int64
+	leaderTurn             int
+	failedResponses        int64
 }
 
 func installMetadataControl(cluster *kfake.Cluster, template *kmsg.MetadataResponse, behaviours *brokersBehaviourProvider) *metadataView {
@@ -40,6 +48,12 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 		// kfake reshuffles leaders during membership changes. Publish a complete
 		// scenario view so unrelated partitions never inherit those random leaders.
 		behaviour := behaviours.get()
+		if behaviour.metadataFailing {
+			view.mu.Lock()
+			view.failedResponses++
+			view.mu.Unlock()
+			return nil, errMetadataUnavailable, true
+		}
 		response := metadataWithoutBrokers(view.current.Load(), req.GetVersion(), behaviour.missingBrokers)
 		if singleAgent {
 			preferred := int32(0)
@@ -49,6 +63,9 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 			count := 3
 			if len(advertised) > 0 && advertised[0] > 0 {
 				count = advertised[0]
+			}
+			if len(behaviour.leaderPool) > 0 {
+				preferred = view.nextLeader(behaviour.leaderPool)
 			}
 			response = metadataPreferredPlacement(response, preferred, count, retainedFallback)
 		}
@@ -73,6 +90,15 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 		return response, nil, true
 	})
 	return view
+}
+
+// nextLeader rotates through pool so successive responses name different leaders.
+func (view *metadataView) nextLeader(pool []int32) int32 {
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	leader := pool[view.leaderTurn%len(pool)]
+	view.leaderTurn++
+	return leader
 }
 
 func (view *metadataView) withdrawBroker(nodeID int32) {
@@ -104,6 +130,12 @@ func (view *metadataView) observeMissingLeaders(response *kmsg.MetadataResponse)
 	for nodeID := range missing {
 		view.missingLeaderResponses[nodeID]++
 	}
+}
+
+func (view *metadataView) failedMetadata() int64 {
+	view.mu.Lock()
+	defer view.mu.Unlock()
+	return view.failedResponses
 }
 
 func (view *metadataView) missingLeaders() map[int32]int64 {
