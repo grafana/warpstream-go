@@ -316,15 +316,19 @@ func TestNewMetrics_ProduceRequestsFailed(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	m := newMetrics(reg)
 
-	m.produceRequestsFailed[produceFailureReasonCandidatesExhausted].Inc()
+	m.produceRequestsFailed[produceFailureReasonNoAlternate].Inc()
+	m.produceRequestsFailed[produceFailureReasonListDrained].Add(5)
+	m.produceRequestsFailed[produceFailureReasonBudgetCap].Add(6)
 	m.produceRequestsFailed[produceFailureReasonTerminalError].Add(2)
 	m.produceRequestsFailed[produceFailureReasonWriteTimeout].Add(3)
 	m.produceRequestsFailed[produceFailureReasonInternalError].Add(4)
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-		# HELP warpstream_produce_requests_failed_total Why a Hedger produce failed: candidates_exhausted (a partition hit its candidate budget or had no unused candidate), terminal_error (a non-retriable error from the primary or a retry), write_timeout (the work deadline expired; it outranks candidate exhaustion but not a terminal error), or internal_error (routing mismatch, duplicate partition, or an unclassifiable result). The reason is why the retry cascade stopped. One increment per failed invocation, not per public call, record, partition, or wire attempt. Success and caller cancellation are omitted. The routing-mismatch guard is counted here but not in warpstream_produce_requests_attempts.
+		# HELP warpstream_produce_requests_failed_total Failed Hedger invocations by reason: candidates_exhausted_no_alternate (no fallback offered), candidates_exhausted_list_drained (all offered agents tried before reaching the budget), candidates_exhausted_budget_cap (MaxHedgeAgents agents tried), terminal_error (non-retriable error), write_timeout (work deadline expired), or internal_error (routing mismatch, duplicate partition, or unclassified failure). Terminal errors take precedence over deadlines, then exhaustion. Counts once per failed invocation, including routing errors; excludes success and caller cancellation.
 		# TYPE warpstream_produce_requests_failed_total counter
-		warpstream_produce_requests_failed_total{reason="candidates_exhausted"} 1
+		warpstream_produce_requests_failed_total{reason="candidates_exhausted_budget_cap"} 6
+		warpstream_produce_requests_failed_total{reason="candidates_exhausted_list_drained"} 5
+		warpstream_produce_requests_failed_total{reason="candidates_exhausted_no_alternate"} 1
 		warpstream_produce_requests_failed_total{reason="internal_error"} 4
 		warpstream_produce_requests_failed_total{reason="terminal_error"} 2
 		warpstream_produce_requests_failed_total{reason="write_timeout"} 3
