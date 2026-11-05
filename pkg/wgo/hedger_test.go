@@ -257,7 +257,7 @@ func TestHedger_ProduceSync(t *testing.T) {
 		wantAttempts  float64
 	}{
 		{"fallback exhausts before primary fails", 100 * time.Millisecond, 0, kerr.RequestTimedOut, 3},
-		{"primary fails before fallback exhausts", 0, 100 * time.Millisecond, kerr.RequestTimedOut, 3},
+		{"primary fails before fallback exhausts", 100 * time.Millisecond, 200 * time.Millisecond, kerr.RequestTimedOut, 3},
 		{"primary succeeds after fallback exhausts", 100 * time.Millisecond, 0, nil, 1},
 	} {
 		t.Run("attempts when the race ends: "+tc.name, func(t *testing.T) {
@@ -278,6 +278,11 @@ func TestHedger_ProduceSync(t *testing.T) {
 			h := NewHedger(producer, slowPrimaryTracker(), strategy, health, raceCfg, 0, 1<<20, m, nil)
 			capture := newResultCapture()
 			runHedger(h, context.Background(), makeReq(capture))
+
+			// A primary that fails before the hedge delay skips the race and
+			// triggers on primary failure instead, so these pin the race path.
+			assert.Equal(t, float64(1), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerLatency]))
+			assert.Equal(t, float64(0), testutil.ToFloat64(m.hedgeTriggers[hedgeTriggerPrimaryFailure]))
 
 			metric := m.produceRequestsAttemptsSuccess
 			if tc.primaryErr != nil {
