@@ -20,6 +20,7 @@ func missingBrokerBehaviours(nodeIDs ...int32) brokersBehaviour {
 }
 
 type metadataView struct {
+	delayedReply           atomic.Pointer[delayedMetadataReply]
 	current                atomic.Pointer[kmsg.MetadataResponse]
 	template               *kmsg.MetadataResponse
 	mu                     sync.Mutex
@@ -58,6 +59,10 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 			}
 		}
 		metadataRequest := req.(*kmsg.MetadataRequest)
+		if delay := view.delayedReply.Load(); delay != nil && metadataRequest.IncludeTopicAuthorizedOperations {
+			delay.markStarted()
+			cluster.SleepControl(func() { <-delay.release })
+		}
 		if len(behaviour.brokerOnlyMissing) > 0 {
 			brokerOnly := metadataRequest.Topics != nil && len(metadataRequest.Topics) == 0
 			if !brokerOnly && behaviour.topicMetadataDelay > 0 {

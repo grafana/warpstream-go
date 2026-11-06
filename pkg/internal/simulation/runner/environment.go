@@ -87,8 +87,10 @@ type produceClient = Producer
 // broker capacity. Each cluster is configured identically (same broker count,
 // same per-broker behaviour overrides) so the comparison stays apples-to-apples.
 type environment struct {
-	topic         string
-	numPartitions int32
+	wgoMetadataSource, kgoMetadataSource *metadataRequestSource
+	seedMetadata                         *seedMetadataReordering
+	topic                                string
+	numPartitions                        int32
 
 	wgoCluster  *kfake.Cluster
 	wgoClient   produceClient
@@ -210,9 +212,17 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	}
 	wgoRegistry := prometheus.NewPedanticRegistry()
 	var wgoClient produceClient
+	var wgoMetadataSource, kgoMetadataSource *metadataRequestSource
 	if factory == nil {
 		var raw *wgo.WarpstreamClient
-		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
+		var extra []wgo.Opt
+		var source *metadataRequestSource
+		if sc.reorderSeedMetadata {
+			source = &metadataRequestSource{}
+			extra = append(extra, wgo.WithHooks(source))
+		}
+		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, append(extra, wgo.WithDialer(wgoNetwork.DialContext))...)
+		wgoMetadataSource = source
 		if err == nil {
 			raw.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, hookErr error) {
 				beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
@@ -266,7 +276,12 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	var kgoClient produceClient
 	if factory == nil {
 		var inner *kgo.Client
-		inner, err = newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
+		var extra []kgo.Opt
+		if sc.reorderSeedMetadata {
+			kgoMetadataSource = &metadataRequestSource{}
+			extra = append(extra, kgo.WithHooks(kgoMetadataSource))
+		}
+		inner, err = newKgoClient(kgoAddr, append(extra, kgo.Dialer(kgoNetwork.DialContext))...)
 		if err == nil {
 			kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
 		}
@@ -279,7 +294,8 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	clients = append(clients, kgoClient)
 
 	return &environment{
-		topic:         topicName,
+		topic:             topicName,
+		wgoMetadataSource: wgoMetadataSource, kgoMetadataSource: kgoMetadataSource,
 		numPartitions: partitions,
 		wgoCluster:    wgoCluster,
 		wgoClient:     wgoClient,

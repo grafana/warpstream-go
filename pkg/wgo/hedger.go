@@ -89,7 +89,7 @@ func (s produceStop) exhausted() bool {
 // possibly fire a hedge to race the primary, give up when
 // MaxHedgeAgents is reached" story lives here; the layer below
 // (TrackingProducer → KafkaDirectProducer) shares one per-attempt deadline,
-// including one same-agent retry if its broker connection dies.
+// including bounded same-agent retries if its broker connection dies.
 //
 // ProduceSync fires the primary leg and then waits for one of three outcomes:
 //

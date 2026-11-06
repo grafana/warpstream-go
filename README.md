@@ -105,7 +105,7 @@ Every produce attempt (primary or hedge wave) feeds latency and error data into 
 
 The bottom layer is a thin `KafkaDirectProducer` that hands a built `ProduceRequest` to `kgo.Client.Broker().Request()`. We do not use `kgo.Client.Produce()` because that's where franz-go's leader-pinning lives. By dropping into the raw `Broker.Request` path we keep all of franz-go's connection pooling, TLS/SASL, and wire encoding while taking complete control of which broker each request actually goes to.
 
-A broker replacement during Metadata refresh (including a rack-only change) can close an in-flight connection even while the agent remains healthy. wgo retries that transport error once on the same agent's current connection, within the original per-attempt deadline, before falling back to other agents. Dial failures and Kafka response errors still go straight to the fallback path. Each wire attempt counts in the direct-request metrics.
+A broker replacement during Metadata refresh (including a rack-only change) can close an in-flight connection even while the agent remains healthy. A delayed pre-change Metadata reply can temporarily restore the previous broker identities. wgo retries the connection-dead error up to three times on the same agent's current connection, within the original per-attempt deadline, before falling back to other agents. Dial failures and Kafka response errors still go straight to the fallback path. Each wire attempt counts in the direct-request metrics.
 
 ### Hooks
 

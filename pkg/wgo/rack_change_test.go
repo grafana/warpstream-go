@@ -2,6 +2,7 @@ package wgo
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,13 +22,15 @@ import (
 
 func TestKafkaDirectProducer_MetadataRackChange(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		changes  bool
-		deadline bool
+		name      string
+		changes   bool
+		deadline  bool
+		exhausted bool
 	}{
 		{name: "unchanged rack preserves in-flight produces"},
 		{name: "one rack change retries in-flight produces across the pool", changes: true},
 		{name: "retry shares the original deadline", changes: true, deadline: true},
+		{name: "four connection replacements exhaust the retry limit", changes: true, exhausted: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -119,6 +122,25 @@ func TestKafkaDirectProducer_MetadataRackChange(t *testing.T) {
 						<-started
 					}
 				}
+				if tc.exhausted {
+					for i := range 3 {
+						anotherRack := originalRack + "-again-" + strconv.Itoa(i)
+						rack.Store(&anotherRack)
+						time.Sleep(2 * time.Nanosecond)
+						_, err = pool.Refresh(t.Context())
+						require.NoError(t, err)
+						synctest.Wait()
+						if i < 2 {
+							require.Empty(t, results)
+							require.Len(t, started, 3)
+							for range 3 {
+								<-started
+							}
+						} else {
+							require.Len(t, results, 3)
+						}
+					}
+				}
 				if tc.deadline {
 					time.Sleep(time.Until(attemptStart.Add(2 * time.Second)))
 					synctest.Wait()
@@ -131,6 +153,8 @@ func TestKafkaDirectProducer_MetadataRackChange(t *testing.T) {
 					result := <-results
 					if tc.deadline {
 						require.ErrorIs(t, result.err, context.DeadlineExceeded)
+					} else if tc.exhausted {
+						require.ErrorContains(t, result.err, "the broker connection has died")
 					} else {
 						require.NoError(t, result.error())
 					}
@@ -139,9 +163,16 @@ func TestKafkaDirectProducer_MetadataRackChange(t *testing.T) {
 				if tc.changes {
 					expectedRequests = 6
 				}
+				if tc.exhausted {
+					expectedRequests = 12
+				}
 				assert.Equal(t, expectedRequests, testutil.ToFloat64(m.produceDirectRequestsTotal.WithLabelValues("healthy")))
 				if tc.changes {
-					assert.Equal(t, float64(3), testutil.ToFloat64(m.produceDirectRequestsFailedTotal.WithLabelValues("transport", "healthy")))
+					expectedFailures := float64(3)
+					if tc.exhausted {
+						expectedFailures = 12
+					}
+					assert.Equal(t, expectedFailures, testutil.ToFloat64(m.produceDirectRequestsFailedTotal.WithLabelValues("transport", "healthy")))
 				}
 
 				for nodeID := range int32(3) {

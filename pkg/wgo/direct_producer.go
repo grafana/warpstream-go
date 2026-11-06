@@ -118,9 +118,11 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 
 	// Keep transport retries bounded so a broken agent still cascades promptly.
 	resp, err := s.client.Broker(int(target.NodeID)).Request(attemptCtx, req)
-	if isBrokerConnectionDeadErr(err) && attemptCtx.Err() == nil {
+	const maxConnectionRetries = 3
+	for retries := 0; retries < maxConnectionRetries && isBrokerConnectionDeadErr(err) && attemptCtx.Err() == nil; retries++ {
 		// Metadata can replace every broker at once on a rack-only change.
-		// Retry its current connection once without spending a hedge candidate.
+		// Old in-flight metadata replies can replace it again, so reconnect
+		// within this attempt's deadline before spending hedge candidates.
 		reason := getProduceResultErr(err).reason
 		s.metrics.produceDirectRequestLatencyFailure.WithLabelValues(reason).Observe(time.Since(reqStart).Seconds())
 		s.metrics.produceDirectRequestsFailedTotal.WithLabelValues(reason, agentState).Inc()
