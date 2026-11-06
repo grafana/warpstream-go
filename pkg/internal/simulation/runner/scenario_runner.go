@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,7 +61,7 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		}
 	}
 	var initialFallback *staleFallbackEvidence
-	if sc.requireStaleFallback {
+	if sc.collectsCascadeEvidence() {
 		initialFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
@@ -113,6 +114,7 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	kgoSnapshot := kgoObservations.snapshot()
 	res := scenarioResult{
 		wgoMissingLeaders: env.wgoMetadata.missingLeaders(), kgoMissingLeaders: env.kgoMetadata.missingLeaders(),
+		wgoMetadataFailures: env.wgoMetadata.failedMetadata(), kgoMetadataFailures: env.kgoMetadata.failedMetadata(),
 		wgoTransport: env.wgoNetwork.snapshot(), kgoTransport: env.kgoNetwork.snapshot(),
 		sc:                   sc,
 		wgoLatencySelections: env.behaviours.selectedLatencies(clientTypeWgo), kgoLatencySelections: env.behaviours.selectedLatencies(clientTypeKgo),
@@ -150,17 +152,12 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 	if profile, ok := env.wgoClient.(interface{ Describe() (string, string) }); ok {
 		res.workloadDescription, res.workloadConfiguration = profile.Describe()
 	}
-	if sc.requireStaleFallback {
+	if sc.collectsCascadeEvidence() {
 		res.staleFallback, err = readStaleFallbackEvidence(metrics, prefix, env.wgoMetadata)
 		if err != nil {
 			return scenarioResult{}, err
 		}
-		res.staleFallback.FallbackErrors -= initialFallback.FallbackErrors
-		for reason, count := range initialFallback.FallbackErrorReasons {
-			res.staleFallback.FallbackErrorReasons[reason] -= count
-		}
-		res.staleFallback.ThirdAttemptSuccesses -= initialFallback.ThirdAttemptSuccesses
-		res.staleFallback.TerminalErrors -= initialFallback.TerminalErrors
+		res.staleFallback.subtract(initialFallback)
 	}
 	if initialEvidence != nil {
 		res.clientEvidence, err = readClientEvidence(metrics, prefix)
@@ -318,10 +315,15 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 		innerWG  sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
+		okWrites atomic.Int64
 	)
 	for _, rec := range event.records {
 		innerWG.Add(1)
 		client.Produce(eventCtx, rec, func(_ *kgo.Record, err error) {
+			// An acknowledgement after the deadline is too late for the application.
+			if err == nil && eventCtx.Err() == nil {
+				okWrites.Add(1)
+			}
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -339,9 +341,9 @@ func runScenarioEvent(ctx context.Context, client produceClient, start time.Time
 		if eventCtx.Err() != nil {
 			firstErr = eventCtx.Err()
 		}
-		obs.record(scheduled, issued, time.Since(issued), firstErr)
+		obs.recordWrites(scheduled, issued, time.Since(issued), firstErr, len(event.records), int(okWrites.Load()))
 	case <-eventCtx.Done():
-		obs.record(scheduled, issued, time.Since(issued), eventCtx.Err())
+		obs.recordWrites(scheduled, issued, time.Since(issued), eventCtx.Err(), len(event.records), int(okWrites.Load()))
 	}
 	// Drain callbacks before cleanup so they cannot access a closed environment.
 	<-done

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -58,6 +59,29 @@ type scenario struct {
 	requiredWgoDelayBrokers []int32
 	requireStaleFallback    bool
 	collectClientEvidence   bool
+	// splitWrites makes a Mimir event one write per series instead of one request
+	// carrying all of them, so the report can count successful writes, not only
+	// events that got every one through.
+	splitWrites bool
+
+	// requireCascadeContinuation asserts that no retry cascade stopped at a
+	// terminal error while a candidate was left, and that some writes got
+	// past two attempts.
+	requireCascadeContinuation bool
+
+	// requireSuppression and forbidSuppression name hedge-suppression reasons
+	// that must, or must not, have fired. They show which health gate acted,
+	// so a scenario meant to isolate one gate is reported when another did.
+	requireSuppression, forbidSuppression []string
+
+	// expectedHedgeStop is the health gate the scenario is built to trip, or empty
+	// when no gate should stop hedging. The report shows it next to the gate that
+	// did.
+	expectedHedgeStop string
+}
+
+func (sc scenario) collectsCascadeEvidence() bool {
+	return sc.requireStaleFallback || sc.requireCascadeContinuation
 }
 
 func (sc scenario) duration() time.Duration {
@@ -75,7 +99,7 @@ func ptr[T any](v T) *T { return &v }
 // scenario tests verbatim; expectations are tightened from the original
 // single-floor design per the PR #3 review (a floor alone can't tell a
 // rerouting client from one that just waits — see scenarioExpectations).
-func scenarios() []scenario {
+func scenarios(runID int) []scenario {
 	// agentCount returns numerator/denominator of the cluster as an agent count,
 	// panicking if the split is degenerate (no affected agents, or none left healthy).
 	agentCount := func(label string, numerator, denominator int32) int32 {
@@ -222,9 +246,10 @@ func scenarios() []scenario {
 				bh.byBroker[i] = brokerBehaviour{latencyFn: highLatency}
 			}
 			return scenario{
-				name:        "25% slow agents",
-				description: "A quarter of agents are permanently slow (avg 1.5s, max 3s); the hedge fallback should steer most traffic onto the healthy majority.",
-				behaviours:  bh,
+				name:                  "25% slow agents",
+				collectClientEvidence: true,
+				description:           "A quarter of agents are permanently slow (avg 1.5s, max 3s); the hedge fallback should steer most traffic onto the healthy majority.",
+				behaviours:            bh,
 				// Every event fans out to all 50 partitions, so it
 				// deterministically touches all 12 of the slow quarter every
 				// time; the event's own latency is the max across all 50
@@ -246,6 +271,16 @@ func scenarios() []scenario {
 				},
 			}
 		}(),
+		fractionScenario(slowFractionGate, false),
+		fractionScenario(slowFractionGate, true),
+		fractionScenario(barelyHedgedSlowFractionGate, false),
+		fractionScenario(barelyHedgedSlowFractionGate, true),
+		fractionScenario(stalledFastFirstFallbackGate(runID), false),
+		fractionScenario(stalledFastFirstFallbackGate(runID), true),
+		fractionScenario(stalledFastSecondFallbackGate(runID), false),
+		fractionScenario(stalledFastSecondFallbackGate(runID), true),
+		fractionScenario(faultyFractionGate, false),
+		fractionScenario(faultyFractionGate, true),
 		func() scenario {
 			// GCS outage: first 10% very bad, next 40% moderately slow, rest healthy.
 			// Both model object-storage degradation as healthy base + occasional burst,
@@ -280,13 +315,18 @@ func scenarios() []scenario {
 	}, transportScenarios()...)
 }
 
+func (sc scenario) failsMetadata() bool {
+	return slices.ContainsFunc(sc.behaviourPhases, func(phase behaviourPhase) bool { return phase.behaviours.metadataFailing })
+}
+
 func (sc scenario) hasInjectedDelays() bool {
-	for _, phase := range sc.behaviourPhases {
-		for _, behaviour := range phase.behaviours.byBroker {
+	delays := func(behaviours brokersBehaviour) bool {
+		for _, behaviour := range behaviours.byBroker {
 			if behaviour.injectedLatency {
 				return true
 			}
 		}
+		return false
 	}
-	return false
+	return delays(sc.behaviours) || slices.ContainsFunc(sc.behaviourPhases, func(phase behaviourPhase) bool { return delays(phase.behaviours) })
 }

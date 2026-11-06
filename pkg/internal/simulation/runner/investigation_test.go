@@ -1,27 +1,30 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestInvestigation_ProfileSelection(t *testing.T) {
-	_, err := profileScenarios("mimir-investigation", false)
+	_, err := profileScenarios("mimir-investigation", false, defaultRunID)
 	require.ErrorContains(t, err, "external workload")
-	_, err = profileScenarios("unknown", true)
+	_, err = profileScenarios("unknown", true, defaultRunID)
 	require.Error(t, err)
-	standard, err := profileScenarios("standard", false)
+	standard, err := profileScenarios("standard", false, defaultRunID)
 	require.NoError(t, err)
-	require.Len(t, standard, len(scenarios()))
-	investigation, err := profileScenarios("mimir-investigation", true)
+	require.Len(t, standard, len(scenarios(defaultRunID)))
+	investigation, err := profileScenarios("mimir-investigation", true, defaultRunID)
 	require.NoError(t, err)
-	require.Len(t, investigation, 5)
-	all, err := profileScenarios("all", true)
+	require.Len(t, investigation, 7+len(researchScenarios()))
+	all, err := profileScenarios("all", true, defaultRunID)
 	require.NoError(t, err)
 	require.Len(t, all, len(standard)+len(investigation)+len(storagePressureScenarios()))
 	found := false
@@ -117,4 +120,49 @@ func TestInvestigation_RequiredFallbackFault(t *testing.T) {
 	require.Len(t, checkResult(result), 1)
 	result.wgoLatencySelections[2] = 1
 	require.Empty(t, checkResult(result))
+}
+
+func TestInvestigation_RotatingLeaderOverStaleDiscovery(t *testing.T) {
+	t.Parallel()
+	var sc scenario
+	for _, candidate := range investigationScenarios() {
+		if candidate.name == "investigation: rotating leader over stale discovery" {
+			sc = candidate
+		}
+	}
+	require.NotEmpty(t, sc.name)
+	require.True(t, sc.requireCascadeContinuation)
+	brokers, _ := sc.topology()
+	require.EqualValues(t, rotatingAgents, brokers)
+	require.Equal(t, rotatingAgents, sc.profile.advertisedAgents)
+	assert.True(t, slices.IsSortedFunc(sc.transportPhases, func(a, b transportPhase) int { return cmp.Compare(a.at, b.at) }))
+
+	dead := map[int32]bool{}
+	var mostDead int
+	for _, phase := range sc.transportPhases {
+		dead[phase.nodeID] = phase.action == killPod
+		var count int
+		for _, isDead := range dead {
+			if isDead {
+				count++
+			}
+		}
+		mostDead = max(mostDead, count)
+	}
+	assert.Equal(t, rotatingAgents/5, mostDead)
+	for _, isDead := range dead {
+		assert.False(t, isDead, "every agent that left must return")
+	}
+
+	var named int
+	for _, phase := range sc.behaviourPhases {
+		require.NotEmpty(t, phase.behaviours.leaderPool)
+		if len(phase.behaviours.leaderPool) == 1 {
+			named++
+		}
+		for _, nodeID := range phase.behaviours.brokerOnlyMissing {
+			assert.Less(t, nodeID, int32(rotatingAgents))
+		}
+	}
+	assert.Equal(t, rotatingWaves, named)
 }

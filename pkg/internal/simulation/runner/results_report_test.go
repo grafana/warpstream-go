@@ -21,8 +21,8 @@ func TestResultsReport_GenerateJSON(t *testing.T) {
 	data, err := newResultsReport(results).generateJSON()
 	require.NoError(t, err)
 	assert.JSONEq(t, `[
-		{"scenario":"a","wgo":{"attempts":4,"passes":4},"kgo":{"attempts":4,"passes":0}},
-		{"scenario":"b","wgo":{"attempts":4,"passes":3},"kgo":{"attempts":4,"passes":1}}
+		{"scenario":"a","wgo":{"attempts":4,"passes":4},"kgo":{"attempts":4,"passes":0},"wgo_success_latency":{"mean_seconds":0,"p50_seconds":0,"p99_seconds":0}},
+		{"scenario":"b","wgo":{"attempts":4,"passes":3},"kgo":{"attempts":4,"passes":1},"wgo_success_latency":{"mean_seconds":0,"p50_seconds":0,"p99_seconds":0},"kgo_success_latency":{"mean_seconds":0,"p50_seconds":0,"p99_seconds":0}}
 	]`, string(data))
 
 	results.entries[0], results.entries[1] = results.entries[1], results.entries[0]

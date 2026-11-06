@@ -39,6 +39,15 @@ type brokersBehaviour struct {
 	missingBrokers     []int32
 	brokerOnlyMissing  []int32
 	topicMetadataDelay time.Duration
+
+	// leaderPool lists the agents a single-leader Metadata response may name as
+	// the leader of every partition, in rotation. Empty keeps the placement
+	// the profile configures.
+	leaderPool []int32
+
+	// metadataFailing makes every Metadata request fail, as when the discovery
+	// control plane is unhealthy, while Produce keeps working.
+	metadataFailing bool
 }
 
 // forBroker returns the behaviour for nodeID, and whether one is configured.
@@ -115,7 +124,7 @@ func newBrokersBehaviourProvider(initial brokersBehaviour) *brokersBehaviourProv
 // set swaps in a copy of b's map so a caller that keeps mutating its own map can't
 // race the concurrent produce paths reading the live behaviour.
 func (p *brokersBehaviourProvider) set(b brokersBehaviour) {
-	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers), brokerOnlyMissing: slices.Clone(b.brokerOnlyMissing), topicMetadataDelay: b.topicMetadataDelay})
+	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers), brokerOnlyMissing: slices.Clone(b.brokerOnlyMissing), topicMetadataDelay: b.topicMetadataDelay, leaderPool: slices.Clone(b.leaderPool), metadataFailing: b.metadataFailing})
 }
 
 func (p *brokersBehaviourProvider) get() brokersBehaviour {

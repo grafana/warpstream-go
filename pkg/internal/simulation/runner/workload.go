@@ -15,11 +15,14 @@ type Producer interface {
 }
 
 type WorkloadConfig struct {
-	Backend, Address, Topic                         string
-	Partitions                                      int32
-	SecondaryTopic                                  string
-	SecondaryPartitions                             int32
-	SeriesPerRequest                                int
+	Backend, Address, Topic string
+	Partitions              int32
+	SecondaryTopic          string
+	SecondaryPartitions     int32
+	SeriesPerRequest        int
+	// SplitWrites sends every series of an event as its own write, so a partly failed
+	// event still reports how many writes succeeded.
+	SplitWrites                                     bool
 	Prometheus                                      bool
 	EnforceProduceTimeout                           bool
 	RemoteTimeout, ArtificialDelay                  time.Duration
