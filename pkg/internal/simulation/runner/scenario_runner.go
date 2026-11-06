@@ -40,6 +40,14 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		return scenarioResult{}, fmt.Errorf("scenario %q warmup: %w", sc.name, err)
 	}
 
+	if sc.reorderSeedMetadata {
+		env.seedMetadata, err = env.prepareSeedMetadata(runCtx)
+		if err != nil {
+			return scenarioResult{}, err
+		}
+		defer env.seedMetadata.release()
+	}
+
 	// Sample the Hedger's primary/hedge counters at exact bucket boundaries,
 	// anchored at observedStart so the per-bucket deltas line up with the
 	// per-event observation buckets in the report.
@@ -90,10 +98,13 @@ func runScenario(ctx context.Context, sc scenario, factory WorkloadFactory) (sce
 		phaseDone <- err
 	}()
 	wgoObservations, kgoObservations, observedErr := observeWorkloads(runCtx, env, observedStart, sc.duration(), wgoEvents, kgoEvents)
-	stopPhases()
+	if !sc.reorderSeedMetadata {
+		stopPhases()
+	}
 	if err := <-phaseDone; err != nil {
 		return scenarioResult{}, fmt.Errorf("scenario %q transport phases: %w", sc.name, err)
 	}
+	stopPhases()
 	if observedErr != nil {
 		return scenarioResult{}, observedErr
 	}

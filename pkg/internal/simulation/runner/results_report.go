@@ -111,7 +111,7 @@ func (rr *resultsReport) generateMarkdown() string {
 		fmt.Fprintf(&b, "- **Event**: one simulated application write, issued every %s. Each event fans "+
 			"out one Produce record per partition (%d records/event, one per broker since partitions and "+
 			"brokers are 1:1) and is recorded as a single success/failure once every partition's record has "+
-			"settled or the %s app-request timeout has elapsed.\n\n", eventSpacing, clusterSize, appRequestTimeout)
+			"settled or the %s app-request timeout has elapsed.\n\n", spacing, partitions, appRequestTimeout)
 
 	}
 
@@ -155,9 +155,7 @@ func (rr *resultsReport) writeConfigSection(b *strings.Builder) {
 	fmt.Fprintf(b, "| Metadata refresh interval | %s |\n", clientMetadataRefresh)
 	b.WriteString("\n")
 
-	b.WriteString("wgo-only — this simulation's own values, shown against `pkg/wgo`'s library " +
-		"defaults for comparison (a value need not match its default; it's what this run actually " +
-		"used):\n\n")
+	b.WriteString("wgo-only — Mimir r416 production settings, shown against `pkg/wgo`'s library defaults:\n\n")
 	b.WriteString("| Setting | Value | pkg/wgo default |\n| --- | --- | --- |\n")
 	fmt.Fprintf(b, "| Hedger: min hedge delay | %s | %s |\n", wgoHedgerMinHedgeDelay, wgo.DefaultHedgerMinHedgeDelay)
 	fmt.Fprintf(b, "| Hedger: max hedge agents | %d | %d |\n", wgoHedgerMaxHedgeAgents, wgo.DefaultHedgerMaxHedgeAgents)

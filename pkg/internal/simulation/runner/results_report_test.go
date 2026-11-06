@@ -171,16 +171,12 @@ func TestResultsReport_GenerateMarkdown_DocumentsEventAndConfig(t *testing.T) {
 	assert.Contains(t, md, fmt.Sprintf("| Linger | %s |", clientLinger))
 	assert.Contains(t, md, "| Batch max bytes | 16,000,000 |")
 
-	assert.Contains(t, md, "wgo-only — this simulation's own values")
+	assert.Contains(t, md, "wgo-only — Mimir r416 production settings")
 	assert.Contains(t, md, "| Setting | Value | pkg/wgo default |")
-	// This simulation deliberately overrides two wgo defaults: it hedges later
-	// (1s vs. the library's 500ms) and flags an agent faulty sooner (5% vs.
-	// 20%). Pin both sides so a formatting bug, or an accidental value change,
-	// fails the test rather than silently misreporting either number.
 	assert.Contains(t, md, fmt.Sprintf("| Hedger: min hedge delay | %s | %s |", wgoHedgerMinHedgeDelay, wgo.DefaultHedgerMinHedgeDelay))
 	assert.Contains(t, md, fmt.Sprintf("| Hedger: max hedge agents | %d | %d |", wgoHedgerMaxHedgeAgents, wgo.DefaultHedgerMaxHedgeAgents))
 	assert.Contains(t, md, "| Health check: max slow fraction | 30% | 30% |")
-	assert.Contains(t, md, "| Health check: faulty threshold | 5% | 20% |")
+	assert.Contains(t, md, "| Health check: faulty threshold | 20% | 20% |")
 
 	assert.Contains(t, md, "kgo-only:")
 	assert.Contains(t, md, "| Partitioner | Manual")
