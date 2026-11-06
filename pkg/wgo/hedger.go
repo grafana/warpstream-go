@@ -88,8 +88,8 @@ func (s produceStop) exhausted() bool {
 // same batch of partitions. The whole "retry on a different agent,
 // possibly fire a hedge to race the primary, give up when
 // MaxHedgeAgents is reached" story lives here; the layer below
-// (TrackingProducer → KafkaDirectProducer) is a single per-attempt
-// produce with no retry of its own.
+// (TrackingProducer → KafkaDirectProducer) shares one per-attempt deadline,
+// including one same-agent retry if its broker connection dies.
 //
 // ProduceSync fires the primary leg and then waits for one of three outcomes:
 //

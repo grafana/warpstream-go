@@ -88,6 +88,16 @@ func (f scenarioFailure) String() string {
 func checkResult(res scenarioResult) []scenarioFailure {
 	var out []scenarioFailure
 	exp := res.sc.expect
+	if exp.maxPrimaryFailureCascades != nil {
+		if res.clientEvidence == nil {
+			out = append(out, scenarioFailure{scenario: res.sc.name, detail: "missing primary-failure cascade evidence"})
+		} else {
+			failed := res.clientEvidence.HedgeTriggers["primary_failure"]
+			if failed > *exp.maxPrimaryFailureCascades {
+				out = append(out, scenarioFailure{scenario: res.sc.name, detail: fmt.Sprintf("wgo had %d primary-failure cascades, above the %d ceiling", failed, *exp.maxPrimaryFailureCascades)})
+			}
+		}
+	}
 
 	if got := res.successRate(); got < exp.minWgoSuccessRate {
 		out = append(out, scenarioFailure{

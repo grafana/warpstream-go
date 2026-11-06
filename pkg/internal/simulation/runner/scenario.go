@@ -17,10 +17,11 @@ type scenarioExpectations struct {
 	// minWgoSuccessRate is the floor the wgo app-level success rate must
 	// clear. Always enforced; the zero value is a no-op floor every run
 	// passes.
-	minWgoSuccessRate float64
-	maxSenderLag      *time.Duration
-	recoveryFrom      *time.Duration
-	maxHedgeSurge     *float64
+	minWgoSuccessRate         float64
+	maxSenderLag              *time.Duration
+	recoveryFrom              *time.Duration
+	maxHedgeSurge             *float64
+	maxPrimaryFailureCascades *int64
 
 	// slowBudget and maxWgoSlowFraction together assert wgo's sub-timeout
 	// tail: at most maxWgoSlowFraction of wgo requests may take longer than
@@ -48,6 +49,7 @@ type scenarioExpectations struct {
 type scenario struct {
 	name                    string
 	observedFor             time.Duration
+	eventInterval           time.Duration
 	description             string
 	behaviours              brokersBehaviour
 	expect                  scenarioExpectations
@@ -88,6 +90,14 @@ func scenarios() []scenario {
 	}
 
 	return append([]scenario{
+		{
+			name:                  "rack metadata change",
+			eventInterval:         time.Second,
+			description:           "Metadata changes Rack once across the entire pool, then keeps the new Rack stable. Agent addresses and partition assignments stay fixed. Requests arrive once per second and Produce responses wait 750ms on the wire; every application write must succeed without primary-failure fallback cascades.",
+			behaviours:            changedRackBehaviours(),
+			collectClientEvidence: true,
+			expect:                scenarioExpectations{minWgoSuccessRate: 1, maxPrimaryFailureCascades: ptr(int64(0))},
+		},
 		{
 			name:        "all healthy",
 			description: "Every agent at healthy latency. Every record should succeed via the primary; no hedge fires.",

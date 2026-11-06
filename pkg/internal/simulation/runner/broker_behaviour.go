@@ -39,6 +39,8 @@ type brokersBehaviour struct {
 	missingBrokers     []int32
 	brokerOnlyMissing  []int32
 	topicMetadataDelay time.Duration
+	brokerRack         string
+	wireDelay          time.Duration
 }
 
 // forBroker returns the behaviour for nodeID, and whether one is configured.
@@ -115,7 +117,7 @@ func newBrokersBehaviourProvider(initial brokersBehaviour) *brokersBehaviourProv
 // set swaps in a copy of b's map so a caller that keeps mutating its own map can't
 // race the concurrent produce paths reading the live behaviour.
 func (p *brokersBehaviourProvider) set(b brokersBehaviour) {
-	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers), brokerOnlyMissing: slices.Clone(b.brokerOnlyMissing), topicMetadataDelay: b.topicMetadataDelay})
+	p.current.Store(&brokersBehaviour{byBroker: maps.Clone(b.byBroker), missingBrokers: slices.Clone(b.missingBrokers), brokerOnlyMissing: slices.Clone(b.brokerOnlyMissing), topicMetadataDelay: b.topicMetadataDelay, brokerRack: b.brokerRack, wireDelay: b.wireDelay})
 }
 
 func (p *brokersBehaviourProvider) get() brokersBehaviour {
@@ -129,6 +131,9 @@ func (p *brokersBehaviourProvider) get() brokersBehaviour {
 // by client, or 0 when the broker has no latency configured. It only draws; the
 // caller decides whether/how to sleep.
 func (p *brokersBehaviourProvider) nextLatencyFor(client clientType, nodeID int32) time.Duration {
+	if p.get().wireDelay > 0 {
+		return 0
+	}
 	b, ok := p.get().forBroker(nodeID)
 	if !ok || b.latencyFn == nil {
 		return 0

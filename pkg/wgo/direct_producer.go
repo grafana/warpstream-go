@@ -116,9 +116,18 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		}
 	}()
 
-	// Uses Broker.Request (not RetriableRequest) so franz-go's internal retry
-	// loop stays out of the way: retries are owned by the caller.
+	// Keep transport retries bounded so a broken agent still cascades promptly.
 	resp, err := s.client.Broker(int(target.NodeID)).Request(attemptCtx, req)
+	if isBrokerConnectionDeadErr(err) && attemptCtx.Err() == nil {
+		// Metadata can replace every broker at once on a rack-only change.
+		// Retry its current connection once without spending a hedge candidate.
+		reason := getProduceResultErr(err).reason
+		s.metrics.produceDirectRequestLatencyFailure.WithLabelValues(reason).Observe(time.Since(reqStart).Seconds())
+		s.metrics.produceDirectRequestsFailedTotal.WithLabelValues(reason, agentState).Inc()
+		s.metrics.produceDirectRequestsTotal.WithLabelValues(agentState).Inc()
+		reqStart = time.Now()
+		resp, err = s.client.Broker(int(target.NodeID)).Request(attemptCtx, req)
+	}
 
 	// Decode the response up front so the hook always observes the same
 	// typed value the caller would see.
@@ -144,4 +153,16 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 		return ProduceResult{err: &wireError{err: err}}
 	}
 	return ProduceResult{resp: pr}
+}
+
+// franz-go's connection-dead sentinel is unexported; match the pinned version's
+// text rather than retrying dial failures that should cascade to another agent.
+func isBrokerConnectionDeadErr(err error) bool {
+	for err != nil {
+		if err.Error() == "the broker connection has died and the request will be retried on a new connection" {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }

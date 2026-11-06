@@ -52,13 +52,14 @@ const (
 	// with context.DeadlineExceeded. Models a caller that won't wait forever.
 	appRequestTimeout = 5 * time.Second
 
-	// Shared settings keep the two clients comparable.
+	// Match deployment_tools Mimir r416 and its Mimir 86811cf6 client mapping.
+	// Keep the baseline on the same transport budgets.
 	clientLinger                 = 50 * time.Millisecond
 	clientBatchMaxBytes          = 16_000_000
 	clientMaxInflight            = 20
 	clientMetadataRefresh        = 10 * time.Second
-	clientDialTimeout            = 2 * time.Second
-	clientWriteTimeout           = 10 * time.Second
+	clientDialTimeout            = 500 * time.Millisecond
+	clientWriteTimeout           = 4 * time.Second
 	clientRequestTimeoutOverhead = 2 * time.Second
 	// wgo.Config requires WriteTimeout >= ProduceRequestTimeout + overhead, so
 	// derive the per-attempt produce timeout from the write budget rather than
@@ -71,9 +72,9 @@ const (
 	// simulation ran with alongside the shared client config above.
 	wgoHealthCheckSlowMultiplier    = 2.0
 	wgoHealthCheckMaxSlowFraction   = 0.3
-	wgoHealthCheckFaultyThreshold   = 0.05
+	wgoHealthCheckFaultyThreshold   = 0.2
 	wgoHealthCheckMaxFaultyFraction = 0.3
-	wgoHedgerMinHedgeDelay          = time.Second
+	wgoHedgerMinHedgeDelay          = 500 * time.Millisecond
 	wgoHedgerMaxHedgeAgents         = 3
 	wgoDemoterProbeInterval         = time.Second
 	wgoClusterStatsTTL              = time.Second
@@ -302,14 +303,17 @@ func (env *environment) Close() {
 }
 
 // installFailureControl installs the per-broker FAILURE-injection control
-// function on the kfake cluster. Latency is NOT applied here: kfake serializes
-// requests per broker, so cluster-side latency would cap per-broker throughput at
-// 1/latency. Latency is applied client-side via the latency hooks so kfake
-// responds instantly and broker parallelism is preserved.
+// function on the kfake cluster. Most scenarios delay responses in client hooks
+// to preserve broker parallelism. Wire-delay scenarios yield the control handler
+// so Metadata can interrupt an outstanding Produce request.
 func installFailureControl(cluster *kfake.Cluster, behaviours *brokersBehaviourProvider, client clientType) {
 	cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
 		cluster.KeepControl()
 		nodeID := cluster.CurrentNode()
+		if delay := behaviours.get().wireDelay; delay > 0 {
+			// Yield so Metadata can replace brokers before this response arrives.
+			cluster.SleepControl(func() { time.Sleep(delay) })
+		}
 		shouldFail := behaviours.nextFailureFor(client, nodeID)
 		preq := req.(*kmsg.ProduceRequest)
 		presp := preq.ResponseKind().(*kmsg.ProduceResponse)

@@ -52,6 +52,11 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 			}
 			response = metadataPreferredPlacement(response, preferred, count, retainedFallback)
 		}
+		if rack := behaviour.brokerRack; rack != "" {
+			for i := range response.Brokers {
+				response.Brokers[i].Rack = &rack
+			}
+		}
 		metadataRequest := req.(*kmsg.MetadataRequest)
 		if len(behaviour.brokerOnlyMissing) > 0 {
 			brokerOnly := metadataRequest.Topics != nil && len(metadataRequest.Topics) == 0
@@ -199,4 +204,11 @@ func metadataPreferredPlacement(template *kmsg.MetadataResponse, preferred int32
 		}
 	}
 	return &response
+}
+
+func changedRackBehaviours() brokersBehaviour {
+	b := healthyBehaviours()
+	b.brokerRack = "rollout-new"
+	b.wireDelay = 750 * time.Millisecond
+	return b
 }

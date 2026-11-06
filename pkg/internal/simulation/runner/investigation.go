@@ -33,6 +33,9 @@ func (sc scenario) topology() (int32, int32) {
 }
 
 func (sc scenario) spacing() time.Duration {
+	if sc.eventInterval > 0 {
+		return sc.eventInterval
+	}
 	if sc.profile != nil {
 		return sc.profile.spacing
 	}
@@ -41,7 +44,10 @@ func (sc scenario) spacing() time.Duration {
 
 func (sc scenario) healthyBehaviours() brokersBehaviour {
 	if sc.profile == nil {
-		return healthyBehaviours()
+		healthy := healthyBehaviours()
+		// Wire latency must stay constant so the observed phase isolates metadata.
+		healthy.wireDelay = sc.behaviours.wireDelay
+		return healthy
 	}
 	brokers, _ := sc.topology()
 	bh := brokersBehaviour{byBroker: make(map[int32]brokerBehaviour, brokers)}
