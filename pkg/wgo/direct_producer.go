@@ -157,8 +157,9 @@ func (s *KafkaDirectProducer) ProduceSync(ctx context.Context, target Agent, par
 	return ProduceResult{resp: pr}
 }
 
-// franz-go's connection-dead sentinel is unexported; match the pinned version's
-// text rather than retrying dial failures that should cascade to another agent.
+// TODO: Use errors.Is(err, kgo.ErrBrokerConnectionDead) once released and vendored:
+// https://github.com/twmb/franz-go/pull/1536
+// Until then, match the sentinel text so dial failures still take the fallback path.
 func isBrokerConnectionDeadErr(err error) bool {
 	for err != nil {
 		if err.Error() == "the broker connection has died and the request will be retried on a new connection" {
