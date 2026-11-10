@@ -266,7 +266,7 @@ func TestMetadata_StaleFallbackIsUnknownToTransport(t *testing.T) {
 		require.NoError(t, err)
 		behaviour := newBrokersBehaviourProvider(healthyBehaviours())
 		installFailureControl(cluster, behaviour, clientTypeWgo)
-		view := installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviour, true, false, -1)
+		view := installMetadataPlacementControl(cluster, raw.(*kmsg.MetadataResponse), behaviour, true, false, -1, 3)
 		pool := wgo.NewAgentPool(client)
 		_, err = pool.Refresh(t.Context())
 		require.NoError(t, err)
@@ -294,4 +294,28 @@ func TestMetadata_StaleFallbackIsUnknownToTransport(t *testing.T) {
 		view.mu.Unlock()
 		require.Positive(t, stale)
 	})
+}
+
+func TestMetadataView_NextLeader(t *testing.T) {
+	t.Parallel()
+	view := &metadataView{}
+	var got []int32
+	for range 5 {
+		got = append(got, view.nextLeader([]int32{4, 7}))
+	}
+	require.Equal(t, []int32{4, 7, 4, 7, 4}, got)
+}
+
+func TestMetadataPreferredPlacement_AdvertisesRequestedAgents(t *testing.T) {
+	t.Parallel()
+	template := &kmsg.MetadataResponse{}
+	for id := range int32(6) {
+		template.Brokers = append(template.Brokers, kmsg.MetadataResponseBroker{NodeID: id})
+	}
+	response := metadataPreferredPlacement(template, 4, 6, -1)
+	var ids []int32
+	for _, broker := range response.Brokers {
+		ids = append(ids, broker.NodeID)
+	}
+	require.Equal(t, []int32{4, 5, 0, 1, 2, 3}, ids)
 }

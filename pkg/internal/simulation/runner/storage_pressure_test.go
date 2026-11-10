@@ -20,9 +20,9 @@ func TestStoragePressure_Discovery(t *testing.T) {
 		require.Len(t, response.Brokers, 10)
 		require.Equal(t, preferred, response.Topics[0].Partitions[0].Leader)
 	}
-	_, err := profileScenarios("mimir-prometheus", false)
+	_, err := profileScenarios("mimir-prometheus", false, defaultRunID)
 	require.ErrorContains(t, err, "external workload")
-	selected, err := profileScenarios("mimir-prometheus", true)
+	selected, err := profileScenarios("mimir-prometheus", true, defaultRunID)
 	require.NoError(t, err)
 	require.Len(t, selected, 2)
 }

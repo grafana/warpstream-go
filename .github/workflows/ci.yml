@@ -211,12 +211,13 @@ jobs:
           SIMULATION_TIMEOUT: ${{ matrix.workload.timeout }}
           SIMULATION_BATCH: ${{ matrix.workload.batch }}
           SIMULATION_BATCHES: ${{ matrix.workload.batches }}
+          SIMULATION_RUN: ${{ matrix.run }}
           SIMULATION_BINARY: ${{ runner.temp }}/simulation-build/workload/${{ matrix.workload.name }}
         run: |
           mkdir -p "$RUNNER_TEMP/simulation-report"
           cp "$RUNNER_TEMP/simulation-build/provenance/"*.txt "$RUNNER_TEMP/simulation-report/"
           "$RUNNER_TEMP/simulation-build/harness" -timeout "$SIMULATION_TIMEOUT" -check=false \
-            -batch "$SIMULATION_BATCH" -batches "$SIMULATION_BATCHES" \
+            -batch "$SIMULATION_BATCH" -batches "$SIMULATION_BATCHES" -run-id "$SIMULATION_RUN" \
             -report-filepath "$RUNNER_TEMP/simulation-report/report.md" \
             -json-report-filepath "$RUNNER_TEMP/simulation-report/report.json"
       - name: Upload simulation report
