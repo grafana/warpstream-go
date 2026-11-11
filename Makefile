@@ -6,6 +6,12 @@ format:
 test:
 	go test -race ./...
 
+FUZZTIME ?= 1m
+
+.PHONY: fuzz
+fuzz:
+	go test ./pkg/wgo -run '^$$' -fuzz '^FuzzEncodeBatch_RoundTripsAndMatchesEstimate$$' -fuzztime $(FUZZTIME)
+
 .PHONY: lint
 lint:
 	CGO_ENABLED=0 golangci-lint run
