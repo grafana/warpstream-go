@@ -79,6 +79,18 @@ func newTestWarpstreamClient(t *testing.T, topic string, numPartitions int32, op
 	return c, cluster, clusterAddr, vnet
 }
 
+func TestProduceMaxVersions_CapsProduceAndApiVersions(t *testing.T) {
+	v := produceMaxVersions()
+
+	produce, ok := v.LookupMaxKeyVersion(kmsg.Produce.Int16())
+	require.True(t, ok)
+	assert.Equal(t, ProduceAPIVersion, produce)
+
+	apiVersions, ok := v.LookupMaxKeyVersion(kmsg.ApiVersions.Int16())
+	require.True(t, ok)
+	assert.LessOrEqual(t, apiVersions, maxApiVersionsAPIVersion)
+}
+
 func TestWarpstreamClient_ProduceSync(t *testing.T) {
 	const topic = "test-topic"
 

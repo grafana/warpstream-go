@@ -23,6 +23,13 @@ import (
 // which we do not need today.
 const ProduceAPIVersion int16 = 11
 
+// maxApiVersionsAPIVersion is the highest ApiVersions request version we
+// send. kgo issues ApiVersions before it can negotiate anything, so the
+// version is not downgraded to what the broker supports; Warpstream agents
+// close the connection on versions they cannot parse (v5, added with
+// franz-go v1.22, is one) instead of replying UNSUPPORTED_VERSION.
+const maxApiVersionsAPIVersion int16 = 4
+
 // WarpstreamClient is a produce-only Kafka client tailored to Warpstream's
 // stateless-agent architecture. It exists because franz-go's standard produce
 // path enforces vanilla Kafka's "Produce request must go to the partition
@@ -750,10 +757,12 @@ func newKgoClient(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kg
 // produceMaxVersions returns a kversion.Versions snapshot identical to
 // kgo's default kversion.Stable() except Produce is capped at
 // ProduceAPIVersion so kgo's per-request version negotiation can't
-// promote us past the wire format we generate and parse.
+// promote us past the wire format we generate and parse, and ApiVersions is
+// capped at maxApiVersionsAPIVersion.
 func produceMaxVersions() *kversion.Versions {
 	v := kversion.Stable()
 	v.SetMaxKeyVersion(kmsg.Produce.Int16(), ProduceAPIVersion)
+	v.SetMaxKeyVersion(kmsg.ApiVersions.Int16(), maxApiVersionsAPIVersion)
 	return v
 }
 
