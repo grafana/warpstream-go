@@ -38,13 +38,54 @@ func TestPrintSummary_PrintsMissedExpectationDetails(t *testing.T) {
 }
 
 func TestSelectScenarios_Filter(t *testing.T) {
-	selected, err := selectScenarios("^25% (dropped leaders|slow agents)$")
+	selected, err := selectScenarios("standard", "^25% (dropped leaders|slow agents)$", 1, 1, false)
 	require.NoError(t, err)
-	require.Len(t, selected, 2)
-	assert.Equal(t, "25% dropped leaders", selected[0].name)
-	assert.Equal(t, "25% slow agents", selected[1].name)
-	_, err = selectScenarios("not a scenario")
-	require.ErrorContains(t, err, "no scenarios match")
-	_, err = selectScenarios("[")
+	assert.Equal(t, []string{"25% dropped leaders", "25% slow agents"}, scenarioNames(selected))
+}
+
+func TestSelectScenarios_DefaultSelectsEveryScenario(t *testing.T) {
+	for _, tc := range []struct {
+		profile  string
+		external bool
+	}{{"standard", false}, {"all", true}} {
+		t.Run(tc.profile, func(t *testing.T) {
+			available, err := profileScenarios(tc.profile, tc.external)
+			require.NoError(t, err)
+			selected, err := selectScenarios(tc.profile, "", 1, 1, tc.external)
+			require.NoError(t, err)
+			assert.Equal(t, scenarioNames(available), scenarioNames(selected))
+		})
+	}
+}
+
+func TestSelectScenarios_InvalidPattern(t *testing.T) {
+	_, err := selectScenarios("standard", "[", 1, 1, false)
 	require.ErrorContains(t, err, "scenario filter")
+}
+
+func TestSelectScenarios_NoMatches(t *testing.T) {
+	_, err := selectScenarios("standard", "not a scenario", 1, 1, false)
+	require.ErrorContains(t, err, `no scenarios match "not a scenario"`)
+}
+
+func TestSelectScenarios_FiltersBeforeBatching(t *testing.T) {
+	available, err := profileScenarios("mimir-investigation", true)
+	require.NoError(t, err)
+	selected, err := selectScenarios("all", "^investigation: ", 2, 2, true)
+	require.NoError(t, err)
+	assert.Equal(t, []string{available[1].name, available[3].name}, scenarioNames(selected))
+}
+
+func TestPrintScenarioNames_OneNamePerLine(t *testing.T) {
+	var buf bytes.Buffer
+	printScenarioNames(&buf, []scenario{{name: "all healthy"}, {name: "25% slow agents"}})
+	assert.Equal(t, "all healthy\n25% slow agents\n", buf.String())
+}
+
+func scenarioNames(scs []scenario) []string {
+	names := make([]string, len(scs))
+	for i, sc := range scs {
+		names[i] = sc.name
+	}
+	return names
 }

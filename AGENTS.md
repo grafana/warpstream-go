@@ -34,6 +34,9 @@ This file holds repo-wide conventions. More specific instructions live in nested
 - `make lint` — runs the linters.
 - `make format` — formats the code to match what `make lint` checks. Run it
   before committing.
+- `make simulation` — runs every simulation scenario. See
+  [`pkg/internal/simulation/README.md`](pkg/internal/simulation/README.md) to
+  list scenarios or run a subset.
 
 ## Commits
 

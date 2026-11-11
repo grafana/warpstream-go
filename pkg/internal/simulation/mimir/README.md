@@ -77,7 +77,8 @@ this directory. CI supplies the same path through `SIMULATION_BINARY`.
 Use the pinned source and current client checkout for comparisons with CI.
 Reports identify the supplied binary's Go version and linked client version;
 the default builder source pin does not assert the source of a supplied binary.
-Use `-scenario` with a regular expression to rerun selected scenarios.
+Use `-list` to print the scenario names and `-scenario` with a regular expression to
+rerun selected scenarios; see [the simulation README](../README.md) for examples.
 Use `-batch 1 -batches 5` to run the first of five batches. Batches select every
 fifth scenario after filtering, spreading the investigation cases across runners.
 Run `go test -race ./...` here for proxy, remote-write and observer unit tests.
