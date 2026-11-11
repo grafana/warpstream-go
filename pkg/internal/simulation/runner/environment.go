@@ -402,7 +402,7 @@ func newWarpstreamClient(addr string, extra ...wgo.Opt) (*wgo.WarpstreamClient, 
 func newKgoClient(addr string, extra ...kgo.Opt) (*kgo.Client, error) {
 	// Cap Produce at the version wgo pins so request and response payloads carry
 	// the topic name on the wire, matching what the client emits.
-	v := kversion.Stable()
+	v := kversion.V4_2_0()
 	v.SetMaxKeyVersion(kmsg.Produce.Int16(), produceAPIVersion)
 
 	opts := []kgo.Opt{

@@ -754,13 +754,13 @@ func newKgoClient(cfg Config, logger kgo.Logger, reg prometheus.Registerer) (*kg
 	return kgo.NewClient(opts...)
 }
 
-// produceMaxVersions returns a kversion.Versions snapshot identical to
-// kgo's default kversion.Stable() except Produce is capped at
-// ProduceAPIVersion so kgo's per-request version negotiation can't
-// promote us past the wire format we generate and parse, and ApiVersions is
-// capped at maxApiVersionsAPIVersion.
+// produceMaxVersions returns the request versions of Kafka 4.2, with Produce
+// capped at ProduceAPIVersion so kgo's per-request version negotiation can't
+// promote us past the wire format we generate and parse, and ApiVersions
+// capped at maxApiVersionsAPIVersion. The table is a fixed Kafka release and
+// not kversion.Stable(), because Stable() changes with franz-go upgrades.
 func produceMaxVersions() *kversion.Versions {
-	v := kversion.Stable()
+	v := kversion.V4_2_0()
 	v.SetMaxKeyVersion(kmsg.Produce.Int16(), ProduceAPIVersion)
 	v.SetMaxKeyVersion(kmsg.ApiVersions.Int16(), maxApiVersionsAPIVersion)
 	return v
