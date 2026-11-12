@@ -70,6 +70,9 @@ func FuzzEncodeBatch_RoundTripsAndMatchesEstimate(f *testing.F) {
 		require.EqualValues(t, len(records)-1, rb.LastOffsetDelta)
 		require.Equal(t, records[0].Timestamp.UnixMilli(), rb.FirstTimestamp)
 		require.Equal(t, maxTimestampMillis(records), rb.MaxTimestamp)
+		for i, record := range decodeRecords(t, rb) {
+			require.EqualValues(t, i, record.OffsetDelta)
+		}
 
 		got := decodeBatch(encoded)
 		require.Equal(t, carriedFields(records), carriedFields(got))
