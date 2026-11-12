@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"net"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2148,6 +2150,22 @@ func TestWarpstreamClient_IdleClusterStats(t *testing.T) {
 	})
 }
 
+func TestWarpstreamClient_AgentAddressesGauge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reg := prometheus.NewPedanticRegistry()
+		vnet := &kfake.VirtualNetwork{}
+		_, clusterAddr := testkafka.CreateCluster(t, 1, "test-topic", testkafka.WithVirtualNetwork(vnet))
+		c, err := NewWarpstreamClient(nil, reg, append(testWarpstreamOpts(clusterAddr, "test-topic"), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		agents := float64(len(c.pool.Agents()))
+		require.Positive(t, agents)
+		assert.Equal(t, agents, testutil.ToFloat64(c.metrics.agentPoolAgentsUnique))
+		assert.Equal(t, float64(0), testutil.ToFloat64(c.metrics.agentPoolAgentsShared))
+	})
+}
+
 func TestWarpstreamClient_NoteLeaderDrops(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	c := &WarpstreamClient{
@@ -2190,6 +2208,295 @@ func TestWarpstreamClient_NoteLeaderDrops(t *testing.T) {
 		t.Fatal("clean refresh nudged")
 	default:
 	}
+}
+
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []loggedLine
+}
+
+type loggedLine struct {
+	msg     string
+	keyvals []any
+}
+
+func (l *recordingLogger) Level() kgo.LogLevel { return kgo.LogLevelWarn }
+
+func (l *recordingLogger) Log(_ kgo.LogLevel, msg string, keyvals ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, loggedLine{msg: msg, keyvals: keyvals})
+}
+
+func (l *recordingLogger) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.lines)
+}
+
+func (l *recordingLogger) countMsg(msg string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, line := range l.lines {
+		if line.msg == msg {
+			n++
+		}
+	}
+	return n
+}
+
+func (l *recordingLogger) last() loggedLine {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lines[len(l.lines)-1]
+}
+
+func TestWarpstreamClient_NoteAgentAddresses(t *testing.T) {
+	lb := brokerAddress{host: "agents.svc.cluster.local.", port: 9092}
+	shared := func(agents, sharedAgents int) addressStats {
+		s := addressStats{agents: agents, shared: sharedAgents, addresses: agents - sharedAgents + 1}
+		if sharedAgents > 0 {
+			s.top, s.topAgents = lb, sharedAgents
+		}
+		return s
+	}
+
+	newClient := func(cur addressStats) (*WarpstreamClient, *recordingLogger) {
+		logger := &recordingLogger{}
+		pool := &AgentPool{}
+		pool.state.Store(&poolState{addresses: cur})
+		return &WarpstreamClient{
+			logger:  logger,
+			metrics: newMetrics(prometheus.NewRegistry()),
+			pool:    pool,
+		}, logger
+	}
+	split := func(t *testing.T, c *WarpstreamClient) (unique, shared float64) {
+		t.Helper()
+		return testutil.ToFloat64(c.metrics.agentPoolAgentsUnique), testutil.ToFloat64(c.metrics.agentPoolAgentsShared)
+	}
+
+	t.Run("nothing shared never logs and publishes the split", func(t *testing.T) {
+		c, logger := newClient(addressStats{agents: 5, addresses: 5})
+		c.noteAgentAddresses(addressStats{}, true)
+		assert.Zero(t, logger.count())
+		unique, sharedAgents := split(t, c)
+		assert.Equal(t, float64(5), unique)
+		assert.Equal(t, float64(0), sharedAgents)
+	})
+
+	t.Run("constructor logs a shared start", func(t *testing.T) {
+		c, logger := newClient(shared(10, 10))
+		c.noteAgentAddresses(addressStats{}, false)
+		require.Equal(t, 1, logger.count())
+		line := logger.last()
+		assert.Equal(t, "warpstream agentpool: agents share an address", line.msg)
+		assert.Equal(t, []any{
+			"agents", 10,
+			"agents_sharing_address", 10,
+			"distinct_addresses", 1,
+			"top_shared_address", "agents.svc.cluster.local.:9092",
+			"top_shared_address_agents", 10,
+		}, line.keyvals)
+		unique, sharedAgents := split(t, c)
+		assert.Equal(t, float64(0), unique)
+		assert.Equal(t, float64(10), sharedAgents)
+	})
+
+	t.Run("unchanged refresh with the same shared count does not log", func(t *testing.T) {
+		c, logger := newClient(shared(10, 10))
+		c.noteAgentAddresses(shared(10, 10), false)
+		assert.Zero(t, logger.count())
+		_, sharedAgents := split(t, c)
+		assert.Equal(t, float64(10), sharedAgents)
+	})
+
+	t.Run("membership change logs even when the shared count is the same", func(t *testing.T) {
+		c, logger := newClient(shared(10, 10))
+		c.noteAgentAddresses(shared(10, 10), true)
+		assert.Equal(t, 1, logger.count())
+	})
+
+	t.Run("same shared count but the shared address moved logs", func(t *testing.T) {
+		moved := shared(10, 2)
+		moved.top = brokerAddress{host: "other.svc.cluster.local.", port: 9092}
+		c, logger := newClient(moved)
+		c.noteAgentAddresses(shared(10, 2), false)
+		assert.Equal(t, 1, logger.count())
+	})
+
+	t.Run("same NodeIDs but the shared count moved logs", func(t *testing.T) {
+		c, logger := newClient(shared(10, 2))
+		c.noteAgentAddresses(addressStats{agents: 10, addresses: 10}, false)
+		assert.Equal(t, 1, logger.count())
+	})
+
+	t.Run("sharing that clears does not log and zeroes the gauge", func(t *testing.T) {
+		c, logger := newClient(addressStats{agents: 10, addresses: 10})
+		c.noteAgentAddresses(shared(10, 10), true)
+		assert.Zero(t, logger.count())
+		unique, sharedAgents := split(t, c)
+		assert.Equal(t, float64(10), unique)
+		assert.Equal(t, float64(0), sharedAgents)
+	})
+
+	t.Run("a flap logs each time sharing appears", func(t *testing.T) {
+		c, logger := newClient(shared(10, 2))
+		c.noteAgentAddresses(addressStats{agents: 10, addresses: 10}, false)
+		c.pool.state.Store(&poolState{addresses: addressStats{agents: 10, addresses: 10}})
+		c.noteAgentAddresses(shared(10, 2), false)
+		c.pool.state.Store(&poolState{addresses: shared(10, 2)})
+		c.noteAgentAddresses(addressStats{agents: 10, addresses: 10}, false)
+		assert.Equal(t, 2, logger.count())
+	})
+}
+
+// TestWarpstreamClient_SharedAddressesThroughRefresh serves Metadata that
+// advertises the same Host and Port for several NodeIDs and drives the
+// constructor and the periodic refresh, so the real refreshPool wiring decides
+// what is logged and published.
+func TestWarpstreamClient_SharedAddressesThroughRefresh(t *testing.T) {
+	const (
+		topic   = "test-topic"
+		logMsg  = "warpstream agentpool: agents share an address"
+		refresh = 10 * time.Second
+	)
+
+	synctest.Test(t, func(t *testing.T) {
+		vnet := &kfake.VirtualNetwork{}
+		cluster, clusterAddr := testkafka.CreateCluster(t, 1, topic, testkafka.WithVirtualNetwork(vnet), testkafka.WithNumBrokers(3))
+
+		var real []brokerAddress
+		for _, addr := range cluster.ListenAddrs() {
+			host, portStr, err := net.SplitHostPort(addr)
+			require.NoError(t, err)
+			port, err := strconv.Atoi(portStr)
+			require.NoError(t, err)
+			real = append(real, brokerAddress{host: host, port: int32(port)})
+		}
+		require.Len(t, real, 3)
+		a, b, d := real[0], real[1], real[2]
+
+		type advertised struct {
+			node int32
+			addr brokerAddress
+		}
+		var (
+			current atomic.Pointer[[]advertised]
+			failing atomic.Bool
+		)
+		serve := func(brokers ...advertised) { current.Store(&brokers) }
+		serve(advertised{0, a}, advertised{1, a})
+
+		topicID := [16]byte{1}
+		cluster.ControlKey(int16(kmsg.Metadata), func(req kmsg.Request) (kmsg.Response, error, bool) {
+			cluster.KeepControl()
+			resp := req.ResponseKind().(*kmsg.MetadataResponse)
+			resp.Version = req.GetVersion()
+			if failing.Load() {
+				// A response error fails the fetch in one round trip. Closing the
+				// connection instead makes kgo retry with backoff, and the refresh
+				// would still be in flight when the test asserts.
+				resp.ErrorCode = kerr.UnknownServerError.Code
+				return resp, nil, true
+			}
+			for _, br := range *current.Load() {
+				resp.Brokers = append(resp.Brokers, kmsg.MetadataResponseBroker{NodeID: br.node, Host: br.addr.host, Port: br.addr.port})
+			}
+			name := topic
+			resp.Topics = []kmsg.MetadataResponseTopic{{
+				Topic:   &name,
+				TopicID: topicID,
+				Partitions: []kmsg.MetadataResponseTopicPartition{{
+					Partition: 0, Leader: 0, Replicas: []int32{0}, ISR: []int32{0},
+				}},
+			}}
+			return resp, nil, true
+		})
+
+		logger := &recordingLogger{}
+		reg := prometheus.NewPedanticRegistry()
+		c, err := NewWarpstreamClient(logger, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+		require.NoError(t, err)
+		t.Cleanup(c.Close)
+
+		split := func() (unique, shared float64) {
+			return testutil.ToFloat64(c.metrics.agentPoolAgentsUnique), testutil.ToFloat64(c.metrics.agentPoolAgentsShared)
+		}
+		refreshOnce := func() {
+			time.Sleep(refresh)
+			synctest.Wait()
+		}
+		lastField := func(key string) any {
+			kv := logger.last().keyvals
+			for i := 0; i+1 < len(kv); i += 2 {
+				if kv[i] == key {
+					return kv[i+1]
+				}
+			}
+			t.Fatalf("log field %q not found", key)
+			return nil
+		}
+
+		// The constructor sees two NodeIDs on one address and logs at startup.
+		assert.Equal(t, 1, logger.countMsg(logMsg))
+		unique, shared := split()
+		assert.Equal(t, float64(0), unique)
+		assert.Equal(t, float64(2), shared)
+		assert.Equal(t, 2, lastField("agents_sharing_address"))
+		assert.Equal(t, a.String(), lastField("top_shared_address"))
+
+		// An unchanged refresh stays quiet while the pool is still shared.
+		refreshOnce()
+		assert.Equal(t, 1, logger.countMsg(logMsg))
+
+		// A third NodeID joining the shared address is a membership change.
+		serve(advertised{0, a}, advertised{1, a}, advertised{2, a})
+		refreshOnce()
+		assert.Equal(t, 2, logger.countMsg(logMsg))
+		assert.Equal(t, 3, lastField("agents_sharing_address"))
+
+		// Same NodeIDs, one moved to another address: no membership change, but
+		// the shared count dropped from 3 to 2, so it logs.
+		serve(advertised{0, a}, advertised{1, b}, advertised{2, a})
+		refreshOnce()
+		assert.Equal(t, 3, logger.countMsg(logMsg))
+		assert.Equal(t, 2, lastField("agents_sharing_address"))
+
+		// A failed refresh keeps the previous gauge values and logs nothing.
+		failing.Store(true)
+		refreshOnce()
+		// The previous step moved a broker's address, so kgo's first attempt can hit
+		// a connection that just died and retry after a short backoff (seen in
+		// kgo's debug log). kgo stops after 3 tries with jittered backoff, about 2.1s
+		// at most, so 3s covers it. The failed counter below proves the refresh ended.
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		// The refresh has finished and failed, so the gauges below are the kept values.
+		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+			string(metadataRefreshTriggerPeriodic), metadataRefreshResultFailed)))
+		failing.Store(false)
+		unique, shared = split()
+		assert.Equal(t, float64(1), unique)
+		assert.Equal(t, float64(2), shared)
+		assert.Equal(t, 3, logger.countMsg(logMsg))
+
+		// The shared pair moves together to another address: same NodeIDs and
+		// the same shared count, but the logged address would be stale.
+		serve(advertised{0, d}, advertised{1, b}, advertised{2, d})
+		refreshOnce()
+		assert.Equal(t, 4, logger.countMsg(logMsg))
+		assert.Equal(t, d.String(), lastField("top_shared_address"))
+
+		// Everyone gets their own address: the gauge clears and nothing logs.
+		serve(advertised{0, a}, advertised{1, b}, advertised{2, d})
+		refreshOnce()
+		unique, shared = split()
+		assert.Equal(t, float64(3), unique)
+		assert.Equal(t, float64(0), shared)
+		assert.Equal(t, 4, logger.countMsg(logMsg))
+	})
 }
 
 func TestWarpstreamClient_WaitRefreshCooldown(t *testing.T) {

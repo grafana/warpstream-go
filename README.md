@@ -53,6 +53,8 @@ A partition's leader can briefly go missing from that map during a Metadata refr
 
 `Produce` rejects only the record whose partition has no candidate. `ProduceSync` does the same within one call: a partition with a candidate is buffered and the call waits for it, and a partition with no candidate is rejected on its own and is not sent. That rejection does not fail the other records.
 
+Candidates are keyed by NodeID and assume each NodeID is its own agent. If Metadata reports several NodeIDs on the same Host and Port (for example one load-balanced hostname), hedges to different NodeIDs may reach the same agent. Routing is unchanged; the client reports it with `warpstream_agentpool_agents{agent_address="unique|shared"}` and a warning when the shared-address picture changes. Addresses are compared exactly as Metadata reports them, with no DNS lookup.
+
 ### Buffering: linger by destination agent, not by partition
 
 Records are buffered through a `ClusterRecordBuffer`, which bins them by the destination agent picked at routing time, then through a per-agent `AgentRecordBuffer`, which applies a configurable linger window before flushing. Each flush ships one Produce request to one agent carrying batches for as many partitions as the buffer accumulated.
