@@ -29,21 +29,16 @@ func Main(factory WorkloadFactory) {
 	batch := flag.Int("batch", 1, "one-based scenario batch to run")
 	batches := flag.Int("batches", 1, "number of batches to split the selected scenarios across")
 	check := flag.Bool("check", true, "exit unsuccessfully when a scenario misses an expectation")
+	list := flag.Bool("list", false, "print the names of the scenarios the other flags select, then exit without running them")
 	flag.Parse()
-	available, err := profileScenarios(*profile, factory != nil)
+	selected, err := selectScenarios(*profile, *pattern, *batch, *batches, factory != nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	selected, err := filterScenarios(*pattern, available)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	selected, err = batchScenarios(selected, *batch, *batches)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if *list {
+		printScenarioNames(os.Stdout, selected)
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -89,8 +84,18 @@ func Main(factory WorkloadFactory) {
 	fmt.Println("\nPASS: all scenarios met their expectations.")
 }
 
-func selectScenarios(pattern string) ([]scenario, error) {
-	return filterScenarios(pattern, scenarios())
+// selectScenarios applies -profile, then -scenario, then -batch/-batches, so
+// -list prints exactly the scenarios a run with the same flags executes.
+func selectScenarios(profile, pattern string, batch, batches int, external bool) ([]scenario, error) {
+	available, err := profileScenarios(profile, external)
+	if err != nil {
+		return nil, err
+	}
+	selected, err := filterScenarios(pattern, available)
+	if err != nil {
+		return nil, err
+	}
+	return batchScenarios(selected, batch, batches)
 }
 
 func filterScenarios(pattern string, available []scenario) ([]scenario, error) {
@@ -105,9 +110,15 @@ func filterScenarios(pattern string, available []scenario) ([]scenario, error) {
 		}
 	}
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("no scenarios match %q", pattern)
+		return nil, fmt.Errorf("no scenarios match %q; run with -list and without -scenario to print the scenario names", pattern)
 	}
 	return selected, nil
+}
+
+func printScenarioNames(w io.Writer, scs []scenario) {
+	for _, sc := range scs {
+		fmt.Fprintln(w, sc.name)
+	}
 }
 
 func batchScenarios(available []scenario, batch, batches int) ([]scenario, error) {
