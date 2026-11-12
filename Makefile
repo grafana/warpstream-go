@@ -8,9 +8,16 @@ test:
 
 FUZZTIME ?= 1m
 
+# Go fuzzes one test per run, so this runs every Fuzz test in turn, each for FUZZTIME.
 .PHONY: fuzz
 fuzz:
-	go test ./pkg/wgo -run '^$$' -fuzz '^FuzzEncodeBatch_RoundTripsAndMatchesEstimate$$' -fuzztime $(FUZZTIME)
+	@set -e; for pkg in $$(go list ./...); do \
+		tests=$$(go test -list '^Fuzz' "$$pkg"); \
+		for name in $$(echo "$$tests" | grep '^Fuzz' || true); do \
+			echo "fuzzing $$pkg $$name"; \
+			go test "$$pkg" -run '^$$' -fuzz "^$$name$$" -fuzztime $(FUZZTIME); \
+		done; \
+	done
 
 .PHONY: lint
 lint:

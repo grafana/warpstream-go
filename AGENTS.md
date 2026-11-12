@@ -31,9 +31,10 @@ This file holds repo-wide conventions. More specific instructions live in nested
 ## Common commands
 
 - `make test` — runs the unit tests with the race detector.
-- `make fuzz` — fuzzes batch encoding for `FUZZTIME` (default `1m`), e.g.
-  `make fuzz FUZZTIME=10m`. Go saves a failing input under
-  `pkg/wgo/testdata/fuzz/`; commit it with the fix so `make test` replays it.
+- `make fuzz` — runs every fuzz test for `FUZZTIME` each (default `1m`), e.g.
+  `make fuzz FUZZTIME=10m`. CI runs it on every pull request. Go saves a
+  failing input under the package's `testdata/fuzz/`; commit it with the fix
+  so `make test` replays it.
 - `make lint` — runs the linters.
 - `make format` — formats the code to match what `make lint` checks. Run it
   before committing.
