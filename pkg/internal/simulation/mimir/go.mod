@@ -107,7 +107,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
@@ -117,7 +117,7 @@ require (
 
 replace github.com/grafana/warpstream-go => ../../../..
 
-replace github.com/prometheus/alertmanager => github.com/prometheus/alertmanager v0.34.1
+replace github.com/prometheus/alertmanager => github.com/prometheus/alertmanager v0.35.0
 
 replace github.com/prometheus/prometheus => github.com/grafana/mimir-prometheus v1.8.2-0.20261007153231-4582b0c28e5d
 
