@@ -119,7 +119,7 @@ replace github.com/grafana/warpstream-go => ../../../..
 
 replace github.com/prometheus/alertmanager => github.com/prometheus/alertmanager v0.34.1
 
-replace github.com/prometheus/prometheus => github.com/grafana/mimir-prometheus v1.8.2-0.20261007153231-4582b0c28e5d
+replace github.com/prometheus/prometheus => github.com/grafana/mimir-prometheus/v3 v3.14.0-rc.0
 
 replace github.com/hashicorp/memberlist => github.com/grafana/memberlist v0.3.1-0.20260921102813-8c522db348af
 
