@@ -6,7 +6,7 @@ require (
 	github.com/go-kit/log v0.2.1
 	github.com/golang/snappy v1.0.0
 	github.com/grafana/dskit v0.0.0-20261012114055-366c7d7ae28a
-	github.com/grafana/warpstream-go v0.1.4
+	github.com/grafana/warpstream-go v0.2.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v0.72.1
@@ -107,7 +107,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
