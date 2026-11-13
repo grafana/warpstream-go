@@ -52,13 +52,14 @@ const (
 	// with context.DeadlineExceeded. Models a caller that won't wait forever.
 	appRequestTimeout = 5 * time.Second
 
-	// Shared settings keep the two clients comparable.
+	// Match deployment_tools Mimir r416 and its Mimir 86811cf6 client mapping.
+	// Keep the baseline on the same transport budgets.
 	clientLinger                 = 50 * time.Millisecond
 	clientBatchMaxBytes          = 16_000_000
 	clientMaxInflight            = 20
 	clientMetadataRefresh        = 10 * time.Second
-	clientDialTimeout            = 2 * time.Second
-	clientWriteTimeout           = 10 * time.Second
+	clientDialTimeout            = 500 * time.Millisecond
+	clientWriteTimeout           = 4 * time.Second
 	clientRequestTimeoutOverhead = 2 * time.Second
 	// wgo.Config requires WriteTimeout >= ProduceRequestTimeout + overhead, so
 	// derive the per-attempt produce timeout from the write budget rather than
@@ -71,9 +72,9 @@ const (
 	// simulation ran with alongside the shared client config above.
 	wgoHealthCheckSlowMultiplier    = 2.0
 	wgoHealthCheckMaxSlowFraction   = 0.3
-	wgoHealthCheckFaultyThreshold   = 0.05
+	wgoHealthCheckFaultyThreshold   = 0.2
 	wgoHealthCheckMaxFaultyFraction = 0.3
-	wgoHedgerMinHedgeDelay          = time.Second
+	wgoHedgerMinHedgeDelay          = 500 * time.Millisecond
 	wgoHedgerMaxHedgeAgents         = 3
 	wgoDemoterProbeInterval         = time.Second
 	wgoClusterStatsTTL              = time.Second
@@ -86,8 +87,10 @@ type produceClient = Producer
 // broker capacity. Each cluster is configured identically (same broker count,
 // same per-broker behaviour overrides) so the comparison stays apples-to-apples.
 type environment struct {
-	topic         string
-	numPartitions int32
+	wgoMetadataSource, kgoMetadataSource *metadataRequestSource
+	seedMetadata                         *seedMetadataReordering
+	topic                                string
+	numPartitions                        int32
 
 	wgoCluster  *kfake.Cluster
 	wgoClient   produceClient
@@ -209,9 +212,17 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	}
 	wgoRegistry := prometheus.NewPedanticRegistry()
 	var wgoClient produceClient
+	var wgoMetadataSource, kgoMetadataSource *metadataRequestSource
 	if factory == nil {
 		var raw *wgo.WarpstreamClient
-		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, wgo.WithDialer(wgoNetwork.DialContext))
+		var extra []wgo.Opt
+		var source *metadataRequestSource
+		if sc.reorderSeedMetadata {
+			source = &metadataRequestSource{}
+			extra = append(extra, wgo.WithHooks(source))
+		}
+		raw, wgoRegistry, err = newWarpstreamClient(wsAddr, append(extra, wgo.WithDialer(wgoNetwork.DialContext))...)
+		wgoMetadataSource = source
 		if err == nil {
 			raw.SetTestProduceResponseHook(func(ctx context.Context, nodeID int32, response *kmsg.ProduceResponse, hookErr error) {
 				beh.nextLatencySleepFor(ctx, clientTypeWgo, nodeID)
@@ -265,7 +276,12 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	var kgoClient produceClient
 	if factory == nil {
 		var inner *kgo.Client
-		inner, err = newKgoClient(kgoAddr, kgo.Dialer(kgoNetwork.DialContext))
+		var extra []kgo.Opt
+		if sc.reorderSeedMetadata {
+			kgoMetadataSource = &metadataRequestSource{}
+			extra = append(extra, kgo.WithHooks(kgoMetadataSource))
+		}
+		inner, err = newKgoClient(kgoAddr, append(extra, kgo.Dialer(kgoNetwork.DialContext))...)
 		if err == nil {
 			kgoClient = &latencyDelayedKgoClient{Client: inner, behaviours: beh, client: clientTypeKgo}
 		}
@@ -278,7 +294,8 @@ func newScenarioEnvironment(initial brokersBehaviour, factory WorkloadFactory, s
 	clients = append(clients, kgoClient)
 
 	return &environment{
-		topic:         topicName,
+		topic:             topicName,
+		wgoMetadataSource: wgoMetadataSource, kgoMetadataSource: kgoMetadataSource,
 		numPartitions: partitions,
 		wgoCluster:    wgoCluster,
 		wgoClient:     wgoClient,
@@ -302,14 +319,17 @@ func (env *environment) Close() {
 }
 
 // installFailureControl installs the per-broker FAILURE-injection control
-// function on the kfake cluster. Latency is NOT applied here: kfake serializes
-// requests per broker, so cluster-side latency would cap per-broker throughput at
-// 1/latency. Latency is applied client-side via the latency hooks so kfake
-// responds instantly and broker parallelism is preserved.
+// function on the kfake cluster. Most scenarios delay responses in client hooks
+// to preserve broker parallelism. Wire-delay scenarios yield the control handler
+// so Metadata can interrupt an outstanding Produce request.
 func installFailureControl(cluster *kfake.Cluster, behaviours *brokersBehaviourProvider, client clientType) {
 	cluster.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
 		cluster.KeepControl()
 		nodeID := cluster.CurrentNode()
+		if delay := behaviours.get().wireDelay; delay > 0 {
+			// Yield so Metadata can replace brokers before this response arrives.
+			cluster.SleepControl(func() { time.Sleep(delay) })
+		}
 		shouldFail := behaviours.nextFailureFor(client, nodeID)
 		preq := req.(*kmsg.ProduceRequest)
 		presp := preq.ResponseKind().(*kmsg.ProduceResponse)

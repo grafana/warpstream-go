@@ -158,3 +158,13 @@ func TestScenarioResults_RecoveryBudgetIsReported(t *testing.T) {
 	result.sc.expect.slowBudget = nil
 	assert.Empty(t, checkResult(result))
 }
+
+func TestScenarioResults_PrimaryFailureCascades(t *testing.T) {
+	t.Parallel()
+	result := scenarioResult{sc: scenario{name: "rack changes", expect: scenarioExpectations{maxPrimaryFailureCascades: ptr(int64(0))}}}
+	require.Len(t, checkResult(result), 1)
+	result.clientEvidence = &clientEvidence{HedgeTriggers: map[string]int64{"latency": 5}}
+	assert.Empty(t, checkResult(result))
+	result.clientEvidence.HedgeTriggers["primary_failure"] = 1
+	require.Len(t, checkResult(result), 1)
+}
