@@ -28,7 +28,7 @@
             "matchPackageNames": [
                 "github.com/twmb/franz-go"
             ],
-            "allowedVersions": "<=1.21.6"
+            "allowedVersions": "<=1.21.7"
         },
         {
             "description": "kfake digest bumps pull franz-go forward (#112), hold them too",

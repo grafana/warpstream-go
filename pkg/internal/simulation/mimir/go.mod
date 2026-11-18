@@ -12,8 +12,8 @@ require (
 	github.com/prometheus/common v0.72.1
 	github.com/prometheus/prometheus v1.99.0
 	github.com/stretchr/testify v1.12.1
-	github.com/twmb/franz-go v1.22.1
-	github.com/twmb/franz-go/pkg/kmsg v1.15.0
+	github.com/twmb/franz-go v1.21.7
+	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	go.yaml.in/yaml/v3 v3.0.5
 	google.golang.org/protobuf v1.36.12
 )
@@ -70,7 +70,7 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/twmb/franz-go/pkg/kadm v1.18.1-0.20260529212035-11b03a277c72 // indirect
-	github.com/twmb/franz-go/pkg/kfake v0.0.0-20261013022759-7b6cac30a57a // indirect
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260820024614-9b174ed31afe // indirect
 	github.com/twmb/franz-go/plugin/kprom v1.5.0 // indirect
 	github.com/uber/jaeger-client-go v2.30.0+incompatible // indirect
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
@@ -107,7 +107,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
@@ -130,3 +130,5 @@ replace github.com/grafana/regexp => github.com/grafana/regexp v0.0.0-2025090510
 replace github.com/munnerz/goautoneg => github.com/grafana/goautoneg v0.0.0-20240607115440-f335c04c58ce
 
 replace github.com/prometheus/otlptranslator => github.com/grafana/mimir-otlptranslator v0.0.0-20251017074411-ea1e8f863e1d
+
+replace github.com/twmb/franz-go => github.com/twmb/franz-go v1.21.7
