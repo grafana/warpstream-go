@@ -2354,13 +2354,12 @@ func TestWarpstreamClient_NoteAgentAddresses(t *testing.T) {
 
 // TestWarpstreamClient_SharedAddressesThroughRefresh serves Metadata that
 // advertises the same Host and Port for several NodeIDs and drives the
-// constructor and the periodic refresh, so the real refreshPool wiring decides
-// what is logged and published.
+// constructor and refreshPool, so the real refresh wiring decides what is
+// logged and published.
 func TestWarpstreamClient_SharedAddressesThroughRefresh(t *testing.T) {
 	const (
-		topic   = "test-topic"
-		logMsg  = "warpstream agentpool: agents share an address"
-		refresh = 10 * time.Second
+		topic  = "test-topic"
+		logMsg = "warpstream agentpool: agents share an address"
 	)
 
 	synctest.Test(t, func(t *testing.T) {
@@ -2395,9 +2394,8 @@ func TestWarpstreamClient_SharedAddressesThroughRefresh(t *testing.T) {
 			resp := req.ResponseKind().(*kmsg.MetadataResponse)
 			resp.Version = req.GetVersion()
 			if failing.Load() {
-				// A response error fails the fetch in one round trip. Closing the
-				// connection instead makes kgo retry with backoff, and the refresh
-				// would still be in flight when the test asserts.
+				// A response error fails this one fetch. Closing the connection
+				// instead makes kgo retry, so the step would not be one failure.
 				resp.ErrorCode = kerr.UnknownServerError.Code
 				return resp, nil, true
 			}
@@ -2417,16 +2415,33 @@ func TestWarpstreamClient_SharedAddressesThroughRefresh(t *testing.T) {
 
 		logger := &recordingLogger{}
 		reg := prometheus.NewPedanticRegistry()
-		c, err := NewWarpstreamClient(logger, reg, append(testWarpstreamOpts(clusterAddr, topic), WithDialer(vnet.DialContext))...)
+		// The ticker and kgo's metadata loop share this interval and fire together
+		// in fake time, so kgo closes the connection under the refresh. An hour
+		// keeps both blocked; each step calls refreshPool, the function the ticker runs.
+		c, err := NewWarpstreamClient(logger, reg, append(testWarpstreamOpts(clusterAddr, topic),
+			WithDialer(vnet.DialContext),
+			WithMetadataRefreshInterval(time.Hour),
+		)...)
 		require.NoError(t, err)
 		t.Cleanup(c.Close)
 
 		split := func() (unique, shared float64) {
 			return testutil.ToFloat64(c.metrics.agentPoolAgentsUnique), testutil.ToFloat64(c.metrics.agentPoolAgentsShared)
 		}
+		failedRefreshes := func() float64 {
+			return testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
+				string(metadataRefreshTriggerPeriodic), metadataRefreshResultFailed))
+		}
 		refreshOnce := func() {
-			time.Sleep(refresh)
-			synctest.Wait()
+			before := failedRefreshes()
+			// RequestCachedMetadata serves a cache younger than a nanosecond.
+			// Production refreshes are seconds apart, so this is the same path.
+			time.Sleep(time.Nanosecond)
+			c.refreshPool(metadataRefreshTriggerPeriodic)
+			if failing.Load() {
+				return
+			}
+			require.Equal(t, before, failedRefreshes())
 		}
 		lastField := func(key string) any {
 			kv := logger.last().keyvals
@@ -2465,17 +2480,11 @@ func TestWarpstreamClient_SharedAddressesThroughRefresh(t *testing.T) {
 		assert.Equal(t, 2, lastField("agents_sharing_address"))
 
 		// A failed refresh keeps the previous gauge values and logs nothing.
+		failedBefore := failedRefreshes()
 		failing.Store(true)
 		refreshOnce()
-		// The previous step moved a broker's address, so kgo's first attempt can hit
-		// a connection that just died and retry after a short backoff (seen in
-		// kgo's debug log). kgo stops after 3 tries with jittered backoff, about 2.1s
-		// at most, so 3s covers it. The failed counter below proves the refresh ended.
-		time.Sleep(3 * time.Second)
-		synctest.Wait()
 		// The refresh has finished and failed, so the gauges below are the kept values.
-		require.Equal(t, float64(1), testutil.ToFloat64(c.metrics.metadataRefreshResultsTotal.WithLabelValues(
-			string(metadataRefreshTriggerPeriodic), metadataRefreshResultFailed)))
+		require.Equal(t, failedBefore+1, failedRefreshes())
 		failing.Store(false)
 		unique, shared = split()
 		assert.Equal(t, float64(1), unique)
