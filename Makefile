@@ -6,6 +6,19 @@ format:
 test:
 	go test -race ./...
 
+FUZZTIME ?= 1m
+
+# Go fuzzes one test per run, so this runs every Fuzz test in turn, each for FUZZTIME.
+.PHONY: fuzz
+fuzz:
+	@set -e; for pkg in $$(go list ./...); do \
+		tests=$$(go test -list '^Fuzz' "$$pkg"); \
+		for name in $$(echo "$$tests" | grep '^Fuzz' || true); do \
+			echo "fuzzing $$pkg $$name"; \
+			go test "$$pkg" -run '^$$' -fuzz "^$$name$$" -fuzztime $(FUZZTIME); \
+		done; \
+	done
+
 .PHONY: lint
 lint:
 	CGO_ENABLED=0 golangci-lint run
