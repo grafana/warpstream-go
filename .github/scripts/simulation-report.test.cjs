@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { buildReport } = require('./simulation-report.cjs');
+const { buildReport, skippedReport } = require('./simulation-report.cjs');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { renderWorkload, validateReport } = require('./simulation-report.cjs');
@@ -200,6 +200,17 @@ test('overlapping success ranges have no highlighted winner', () => {
 test('touching success ranges have no highlighted winner', () => {
   const rows = passes => passes.map(p => [{ ...row(p), kgo: { attempts: 120, passes: 0 } }]);
   assert.doesNotMatch(renderWorkload('Mimir', rows([30, 60, 45]), rows([60, 90, 75])), /\*\*/);
+});
+
+test('a skipped run names the failed gates and drops the previous table', () => {
+  const one = skippedReport('Commit: `abc`', { lint: 'success', test: 'failure', vendor: 'success', workloads: 'success' });
+  assert.match(one, /<!-- wgo-simulation-report -->/);
+  assert.match(one, /Unit tests did not succeed, so the suites did not run/);
+  assert.match(one, /Results from an earlier commit do not apply to this push/);
+  assert.match(one, /Commit: `abc`/);
+  assert.doesNotMatch(one, /\| Scenario \|/);
+  const several = skippedReport('', { lint: 'failure', test: 'failure', vendor: 'failure', workloads: 'skipped' });
+  assert.match(several, /Lint, unit tests, the vendor check, and workload discovery did not succeed/);
 });
 
 test('overlapping sample ranges have no highlighted winner', () => {

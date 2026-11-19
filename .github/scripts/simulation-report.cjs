@@ -174,33 +174,80 @@ function buildReport(directory, heading = 'Simulation results', source = '') {
   return sections.join('\n');
 }
 
+const gateLabels = [
+  ['lint', 'lint'],
+  ['test', 'unit tests'],
+  ['vendor', 'the vendor check'],
+  ['workloads', 'workload discovery'],
+];
+
+function joinList(items) {
+  if (items.length < 2) return items[0] || '';
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, and ${items.at(-1)}`;
+}
+
+function skippedReport(source, results) {
+  const failed = gateLabels.filter(([name]) => results[name] !== 'success').map(([, label]) => label);
+  const reason = failed.length ? `${joinList(failed)} did not succeed, so the suites did not run` : 'The suites did not run';
+  return [marker, '## Simulation results', '',
+    `${reason.charAt(0).toUpperCase()}${reason.slice(1)}. Results from an earlier commit do not apply to this push.`, '',
+    source, ''].join('\n');
+}
+
 function api(endpoint, options = []) {
   return JSON.parse(execFileSync('gh', ['api', endpoint, ...options], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }));
 }
 
-function publish(directory) {
+function prContext() {
   const repository = process.env.GH_REPO;
   const number = process.env.PR_NUMBER;
   const sha = process.env.PR_HEAD_SHA;
   if (!/^\d+$/.test(number || '') || !/^[a-f0-9]{40}$/.test(sha || '')) throw new Error('Invalid PR identity');
   const pr = api(`repos/${repository}/pulls/${number}`);
-  if (pr.head.sha !== sha) return console.log('Skipping report for an outdated PR head');
-  const runURL = `${process.env.GITHUB_SERVER_URL}/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-  const body = buildReport(directory, 'Simulation results', `Commit: \`${sha}\` · [CI run and artifacts](${runURL})`);
+  if (pr.head.sha !== sha) return null;
+  return { repository, number, sha };
+}
+
+function postComment(ctx, body, create) {
   if (body.length > 60000) throw new Error('Simulation comment too large');
-  const pages = api(`repos/${repository}/issues/${number}/comments`, ['--paginate', '--slurp']);
+  const pages = api(`repos/${ctx.repository}/issues/${ctx.number}/comments`, ['--paginate', '--slurp']);
   const previous = pages.flat().find(comment => comment.user.login === 'github-actions[bot]' && comment.body.includes(marker));
-  const endpoint = previous ? `repos/${repository}/issues/comments/${previous.id}` : `repos/${repository}/issues/${number}/comments`;
+  if (!previous && !create) return console.log('No simulation comment to update');
+  const endpoint = previous ? `repos/${ctx.repository}/issues/comments/${previous.id}` : `repos/${ctx.repository}/issues/${ctx.number}/comments`;
   const result = execFileSync('gh', ['api', endpoint, '--method', previous ? 'PATCH' : 'POST', '--input', '-'], {
     input: JSON.stringify({ body }), encoding: 'utf8', maxBuffer: 1024 * 1024,
   });
   console.log(JSON.parse(result).html_url);
 }
 
-module.exports = { buildReport, renderWorkload, validateReport };
+function publish(directory) {
+  const ctx = prContext();
+  if (!ctx) return console.log('Skipping report for an outdated PR head');
+  const runURL = `${process.env.GITHUB_SERVER_URL}/${ctx.repository}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+  postComment(ctx, buildReport(directory, 'Simulation results', `Commit: \`${ctx.sha}\` · [CI run and artifacts](${runURL})`), true);
+}
+
+function publishSkipped() {
+  const ctx = prContext();
+  if (!ctx) return console.log('Skipping report for an outdated PR head');
+  const runURL = `${process.env.GITHUB_SERVER_URL}/${ctx.repository}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+  postComment(ctx, skippedReport(`Commit: \`${ctx.sha}\` · [CI run](${runURL})`, {
+    lint: process.env.LINT_RESULT,
+    test: process.env.TEST_RESULT,
+    vendor: process.env.VENDOR_RESULT,
+    workloads: process.env.WORKLOADS_RESULT,
+  }), false);
+}
+
+module.exports = { buildReport, renderWorkload, validateReport, skippedReport };
 if (require.main === module) {
-  const directory = process.argv[2];
-  if (!directory) throw new Error('Usage: simulation-report.cjs DIRECTORY [--publish]');
-  if (process.argv.includes('--publish')) publish(directory);
-  else process.stdout.write(buildReport(directory));
+  if (process.argv.includes('--publish-skipped')) {
+    publishSkipped();
+  } else {
+    const directory = process.argv[2];
+    if (!directory) throw new Error('Usage: simulation-report.cjs DIRECTORY [--publish]');
+    if (process.argv.includes('--publish')) publish(directory);
+    else process.stdout.write(buildReport(directory));
+  }
 }
