@@ -176,9 +176,16 @@ jobs:
 
   simulation:
     name: Simulation (${{ matrix.workload.name }}, ${{ matrix.client }}, batch ${{ matrix.workload.batch }}, run ${{ matrix.run }})
-    needs: [simulation-workloads, simulation-build]
+    needs: [simulation-workloads, simulation-build, lint, test, vendor]
     # A failed workload build must not suppress suites with usable artifacts.
-    if: ${{ !cancelled() && needs.simulation-workloads.result == 'success' }}
+    # The suites are by far the slowest jobs, so they wait for the fast checks and
+    # do not run when one of them fails.
+    if: >-
+      ${{ !cancelled() &&
+      needs.simulation-workloads.result == 'success' &&
+      needs.lint.result == 'success' &&
+      needs.test.result == 'success' &&
+      needs.vendor.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -236,7 +243,8 @@ jobs:
   simulation-report:
     name: Simulation report
     needs: [simulation]
-    if: ${{ always() && !cancelled() && github.event.pull_request.head.repo.full_name == github.repository }}
+    # A skipped run has no reports. simulation-comment replaces an existing comment instead.
+    if: ${{ always() && !cancelled() && needs.simulation.result != 'skipped' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -257,6 +265,38 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node .github/scripts/simulation-report.cjs "$RUNNER_TEMP/simulation-reports" --publish
+
+  simulation-comment:
+    name: Note skipped simulation
+    needs: [simulation-workloads, lint, test, vendor]
+    # Replaces an existing comment once a fast check has failed, without waiting
+    # for the builds. A pull request with no simulation comment is left untouched.
+    if: >-
+      ${{ always() && !cancelled() &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (needs.simulation-workloads.result != 'success' ||
+      needs.lint.result != 'success' ||
+      needs.test.result != 'success' ||
+      needs.vendor.result != 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          VENDOR_RESULT: ${{ needs.vendor.result }}
+          WORKLOADS_RESULT: ${{ needs.simulation-workloads.result }}
+        run: node .github/scripts/simulation-report.cjs --publish-skipped
 
   vendor:
     name: Check go.mod, go.sum and vendor
