@@ -295,3 +295,37 @@ func TestMetadata_StaleFallbackIsUnknownToTransport(t *testing.T) {
 		require.Positive(t, stale)
 	})
 }
+
+func TestMetadata_RackChangePreservesWrites(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var network kfake.VirtualNetwork
+		cluster, addr := testkafka.CreateCluster(t, 3, topicName,
+			testkafka.WithNumBrokers(3), testkafka.WithVirtualNetwork(&network))
+		behaviour := healthyBehaviours()
+		behaviour.wireDelay = 300 * time.Millisecond
+		behaviours := newBrokersBehaviourProvider(behaviour)
+		installFailureControl(cluster, behaviours, clientTypeWgo)
+		client, registry, err := newWarpstreamClient(addr, wgo.WithDialer(network.DialContext))
+		require.NoError(t, err)
+		t.Cleanup(client.Close)
+		raw, err := client.Request(t.Context(), kmsg.NewPtrMetadataRequest())
+		require.NoError(t, err)
+		installMetadataControl(cluster, raw.(*kmsg.MetadataResponse), behaviours)
+		done := make(chan error, 1)
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			behaviour.brokerRack = "rollout-new"
+			behaviours.set(behaviour)
+			_, err := client.RequestCachedMetadata(t.Context(), kmsg.NewPtrMetadataRequest(), time.Nanosecond)
+			done <- err
+		}()
+		observations := runScenarioEvents(t.Context(), client,
+			buildScenarioEvents(topicName, 3, time.Second, eventSpacing), time.Now()).snapshot()
+		require.NoError(t, <-done)
+		assert.Equal(t, 2, observations.summary().successes)
+		assert.Empty(t, observations.errorCounts())
+		evidence, err := readClientEvidence(registry, "")
+		require.NoError(t, err)
+		assert.Zero(t, evidence.HedgeTriggers["primary_failure"])
+	})
+}

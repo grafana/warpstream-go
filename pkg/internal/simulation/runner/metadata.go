@@ -20,6 +20,7 @@ func missingBrokerBehaviours(nodeIDs ...int32) brokersBehaviour {
 }
 
 type metadataView struct {
+	delayedReply           atomic.Pointer[delayedMetadataReply]
 	current                atomic.Pointer[kmsg.MetadataResponse]
 	template               *kmsg.MetadataResponse
 	mu                     sync.Mutex
@@ -52,7 +53,16 @@ func installMetadataPlacementControl(cluster *kfake.Cluster, template *kmsg.Meta
 			}
 			response = metadataPreferredPlacement(response, preferred, count, retainedFallback)
 		}
+		if rack := behaviour.brokerRack; rack != "" {
+			for i := range response.Brokers {
+				response.Brokers[i].Rack = &rack
+			}
+		}
 		metadataRequest := req.(*kmsg.MetadataRequest)
+		if delay := view.delayedReply.Load(); delay != nil && metadataRequest.IncludeTopicAuthorizedOperations {
+			delay.markStarted()
+			cluster.SleepControl(func() { <-delay.release })
+		}
 		if len(behaviour.brokerOnlyMissing) > 0 {
 			brokerOnly := metadataRequest.Topics != nil && len(metadataRequest.Topics) == 0
 			if !brokerOnly && behaviour.topicMetadataDelay > 0 {
@@ -199,4 +209,11 @@ func metadataPreferredPlacement(template *kmsg.MetadataResponse, preferred int32
 		}
 	}
 	return &response
+}
+
+func changedRackBehaviours() brokersBehaviour {
+	b := healthyBehaviours()
+	b.brokerRack = "rollout-new"
+	b.wireDelay = 750 * time.Millisecond
+	return b
 }

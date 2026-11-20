@@ -375,8 +375,8 @@ func (c *WarpstreamClient) BufferedProduceRecords() int64 {
 	return c.buffer.BufferedRecords()
 }
 
-// SetTestProduceResponseHook installs a hook fired after every Broker.Request
-// completes (primary or hedge attempt) inside KafkaDirectProducer. The hook
+// SetTestProduceResponseHook installs a hook fired after the final Broker.Request
+// of each agent attempt inside KafkaDirectProducer. The hook
 // runs synchronously on the per-attempt goroutine and may block — useful for
 // tests that simulate per-agent latency. Production code does not set this.
 func (c *WarpstreamClient) SetTestProduceResponseHook(fn func(ctx context.Context, nodeID int32, resp *kmsg.ProduceResponse, err error)) {
