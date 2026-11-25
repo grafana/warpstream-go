@@ -17,10 +17,11 @@ type scenarioExpectations struct {
 	// minWgoSuccessRate is the floor the wgo app-level success rate must
 	// clear. Always enforced; the zero value is a no-op floor every run
 	// passes.
-	minWgoSuccessRate float64
-	maxSenderLag      *time.Duration
-	recoveryFrom      *time.Duration
-	maxHedgeSurge     *float64
+	minWgoSuccessRate         float64
+	maxSenderLag              *time.Duration
+	recoveryFrom              *time.Duration
+	maxHedgeSurge             *float64
+	maxPrimaryFailureCascades *int64
 
 	// slowBudget and maxWgoSlowFraction together assert wgo's sub-timeout
 	// tail: at most maxWgoSlowFraction of wgo requests may take longer than
@@ -48,6 +49,7 @@ type scenarioExpectations struct {
 type scenario struct {
 	name                    string
 	observedFor             time.Duration
+	eventInterval           time.Duration
 	description             string
 	behaviours              brokersBehaviour
 	expect                  scenarioExpectations
@@ -58,6 +60,7 @@ type scenario struct {
 	requiredWgoDelayBrokers []int32
 	requireStaleFallback    bool
 	collectClientEvidence   bool
+	reorderSeedMetadata     bool
 }
 
 func (sc scenario) duration() time.Duration {
@@ -88,6 +91,16 @@ func scenarios() []scenario {
 	}
 
 	return append([]scenario{
+		seedMetadataScenario(false),
+		seedMetadataScenario(true),
+		{
+			name:                  "rack metadata change",
+			eventInterval:         time.Second,
+			description:           "Metadata changes Rack once across the entire pool, then keeps the new Rack stable. Agent addresses and partition assignments stay fixed. Requests arrive once per second and Produce responses wait 750ms on the wire; every application write must succeed without primary-failure fallback cascades.",
+			behaviours:            changedRackBehaviours(),
+			collectClientEvidence: true,
+			expect:                scenarioExpectations{minWgoSuccessRate: 1, maxPrimaryFailureCascades: ptr(int64(0))},
+		},
 		{
 			name:        "all healthy",
 			description: "Every agent at healthy latency. Every record should succeed via the primary; no hedge fires.",
@@ -289,4 +302,21 @@ func (sc scenario) hasInjectedDelays() bool {
 		}
 	}
 	return false
+}
+
+func seedMetadataScenario(changeRack bool) scenario {
+	b := healthyBehaviours()
+	b.wireDelay = 1500 * time.Millisecond
+	name := "delayed seed metadata without Rack change"
+	rackDescription := "Rack remains unchanged."
+	if changeRack {
+		b.brokerRack = "rollout-new"
+		name = "Rack change with stale seed metadata"
+		rackDescription = "The server changes Rack once after the seed query starts and keeps its new value stable."
+	}
+	return scenario{name: name, observedFor: 4 * time.Second, eventInterval: 5 * time.Second,
+		description: "Direct-client API case: an authorized-operations Metadata query starts on the persistent seed connection. " + rackDescription + " A current reply arrives at 100ms, the delayed pre-transition reply at 1.1s, and a fresh reply at 2.1s. Produce responses take 1.5s throughout warmup and observation. One application write fans out to all 50 partitions and must succeed with the r416 client settings. External Mimir workloads do not expose the admin API needed to schedule this case.",
+		behaviours:  b, collectClientEvidence: true, reorderSeedMetadata: true,
+		expect: scenarioExpectations{minWgoSuccessRate: 1},
+	}
 }

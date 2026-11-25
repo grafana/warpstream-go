@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"time"
 )
 
@@ -33,6 +34,9 @@ func (sc scenario) topology() (int32, int32) {
 }
 
 func (sc scenario) spacing() time.Duration {
+	if sc.eventInterval > 0 {
+		return sc.eventInterval
+	}
 	if sc.profile != nil {
 		return sc.profile.spacing
 	}
@@ -41,7 +45,10 @@ func (sc scenario) spacing() time.Duration {
 
 func (sc scenario) healthyBehaviours() brokersBehaviour {
 	if sc.profile == nil {
-		return healthyBehaviours()
+		healthy := healthyBehaviours()
+		// Wire latency must stay constant so the observed phase isolates metadata.
+		healthy.wireDelay = sc.behaviours.wireDelay
+		return healthy
 	}
 	brokers, _ := sc.topology()
 	bh := brokersBehaviour{byBroker: make(map[int32]brokerBehaviour, brokers)}
@@ -61,14 +68,14 @@ func profileScenarios(profile string, external bool) ([]scenario, error) {
 		if !external {
 			return nil, fmt.Errorf("all requires an external workload")
 		}
-		return append(append(scenarios(), investigationScenarios()...), storagePressureScenarios()...), nil
+		return append(append(workloadScenarios(external), investigationScenarios()...), storagePressureScenarios()...), nil
 	case "mimir-prometheus":
 		if !external {
 			return nil, fmt.Errorf("mimir-prometheus requires an external workload")
 		}
 		return storagePressureScenarios(), nil
 	case "standard":
-		return scenarios(), nil
+		return workloadScenarios(external), nil
 	case "mimir-investigation":
 		if !external {
 			return nil, fmt.Errorf("mimir-investigation requires an external workload")
@@ -145,6 +152,9 @@ func investigationScenarios() []scenario {
 }
 
 func runPhases(ctx context.Context, env *environment, start time.Time, sc scenario) error {
+	if env.seedMetadata != nil {
+		return env.seedMetadata.run(ctx, start)
+	}
 	if len(sc.behaviourPhases) == 0 {
 		return runTransportPhases(ctx, env, start, sc.transportPhases)
 	}
@@ -171,4 +181,13 @@ func runPhases(ctx context.Context, env *environment, start time.Time, sc scenar
 		env.behaviours.set(phase.behaviours)
 	}
 	return phaseErr
+}
+
+func workloadScenarios(external bool) []scenario {
+	cases := scenarios()
+	if external {
+		// Unmodified external workloads do not expose the client's admin API.
+		cases = slices.DeleteFunc(cases, func(sc scenario) bool { return sc.reorderSeedMetadata })
+	}
+	return cases
 }
