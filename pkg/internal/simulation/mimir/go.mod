@@ -6,7 +6,7 @@ require (
 	github.com/go-kit/log v0.2.1
 	github.com/golang/snappy v1.0.0
 	github.com/grafana/dskit v0.0.0-20261012114055-366c7d7ae28a
-	github.com/grafana/warpstream-go v0.1.4
+	github.com/grafana/warpstream-go v1.0.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/prometheus/common v0.72.1
